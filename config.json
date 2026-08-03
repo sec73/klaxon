@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "klaxon": {
+      "command": "/home/marco/project/klaxon/run-klaxon.sh"
+    }
+  }
+}

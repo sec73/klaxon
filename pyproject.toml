@@ -1,0 +1,51 @@
+[project]
+name = "klaxon-mcp"
+version = "0.1.0"
+description = "MCP server for Wazuh 5.x — generic tools over the uniform WCS data model"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [
+    { name = "Marco Moenig", email = "marco.moenig@sec73.io" },
+]
+maintainers = [
+    { name = "sec73 GmbH", email = "marco.moenig@sec73.io" },
+]
+
+dependencies = [
+    "mcp>=2.0.0",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://www.sec73.io"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+klaxon-mcp = "klaxon_mcp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/klaxon_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Default is the bare prefix "test", which also collects an imported
+# `tester_sessions` as a test case. Every test here is named test_*.
+python_functions = ["test_*"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/klaxon_mcp"]

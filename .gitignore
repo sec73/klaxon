@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# Never commit credentials. .env.example is the template.
+.env
+
+# Personal Claude Code settings; the shared ones belong in .claude/settings.json.
+.claude/*.local.json
+.claude/
