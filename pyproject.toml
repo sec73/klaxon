@@ -49,3 +49,15 @@ python_functions = ["test_*"]
 python_version = "3.11"
 strict = true
 files = ["src/klaxon_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/ARCHITECTURE.md",
+    "/docs",
+    "/LICENSE",
+    "/NOTICE",
+    "/pyproject.toml",
+]
