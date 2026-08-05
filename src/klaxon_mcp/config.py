@@ -73,6 +73,15 @@ class TransportConfig:
     auth_token: str
     allowed_hosts: tuple[str, ...]
     allowed_origins: tuple[str, ...]
+    # Browser origins permitted to call the endpoint directly with XHR/fetch.
+    # Empty means no CORS headers at all, which is what any client that is not a
+    # browser wants — including Open WebUI, whose native MCP integration connects
+    # from its backend rather than from the page (its documented
+    # `host.docker.internal` guidance only makes sense server-side; the CORS
+    # advice in its docs is about OpenAPI "Direct Tool Servers", a separate
+    # browser-side feature). Distinct from `allowed_origins`, which only says
+    # which Origin values are *not rejected* — that is a filter, this is a grant.
+    cors_origins: tuple[str, ...]
     json_response: bool
     stateless: bool
 
@@ -99,6 +108,19 @@ class TransportConfig:
         if not path.startswith("/"):
             path = "/" + path
 
+        # An Origin header never carries a path, so a trailing slash here would
+        # produce an entry that matches nothing — and the failure surfaces in the
+        # browser console as a generic CORS error, a long way from this file.
+        cors_origins = tuple(o.rstrip("/") for o in _env_list("WAZUH_MCP_CORS_ORIGINS"))
+        if "*" in cors_origins:
+            raise ConfigError(
+                "WAZUH_MCP_CORS_ORIGINS=* is refused. Every tool here runs with "
+                "the Wazuh credentials in this file, so a wildcard grant lets any "
+                "page a browser loads read your SIEM from that browser's network "
+                "position. List the origins that need it, comma-separated, e.g. "
+                "WAZUH_MCP_CORS_ORIGINS=https://openwebui.example"
+            )
+
         return cls(
             transport=transport,  # type: ignore[arg-type]  # checked above
             host=os.environ.get("WAZUH_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1",
@@ -107,6 +129,7 @@ class TransportConfig:
             auth_token=os.environ.get("WAZUH_MCP_AUTH_TOKEN", "").strip(),
             allowed_hosts=_env_list("WAZUH_MCP_ALLOWED_HOSTS"),
             allowed_origins=_env_list("WAZUH_MCP_ALLOWED_ORIGINS"),
+            cors_origins=cors_origins,
             json_response=_env_bool("WAZUH_MCP_JSON_RESPONSE", False),
             stateless=_env_bool("WAZUH_MCP_STATELESS", False),
         )

@@ -261,12 +261,26 @@ shape from `proto/src/tester.proto:23-32` and `:135-142` (v5.0.0-beta4).
 | `WAZUH_MCP_AUTH_TOKEN` | — | empty (no auth) |
 | `WAZUH_MCP_ALLOWED_HOSTS` | `--allowed-host` | empty |
 | `WAZUH_MCP_ALLOWED_ORIGINS` | — | empty |
+| `WAZUH_MCP_CORS_ORIGINS` | — | empty (no CORS headers) |
 | `WAZUH_MCP_JSON_RESPONSE` | — | `false` |
 | `WAZUH_MCP_STATELESS` | — | `false` |
 
 Flags override environment variables. `sse` is the legacy MCP HTTP transport and
 warns on startup; prefer `http` unless a client requires SSE. Behind a load
 balancer without session affinity, set `WAZUH_MCP_STATELESS=true`.
+
+The two origin settings do different jobs. `WAZUH_MCP_ALLOWED_ORIGINS` is a
+filter — which `Origin` values are not rejected. `WAZUH_MCP_CORS_ORIGINS` is a
+grant — which browser origins may call the endpoint with `fetch` at all. Only
+the latter emits `Access-Control-Allow-Origin`, and setting it also adds those
+origins to the filter so the two cannot contradict each other. Leave it empty
+for any client that is not a browser, including Open WebUI, which connects from
+its backend. `*` is refused.
+
+Origin filtering cannot be enabled on its own: it is part of the same DNS
+rebinding protection as the `Host` check, and turning that on with an empty
+`WAZUH_MCP_ALLOWED_HOSTS` would reject every request. Set the host allowlist too,
+or the origin list is logged as unenforced.
 
 See [README.md](../README.md#read-this-before-opening-the-port) before exposing
 a network listener.

@@ -16,6 +16,7 @@ import pytest
 from klaxon_mcp.config import TransportConfig
 from klaxon_mcp.transport import (
     BearerAuthMiddleware,
+    apply_cors,
     build_transport_security,
     preflight,
 )
@@ -30,6 +31,7 @@ def cfg(**over: Any) -> TransportConfig:
         "auth_token": "",
         "allowed_hosts": (),
         "allowed_origins": (),
+        "cors_origins": (),
         "json_response": False,
         "stateless": False,
     }
@@ -287,6 +289,193 @@ class TestTransportSecurity:
         assert "DNS rebinding protection is DISABLED" in caplog.text
 
 
+def cors_scope(
+    method: str,
+    origin: str | None = None,
+    *,
+    request_method: str | None = None,
+    request_headers: str | None = None,
+    auth: str | None = None,
+    path: str = "/mcp",
+) -> dict[str, Any]:
+    """A scope shaped like what a browser actually sends.
+
+    A preflight is `OPTIONS` carrying `access-control-request-method`; without
+    that header it is just an ordinary OPTIONS request and CORS does not claim
+    it. Both shapes matter here, so the header is explicit rather than implied
+    by the method.
+    """
+    headers: list[tuple[bytes, bytes]] = []
+    if origin is not None:
+        headers.append((b"origin", origin.encode()))
+    if request_method is not None:
+        headers.append((b"access-control-request-method", request_method.encode()))
+    if request_headers is not None:
+        headers.append((b"access-control-request-headers", request_headers.encode()))
+    if auth is not None:
+        headers.append((b"authorization", auth.encode()))
+    return {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "headers": headers,
+        "client": ("10.0.0.5", 51234),
+    }
+
+
+GRANTED = "https://openwebui.example"
+
+
+def browser_stack(app: Any, **over: Any) -> Any:
+    """The production wrapping order: CORS outside, bearer inside."""
+    c = cfg(cors_origins=(GRANTED,), **over)
+    return apply_cors(BearerAuthMiddleware(app, c.auth_token), c)
+
+
+class TestCors:
+    def test_no_granted_origins_leaves_the_app_untouched(self) -> None:
+        """A server-side client sends no Origin and reads no response headers,
+        so CORS there is attack surface with no user."""
+        app = SpyApp()
+        assert apply_cors(app, cfg()) is app
+
+    async def test_preflight_is_answered_without_a_token(self) -> None:
+        """The failure this whole path exists to prevent.
+
+        Browsers never attach Authorization to a preflight, so if the bearer
+        check sees it the answer is 401 and the real request is never sent —
+        surfacing in the console as a bare CORS error that never mentions auth.
+        """
+        app = SpyApp()
+        stack = browser_stack(app, auth_token="s3cret")
+        rec = Recorder()
+
+        await stack(
+            cors_scope("OPTIONS", GRANTED, request_method="POST"), noop_receive, rec
+        )
+
+        assert rec.status == 200
+        assert rec.headers[b"access-control-allow-origin"] == GRANTED.encode()
+        assert not app.called, "a preflight should never reach the MCP app"
+
+    async def test_preflight_allows_the_full_streamable_http_verb_set(self) -> None:
+        """POST carries JSON-RPC, GET opens the SSE stream, DELETE ends the
+        session. Granting only POST works until the client disconnects."""
+        rec = Recorder()
+        await browser_stack(SpyApp(), auth_token="s3cret")(
+            cors_scope("OPTIONS", GRANTED, request_method="DELETE"), noop_receive, rec
+        )
+        allowed = rec.headers[b"access-control-allow-methods"].decode()
+        assert {"GET", "POST", "DELETE"} <= {m.strip() for m in allowed.split(",")}
+
+    async def test_preflight_permits_the_session_header(self) -> None:
+        """mcp-session-id is not a CORS-safelisted request header, so without
+        this the client cannot echo the session back on request two."""
+        rec = Recorder()
+        await browser_stack(SpyApp(), auth_token="s3cret")(
+            cors_scope(
+                "OPTIONS",
+                GRANTED,
+                request_method="POST",
+                request_headers="authorization,content-type,mcp-session-id",
+            ),
+            noop_receive,
+            rec,
+        )
+        assert rec.status == 200
+        allowed = rec.headers[b"access-control-allow-headers"].decode().lower()
+        assert "mcp-session-id" in allowed
+        assert "authorization" in allowed
+
+    async def test_session_header_is_readable_by_the_client(self) -> None:
+        """Unhidden by Access-Control-Expose-Headers, or the client cannot store
+        the session id it was just issued — which reads like the server forgot
+        the session rather than like a CORS problem."""
+        rec = Recorder()
+        await browser_stack(SpyApp(), auth_token="s3cret")(
+            cors_scope("GET", GRANTED, path="/healthz"), noop_receive, rec
+        )
+        exposed = rec.headers[b"access-control-expose-headers"].decode().lower()
+        assert "mcp-session-id" in exposed
+
+    async def test_an_ungranted_origin_gets_no_grant(self) -> None:
+        rec = Recorder()
+        await browser_stack(SpyApp(), auth_token="s3cret")(
+            cors_scope("OPTIONS", "https://evil.example", request_method="POST"),
+            noop_receive,
+            rec,
+        )
+        assert rec.headers.get(b"access-control-allow-origin") != b"https://evil.example"
+
+    async def test_real_requests_still_need_the_token(self) -> None:
+        """CORS answers the preflight; it must not answer anything else.
+
+        The preflight passing is a browser-level permission check, not an
+        authentication decision — the POST that follows carries the token and is
+        authenticated normally.
+        """
+        app = SpyApp()
+        rec = Recorder()
+        await browser_stack(app, auth_token="s3cret")(
+            cors_scope("POST", GRANTED), noop_receive, rec
+        )
+        assert not app.called
+        assert rec.status == 401
+
+        app2 = SpyApp()
+        await browser_stack(app2, auth_token="s3cret")(
+            cors_scope("POST", GRANTED, auth="Bearer s3cret"), noop_receive, Recorder()
+        )
+        assert app2.called
+
+
+class TestCorsAndRebindingProtectionAgree:
+    """The two allowlists are separate switches over the same Origin header."""
+
+    def test_a_granted_origin_is_not_rejected_by_rebinding_protection(self) -> None:
+        """Granting CORS and then 403ing the request is a contradiction the
+        operator cannot read off the config: only one allowlist is named in the
+        error, and it is not the one they set."""
+        settings = build_transport_security(cfg(cors_origins=(GRANTED,)))
+        assert settings.enable_dns_rebinding_protection
+        assert GRANTED in settings.allowed_origins
+        assert "127.0.0.1:*" in settings.allowed_hosts, "loopback bind still locked"
+
+    def test_granted_origins_survive_an_explicit_host_allowlist(self) -> None:
+        settings = build_transport_security(
+            cfg(
+                host="0.0.0.0",
+                allowed_hosts=("klaxon-mcp.example:8000",),
+                cors_origins=(GRANTED,),
+            )
+        )
+        assert settings.allowed_origins == [GRANTED]
+
+    def test_origins_are_not_duplicated(self) -> None:
+        settings = build_transport_security(
+            cfg(
+                host="0.0.0.0",
+                allowed_hosts=("h:8000",),
+                allowed_origins=(GRANTED,),
+                cors_origins=(GRANTED,),
+            )
+        )
+        assert settings.allowed_origins == [GRANTED]
+
+    def test_an_origin_allowlist_alone_cannot_enable_protection(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Turning the switch on with an empty host allowlist 421s every
+        request before the Origin check is reached, so it stays off and says
+        that the origin list is going unenforced."""
+        with caplog.at_level("WARNING"):
+            settings = build_transport_security(
+                cfg(host="0.0.0.0", allowed_origins=(GRANTED,))
+            )
+        assert not settings.enable_dns_rebinding_protection
+        assert "NOT enforced" in caplog.text
+
+
 class TestNetworkExposure:
     @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
     def test_loopback_is_not_networked(self, host: str) -> None:
@@ -343,6 +532,26 @@ class TestTransportConfigFromEnv:
         assert c.path == "/wazuh"
         assert c.allowed_hosts == ("a.example:8000", "b.example:8000")
 
+    def test_no_cors_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("WAZUH_MCP_CORS_ORIGINS", raising=False)
+        assert TransportConfig.from_env().cors_origins == ()
+
+    def test_trailing_slash_is_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An Origin header never carries a path, so `https://x/` would match
+        nothing — and the miss surfaces as a generic browser CORS error."""
+        monkeypatch.setenv("WAZUH_MCP_CORS_ORIGINS", "https://a.example/, https://b.example")
+        assert TransportConfig.from_env().cors_origins == (
+            "https://a.example",
+            "https://b.example",
+        )
+
+    def test_wildcard_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every tool here runs with the Wazuh credentials, so a wildcard lets
+        any page a browser loads read the SIEM from that browser's position."""
+        monkeypatch.setenv("WAZUH_MCP_CORS_ORIGINS", "*")
+        with pytest.raises(Exception, match="is refused"):
+            TransportConfig.from_env()
+
 
 def os_environ_keys() -> list[str]:
     return [
@@ -353,4 +562,5 @@ def os_environ_keys() -> list[str]:
         "WAZUH_MCP_AUTH_TOKEN",
         "WAZUH_MCP_ALLOWED_HOSTS",
         "WAZUH_MCP_ALLOWED_ORIGINS",
+        "WAZUH_MCP_CORS_ORIGINS",
     ]

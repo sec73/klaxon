@@ -7,8 +7,9 @@ questions in plain language; it queries the indexer, reads the schema, tests
 decoders, and reports what it actually found — including when it found nothing,
 and why.
 
-Works with Claude Desktop, Claude Code, and local models through Ollama. Nothing
-leaves your network: Klaxon runs beside your cluster and talks to it directly.
+Works with Claude Desktop, Claude Code, Open WebUI, and local models through
+Ollama. Klaxon itself runs beside your cluster and talks to it directly — point
+it at a local model and nothing leaves your network.
 
 ---
 
@@ -53,7 +54,8 @@ what it finds.
 
 - Wazuh 5.0 or later, indexer reachable over HTTPS
 - Python 3.11+
-- An MCP client — Claude Desktop, Claude Code, `ollmcp`, or any other
+- An MCP client — Claude Desktop, Claude Code, `ollmcp`, Open WebUI 0.6.31+, or
+  any other
 
 `search` and `schema` also work against a Wazuh 4.x indexer. The other tools are
 5.x-specific.
@@ -305,6 +307,96 @@ Transport options are listed in [`docs/TOOLS.md`](docs/TOOLS.md).
 
 ---
 
+## Open WebUI
+
+Open WebUI talks to Klaxon over streamable HTTP and to a chat model over an
+OpenAI-compatible API. The two are configured separately: Klaxon is a tool
+server, the model is what decides to call it.
+
+Requires **Open WebUI v0.6.31 or later** — that is the release that added native
+MCP support. Earlier versions need the [`mcpo`](https://github.com/open-webui/mcpo)
+proxy instead, which converts MCP to OpenAPI. You need an admin account; MCP
+servers cannot be added by regular users.
+
+**1. Serve Klaxon over HTTP**
+
+```bash
+export WAZUH_MCP_AUTH_TOKEN=$(openssl rand -hex 32)
+klaxon-mcp --transport http --host 0.0.0.0 --port 8000 \
+           --allowed-host klaxon.example:8000
+```
+
+Read [Read this before opening the port](#read-this-before-opening-the-port)
+first if you have not — this is a listening socket with SIEM credentials behind
+it.
+
+**2. Add the model** — *Admin Settings → Connections → OpenAI API → +*
+
+| Field | Value |
+|---|---|
+| API Base URL | `https://api.deepseek.com/v1` |
+| API Key | your key from [platform.deepseek.com](https://platform.deepseek.com/api_keys) |
+
+DeepSeek's API is OpenAI-compatible, so no adapter is needed. If the model list
+comes back empty, try the base URL without `/v1`. Then pick
+**`deepseek-v4-flash`** in the model selector — it supports tool calling, which
+is the part that matters here; a model without it will simply answer from
+nothing rather than call Klaxon.
+
+**3. Register Klaxon** — *Admin Settings → External Tools → + (Add Server)*
+
+| Field | Value |
+|---|---|
+| Type | **MCP (Streamable HTTP)** — not OpenAPI |
+| URL | `https://klaxon.example:8000/mcp` (include the path) |
+| Auth | **Bearer**, key = your `WAZUH_MCP_AUTH_TOKEN` |
+
+Choosing OpenAPI here hangs on an infinite load rather than failing cleanly, and
+selecting Bearer while leaving the key empty sends an empty header and gets a
+flat 401 — both are easy to mistake for the server being down.
+
+If Open WebUI runs in Docker and Klaxon is on the host, `localhost` inside the
+container is the container. Use `http://host.docker.internal:8000/mcp` and add
+`--add-host=host.docker.internal:host-gateway` to the Open WebUI container.
+
+Klaxon's eight tools should now appear in the tool picker. Give the model the
+field-convention prompt from [Using a local model](#using-a-local-model) as the
+system prompt — it prevents the same failures there as it does with Ollama.
+
+### CORS is not needed here
+
+Open WebUI connects to MCP servers **from its backend, not from your browser**,
+so no `Access-Control-Allow-Origin` is involved — the `host.docker.internal`
+guidance above is the giveaway, since a browser could not resolve it. What the
+Open WebUI docs say about enabling CORS applies to *OpenAPI* "Direct Tool
+Servers", which are a different, browser-side feature.
+
+Set `WAZUH_MCP_CORS_ORIGINS` only for a genuinely browser-based MCP client:
+
+```bash
+WAZUH_MCP_CORS_ORIGINS=https://webclient.example
+```
+
+Comma-separated, one entry per origin, no trailing slash. `*` is refused: every
+tool runs with the Wazuh credentials, so a wildcard would let any page a browser
+loads read your SIEM from that browser's network position. A granted origin is
+also added to the DNS rebinding allowlist, so the two checks cannot disagree.
+
+To tell which case you are in, watch Klaxon's log while the client connects. A
+browser client sends an `OPTIONS` preflight and an `Origin` header; a backend
+client sends neither.
+
+### Where your data goes
+
+The README says nothing leaves your network, and with Ollama or a local model
+that holds. A hosted API is a different arrangement: tool output contains
+whatever your SIEM contains — IP addresses, usernames, hostnames, login times —
+and all of it is sent to DeepSeek's servers to be processed. Under GDPR that is
+a processing decision that needs to be made deliberately, not a configuration
+detail. If it cannot leave, keep the model local.
+
+---
+
 ## Troubleshooting
 
 **An aggregation returns nothing but there is clearly data.**
@@ -343,6 +435,8 @@ Klaxon flags this, and the fixed tools set it themselves.
 
 The suite covers the input guards, the diagnostics layer and the network
 transport, plus the acceptance criteria that do not need a live cluster.
+
+Release history: [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
