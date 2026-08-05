@@ -7,9 +7,7 @@ questions in plain language; it queries the indexer, reads the schema, tests
 decoders, and reports what it actually found — including when it found nothing,
 and why.
 
-Works with Claude Desktop, Claude Code, Open WebUI, and local models through
-Ollama. Klaxon itself runs beside your cluster and talks to it directly — point
-it at a local model and nothing leaves your network.
+Works with Claude Desktop, Claude Code, and local models through Ollama. Klaxon itself runs beside your cluster and talks to it directly — no third party sits between the two. Where the query results go from there is your choice of model: with a local model through Ollama, nothing leaves your network at all.
 
 ---
 
@@ -39,7 +37,11 @@ local model can call reliably.
 
 ### What it will not do
 
-Klaxon is **read-only**. It queries, it never writes, deletes or reconfigures.
+Klaxon is read-only with respect to your environment. It never writes to the indexer, 
+never modifies configuration, never deletes anything, and never promotes or installs a policy. 
+The one endpoint that is not a plain read is logtest: it submits a line to the engine's tester, 
+which evaluates it against an existing tester session. It does not touch stored data, 
+and it does not create or alter the policies your cluster runs on.
 
 It has **no concept of who is asking**. Every request runs with the credentials
 in its environment, so anyone who can reach it can read everything those
@@ -82,7 +84,7 @@ WAZUH_INDEXER_PASSWORD=...
 ```
 
 Only `WAZUH_INDEXER_URL` is required. Add `WAZUH_MANAGER_URL` for the `manager`
-tool and `WAZUH_ENGINE_URL` for `tester_sessions` — see
+tool and `WAZUH_ENGINE_URL` for `tester_sessions` – see
 [Configuration](#configuration).
 
 **3. Wrap it** so the credentials stay in one place:
@@ -256,7 +258,7 @@ hostname in `.env`, or run with `--network host`.
 ## Running it on another machine
 
 By default Klaxon speaks stdio and is started by your MCP client as a child
-process. To run it elsewhere — next to the Wazuh cluster, say — serve it over
+process. To run it elsewhere — next to the Wazuh cluster, say – serve it over
 HTTP:
 
 ```bash
