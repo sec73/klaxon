@@ -1,0 +1,518 @@
+# SPDX-FileCopyrightText: 2026 sec73 GmbH <https://www.sec73.io>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Author: Marco Moenig <marco.moenig@sec73.io>
+
+"""The anonymization layer: masking rules, determinism, blocking, logging.
+
+The guarantee this layer exists for is stated as: an external LLM client never
+receives personal data. The tests pin the three mechanisms that add up to it —
+the structured field pass (which knows what a field means), the text pass
+(which catches the unambiguous value types anywhere), and the verify/block step
+(which withholds output when a residual survives both).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+from mcp.server.mcpserver.exceptions import ToolError
+
+from klaxon_mcp import overview as _overview
+from klaxon_mcp import server
+from klaxon_mcp.anonymization import (
+    AGENT,
+    EMAIL,
+    HOST,
+    IP,
+    USER,
+    Anonymizer,
+)
+from klaxon_mcp.clients import Response
+from klaxon_mcp.config import AnonymizationConfig
+
+
+def anon(**overrides: Any) -> Anonymizer:
+    return Anonymizer(
+        AnonymizationConfig(enabled=overrides.pop("enabled", True), **overrides)
+    )
+
+
+def ip_ph(value: str, algo: str = "md5") -> str:
+    digest = hashlib.new(algo, value.encode("utf-8")).hexdigest()
+    return f"[IP_{digest[:6]}]"
+
+
+# --------------------------------------------------------------------------- #
+# Activation: the switch is env/config-driven and local-aware
+# --------------------------------------------------------------------------- #
+
+
+class TestActive:
+    def test_disabled_is_never_active(self) -> None:
+        assert anon(enabled=False).active is False
+
+    def test_enabled_external_endpoint_is_active(self) -> None:
+        assert anon(llm_base_url="https://api.deepseek.com/v1").active is True
+
+    def test_enabled_loopback_endpoint_is_inactive(self) -> None:
+        # A local model (Ollama, vLLM on localhost) leaves data unchanged.
+        assert anon(llm_base_url="http://localhost:11434").active is False
+        assert anon(llm_base_url="http://127.0.0.1:8000/v1").active is False
+
+    def test_enabled_unknown_endpoint_is_active(self) -> None:
+        # No endpoint configured: assuming external is the GDPR-safe failure.
+        assert anon(llm_base_url="").active is True
+
+
+# --------------------------------------------------------------------------- #
+# Value-type masking
+# --------------------------------------------------------------------------- #
+
+
+class TestValueMasking:
+    def test_ipv4_is_masked(self) -> None:
+        out = anon().mask_text("login from 192.168.1.100 failed")
+        assert "192.168.1.100" not in out
+        assert ip_ph("192.168.1.100") in out
+
+    def test_ipv6_is_masked(self) -> None:
+        out = anon().mask_text("from 2001:db8:85a3::8a2e:370:7334 ok")
+        assert "2001:db8:85a3::8a2e:370:7334" not in out
+        assert "[IP_" in out
+
+    def test_email_is_masked(self) -> None:
+        out = anon().mask_text("contact user@example.com now")
+        assert "user@example.com" not in out
+        digest = hashlib.md5(b"user@example.com").hexdigest()
+        assert f"[EMAIL_{digest[:6]}]" in out
+
+    def test_port_numbers_and_versions_are_not_ips(self) -> None:
+        out = anon().mask_text("listen on :9200, version 1.2.3, pattern wazuh-events-v5-*")
+        assert ":9200" in out
+        assert "1.2.3" in out
+        assert "wazuh-events-v5-*" in out
+
+    def test_no_hash_uses_generic_labels(self) -> None:
+        out = anon(use_hash=False).mask_text("from 192.168.1.100 via user@example.com")
+        assert "[IP_ADDRESS]" in out
+        assert "[EMAIL]" in out
+
+    def test_spec_free_text_example(self) -> None:
+        """The spec's canonical case: username and IP both masked in one line."""
+        out = anon().mask_text("Failed login for admin from 192.168.1.100")
+        assert "admin" not in out
+        assert "192.168.1.100" not in out
+        assert "[USER_" in out
+        assert "[IP_" in out
+
+    def test_free_text_username_does_not_swallow_an_ip(self) -> None:
+        """'login from <ip>' is a source address, not a username."""
+        out = anon().mask_text("Failed login from 192.168.1.100")
+        assert "192.168.1.100" not in out
+        assert "[IP_" in out
+        assert "[USER_" not in out
+
+    def test_free_text_username_does_not_swallow_prose(self) -> None:
+        out = anon().mask_text("Prevent access from external hosts")
+        assert out == "Prevent access from external hosts"
+
+    def test_username_context_forms(self) -> None:
+        for line in (
+            "user=admin attempted",
+            "username: root accepted",
+            "login as operator ok",
+            "authenticated as svc_backup",
+            "login by user marco from host",
+        ):
+            out = anon().mask_text(line)
+            assert "[USER_" in out, f"expected a username mask in {line!r}"
+
+    def test_sha256_placeholders_differ_from_md5(self) -> None:
+        md5 = anon(hash_algorithm="md5").mask_text("1.2.3.4")
+        sha = anon(hash_algorithm="sha256").mask_text("1.2.3.4")
+        assert md5 == ip_ph("1.2.3.4", "md5")
+        assert sha == ip_ph("1.2.3.4", "sha256")
+        assert md5 != sha
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic placeholders
+# --------------------------------------------------------------------------- #
+
+
+class TestDeterminism:
+    def test_same_input_same_placeholder(self) -> None:
+        a = anon()
+        b = anon()
+        assert a.mask_text("host 192.168.1.100") == b.mask_text("host 192.168.1.100")
+
+    def test_different_inputs_different_placeholders(self) -> None:
+        a = anon().mask_text("1.2.3.4")
+        b = anon().mask_text("5.6.7.8")
+        assert a != b
+
+    def test_masked_value_is_a_placeholder_in_full(self) -> None:
+        out = anon().mask_text("10.0.0.1")
+        assert out == ip_ph("10.0.0.1")
+
+
+# --------------------------------------------------------------------------- #
+# Structured, field-aware masking
+# --------------------------------------------------------------------------- #
+
+
+class TestFieldAwareMasking:
+    def test_source_ip_field(self) -> None:
+        doc = {"_source": {"source": {"ip": "192.168.1.100"}}}
+        out = anon().mask_json(doc)
+        assert out["_source"]["source"]["ip"] == ip_ph("192.168.1.100")
+
+    def test_nested_user_name_field(self) -> None:
+        doc = {"hits": {"hits": [{"_source": {"user": {"name": "admin"}}}]}}
+        out = anon().mask_json(doc)
+        assert out["hits"]["hits"][0]["_source"]["user"]["name"].startswith("[USER_")
+
+    def test_wazuh_agent_name_and_id(self) -> None:
+        doc = {
+            "_source": {
+                "wazuh": {"agent": {"name": "web-server-01", "id": "001"}},
+            }
+        }
+        out = anon().mask_json(doc)
+        assert out["_source"]["wazuh"]["agent"]["name"].startswith("[HOST_")
+        assert out["_source"]["wazuh"]["agent"]["id"].startswith("[AGENT_")
+
+    def test_same_value_same_placeholder_across_documents(self) -> None:
+        a = anon()
+        one = a.mask_json({"_source": {"user": {"name": "admin"}}})
+        two = a.mask_json({"_source": {"user": {"name": "admin"}}})
+        assert one["_source"]["user"]["name"] == two["_source"]["user"]["name"]
+
+    def test_free_text_fields_get_embedded_ip_masking(self) -> None:
+        doc = {"_source": {"event": {"original": "Failed login from 192.168.1.100"}}}
+        out = anon().mask_json(doc)
+        assert "192.168.1.100" not in out["_source"]["event"]["original"]
+        assert "[IP_" in out["_source"]["event"]["original"]
+
+    def test_mask_response_clones_and_masks_json(self) -> None:
+        a = anon()
+        response = Response(
+            200,
+            json.dumps({"_source": {"user": {"name": "admin"}}}),
+            "https://indexer.example/x",
+        )
+        masked = a.mask_response(response)
+        assert masked is not response
+        assert "admin" not in masked.text
+        assert "[USER_" in masked.text
+
+    def test_mask_response_leaves_non_json_alone(self) -> None:
+        a = anon()
+        response = Response(200, "not json at all", "https://indexer.example/x")
+        assert a.mask_response(response) is response
+
+
+class TestMaskOverview:
+    def test_agent_names_are_masked(self) -> None:
+        result = _overview.parse(
+            {
+                "hits": {"total": {"value": 10, "relation": "eq"}},
+                "aggregations": {
+                    "agents": {
+                        "buckets": [
+                            {"key": "web-server-01", "doc_count": 6},
+                            {"key": "opnsense", "doc_count": 4},
+                        ],
+                        "sum_other_doc_count": 0,
+                    },
+                    "agent_count": {"value": 2},
+                },
+            }
+        )
+        masked = anon().mask_overview(result)
+        names = [b.key for b in masked.agents]
+        assert all(not n.startswith("web-server-01") and not n.startswith("opnsense") for n in names)
+        assert all(n.startswith("[HOST_") for n in names)
+        assert masked.agents[0].count == 6
+
+
+# --------------------------------------------------------------------------- #
+# Verify and block
+# --------------------------------------------------------------------------- #
+
+
+class TestVerify:
+    def test_clean_output_has_no_residuals(self) -> None:
+        a = anon()
+        masked = a.mask_text("all clean now [IP_abc123]")
+        assert a.verify(masked) == []
+
+    def test_residual_ip_is_detected(self) -> None:
+        assert anon().verify("something 10.20.30.40 slipped through") == ["IP"]
+
+    def test_residual_email_is_detected(self) -> None:
+        assert anon().verify("contact me@example.org") == ["EMAIL"]
+
+
+class TestBlocking:
+    def test_finish_returns_masked_when_clean(self, tmp_path: Any) -> None:
+        a = anon(log_path=str(tmp_path / "llm_prompts.log"))
+        raw = "login from 192.168.1.100"
+        out = a.finish("search", raw, a.mask_text(raw))
+        assert "192.168.1.100" not in out
+        assert "[IP_" in out
+        assert "GDPR BLOCKED" not in out
+
+    def test_finish_blocks_on_residual(self, tmp_path: Any) -> None:
+        # A masked output that still carries an IP simulates a masking gap:
+        # whitelist semantics mean such a response must not go out.
+        a = anon(whitelist_enabled=True, log_path=str(tmp_path / "llm_prompts.log"))
+        out = a.finish("search", "raw: 192.168.1.100", "masked but 10.0.0.5 remained")
+        assert "GDPR BLOCKED" in out
+        assert "10.0.0.5" not in out
+
+    def test_whitelist_disabled_logs_but_returns_masked(self, tmp_path: Any) -> None:
+        a = anon(
+            whitelist_enabled=False, log_path=str(tmp_path / "llm_prompts.log")
+        )
+        out = a.finish("search", "raw", "masked but 10.0.0.5 remained")
+        assert "GDPR BLOCKED" not in out
+        assert out == "masked but 10.0.0.5 remained"
+
+
+# --------------------------------------------------------------------------- #
+# Audit logging and export
+# --------------------------------------------------------------------------- #
+
+
+class TestAuditLog:
+    def test_masked_line_is_written_no_raw_by_default(
+        self, tmp_path: Any
+    ) -> None:
+        log = str(tmp_path / "llm_prompts.log")
+        a = anon(log_path=log)
+        a.finish("search", "raw has 192.168.1.100", "masked output")
+        with open(log, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        assert "MASKED" in content
+        assert "RAW" not in content
+        assert "192.168.1.100" not in content
+
+    def test_raw_logging_is_explicit(self, tmp_path: Any) -> None:
+        log = str(tmp_path / "llm_prompts.log")
+        a = anon(log_path=log, log_raw=True)
+        a.finish("search", "raw has 192.168.1.100", "masked output")
+        with open(log, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        assert "RAW" in content
+        assert "192.168.1.100" in content
+
+    def test_export_drops_raw_lines(self, tmp_path: Any) -> None:
+        log = str(tmp_path / "llm_prompts.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("ts - [EXTERNAL_LLM] - search RAW: 192.168.1.100\n")
+            fh.write("ts - [EXTERNAL_LLM] - search MASKED: [IP_abc123]\n")
+        exported = Anonymizer.export_masked_log(log)
+        assert "192.168.1.100" not in exported
+        assert "[IP_abc123]" in exported
+        assert "RAW" not in exported
+
+
+class TestReport:
+    def test_report_contains_no_raw_pii(self) -> None:
+        a = anon()
+        a.mask_json({"_source": {"user": {"name": "admin"}}})
+        a.mask_text("from 192.168.1.100")
+        report = a.report_text()
+        assert "admin" not in report
+        assert "192.168.1.100" not in report
+        assert "[USER_" in report
+        assert "[IP_" in report
+
+    def test_status_says_disabled(self) -> None:
+        a = Anonymizer(AnonymizationConfig(enabled=False))
+        assert "DISABLED" in a.status_text()
+
+
+# --------------------------------------------------------------------------- #
+# Server integration: _render masks output only when active
+# --------------------------------------------------------------------------- #
+
+
+class RecordingIndexer:
+    def __init__(self, payload: Any) -> None:
+        self.payload = payload
+
+    async def post(self, path: str, body: Any = None) -> Response:
+        return Response(
+            200, json.dumps(self.payload), f"https://indexer.example{path}"
+        )
+
+
+@pytest.fixture
+def indexer() -> Iterator[RecordingIndexer]:
+    from klaxon_mcp.config import Config
+
+    previous = server._indexer
+    previous_config = server._config
+    server._config = Config(
+        indexer_url="https://indexer.example:9200",
+        indexer_user="",
+        indexer_password="",
+        manager_url="",
+        manager_user="",
+        manager_password="",
+        engine_url="",
+        verify_ssl=False,
+        timeout=60.0,
+        schema_field_limit=200,
+        schema_probe_batch=100,
+        search_max_size=100,
+        logtest_default_trace_level="ASSET_ONLY",
+        logtest_default_space="custom",
+    )
+    server._indexer = RecordingIndexer(
+        {"hits": {"total": {"value": 1, "relation": "eq"}, "hits": []}}
+    )
+    try:
+        yield server._indexer  # type: ignore[misc]
+    finally:
+        server._indexer = previous
+        server._config = previous_config
+
+
+@pytest.fixture
+def active_server() -> Iterator[None]:
+    """Install an active anonymizer on the server module, reset afterwards."""
+    previous_anon = server._anonymizer
+    server._anonymizer = Anonymizer(AnonymizationConfig(enabled=True, log_path="/tmp/klaxon-test-anon.log"))
+    try:
+        yield
+    finally:
+        server._anonymizer = previous_anon
+
+
+class TestCli:
+    """The one-shot --anonymization-* commands need no Wazuh environment."""
+
+    def test_status_enabled(self, capsys: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        from klaxon_mcp.__main__ import main
+
+        monkeypatch.setenv("KLAXON_ANONYMIZE_EXTERNAL_LLM", "true")
+        assert main(["--anonymization-status"]) == 0
+        assert "Anonymization: ENABLED" in capsys.readouterr().out
+
+    def test_status_disabled(
+        self, capsys: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from klaxon_mcp.__main__ import main
+
+        monkeypatch.delenv("KLAXON_ANONYMIZE_EXTERNAL_LLM", raising=False)
+        assert main(["--anonymization-status"]) == 0
+        assert "DISABLED" in capsys.readouterr().out
+
+    def test_report_writes_file(
+        self, capsys: Any, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from klaxon_mcp.__main__ import main
+
+        monkeypatch.delenv("KLAXON_ANONYMIZE_EXTERNAL_LLM", raising=False)
+        out = tmp_path / "report.txt"
+        assert main(["--anonymization-report", str(out)]) == 0
+        assert "report written" in capsys.readouterr().out
+        assert out.exists()
+
+    def test_export_from_missing_log(
+        self, capsys: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from klaxon_mcp.__main__ import main
+
+        monkeypatch.setenv(
+            "KLAXON_ANONYMIZATION_LOG", "/nonexistent/dir/llm_prompts.log"
+        )
+        assert main(["--anonymization-export"]) == 1
+        assert "export failed" in capsys.readouterr().err
+
+
+class TestServerIntegration:
+    async def test_render_masks_response_when_active(self, tmp_path: Any) -> None:
+        response = Response(
+            200,
+            json.dumps({"_source": {"source": {"ip": "10.0.0.9"}}}),
+            "https://indexer.example/x",
+        )
+        previous = server._anonymizer
+        server._anonymizer = Anonymizer(
+            AnonymizationConfig(enabled=True, log_path=str(tmp_path / "llm_prompts.log"))
+        )
+        try:
+            out = server._render("search", [], response)
+            assert "10.0.0.9" not in out
+            assert "[IP_" in out
+        finally:
+            server._anonymizer = previous
+
+    async def test_render_unchanged_when_inactive(self) -> None:
+        response = Response(
+            200,
+            json.dumps({"_source": {"source": {"ip": "10.0.0.9"}}}),
+            "https://indexer.example/x",
+        )
+        previous = server._anonymizer
+        server._anonymizer = Anonymizer(AnonymizationConfig(enabled=False))
+        try:
+            out = server._render("search", [], response)
+            assert "10.0.0.9" in out
+        finally:
+            server._anonymizer = previous
+
+    async def test_search_tool_uses_the_guard(
+        self, indexer: RecordingIndexer, active_server: None
+    ) -> None:
+        from klaxon_mcp.server import search
+
+        indexer.payload = {
+            "hits": {
+                "total": {"value": 1, "relation": "eq"},
+                "hits": [
+                    {
+                        "_source": {
+                            "user": {"name": "admin"},
+                            "source": {"ip": "192.168.1.100"},
+                        }
+                    }
+                ],
+            }
+        }
+        out = await search(index="wazuh-events-v5-*", body='{"size": 1}')
+        assert "admin" not in out
+        assert "192.168.1.100" not in out
+        assert "[USER_" in out
+        assert "[IP_" in out
+
+    async def test_search_tool_untouched_when_inactive(
+        self, indexer: RecordingIndexer
+    ) -> None:
+        from klaxon_mcp.server import search
+
+        indexer.payload = {
+            "hits": {
+                "total": {"value": 1, "relation": "eq"},
+                "hits": [
+                    {
+                        "_source": {
+                            "user": {"name": "admin"},
+                            "source": {"ip": "192.168.1.100"},
+                        }
+                    }
+                ],
+            }
+        }
+        out = await search(index="wazuh-events-v5-*", body='{"size": 1}')
+        assert "admin" in out
+        assert "192.168.1.100" in out

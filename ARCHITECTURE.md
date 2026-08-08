@@ -366,6 +366,55 @@ was added.
 
 ---
 
+## The anonymization layer
+
+Klaxon is a tool server, not an agent: it does not compose prompts or call an
+LLM. Tool results go back to the MCP client, and the client feeds them to the
+chat model. So the only point where personal data can leave the operator's
+network is the **tool response boundary** — which is where the anonymization
+layer sits. There is no prompt text to whitelist server-side; the equivalent
+guarantee is that no tool response carrying unmasked PII is ever returned to an
+external client.
+
+Three mechanisms, in order (see `src/klaxon_mcp/anonymization.py`):
+
+1. **Structured pass.** `mask_json` walks the parsed response with the dotted
+   field path (`hits.hits._source.source.ip`) and replaces values under
+   configured fields wholesale. This is the only pass that can mask a bare
+   username: it knows `user.name` *means* a username, where no regex could
+   tell. `findings_overview` gets its own variant (`mask_overview`) that masks
+   agent names before the tables are rendered.
+2. **Text pass.** `mask_text` runs over the fully rendered output — tables,
+   summaries, footers — masking e-mails, IPv4/IPv6 addresses, and usernames in
+   their log context (`user=…`, `login as/for/by …`). The username pass runs
+   *after* the value-type passes so a source address can never be captured as a
+   username. It is deliberately conservative: bare `from`/`with` connectors
+   would eat ordinary prose ("Prevent access from external hosts"), so they are
+   not in the connector set.
+3. **The gate.** `verify` scans the masked output for residual IP addresses and
+   e-mails — the value types the masker *guarantees*. A residual means a masking
+   gap, and with the whitelist on (the default) the response is **blocked**:
+   the caller gets a `GDPR BLOCKED` notice, never the data. This is the
+   fail-closed reading of "no false negatives": where masking cannot be certain
+   (a username in unrecognised free text), the gate still covers the classes
+   that can be verified mechanically.
+
+**Determinism and no-PII-by-default.** Placeholders are derived from the value
+itself (MD5 or SHA-256, truncated to six hex digits), so the same value maps to
+the same placeholder across requests without shared state. The audit log stores
+MASKED output only; RAW output is written only when
+`KLAXON_ANONYMIZATION_LOG_RAW=true`, which makes the log a personal-data store
+and is warned about. The compliance report and the export command both emit
+placeholders and counts, never the underlying values — the export drops RAW
+lines, so the artifact for access requests contains no unmasked personal data.
+
+**Activation.** `enabled and not llm_base_url on loopback`. An unset endpoint
+is treated as external: in a GDPR context, failing to mask is the expensive
+failure, so the unknown is assumed to leave the network. Local models (Ollama,
+vLLM on localhost) are exempted by a loopback `KLAXON_LLM_BASE_URL`.
+
+---
+
 ## Deliberately not built
 
 - **No tool per data category.** The eight categories are parameter values.

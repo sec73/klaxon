@@ -216,8 +216,10 @@ and means "wrong field". `schema` and `field_coverage` make that visible.
 
 ## Configuration
 
-All configuration is environment variables. Nothing is read from a config file
-and no credential is baked into the Docker image.
+All configuration is environment variables, and no credential is baked into
+the Docker image. The one optional exception is the `anonymization:` block of a
+YAML file (`KLAXON_CONFIG`, default `./config.yaml`) — a convenience for
+shipping masking rules; environment variables still take precedence over it.
 
 | Variable | Default |
 |---|---|
@@ -237,6 +239,99 @@ and no credential is baked into the Docker image.
 Those are three separate endpoints: the indexer, the manager API, and the
 engine's own HTTP server — the last runs inside the manager container but on a
 different port from the manager API.
+
+---
+
+## Anonymization for external LLM clients (GDPR)
+
+Klaxon returns tool results to the MCP client, and the client feeds them to the
+chat model. When that model runs **outside your network** — DeepSeek cloud,
+Mistral API, anything that is not `localhost` — the results physically leave
+the building. The anonymization layer makes sure they leave without personal
+data:
+
+```
+[Wazuh indexer] → (tool result) → (anonymization) → [masked result] → [external LLM]
+```
+
+It is **off by default** and opt-in:
+
+```bash
+KLAXON_ANONYMIZE_EXTERNAL_LLM=true klaxon-mcp
+```
+
+With the switch on, tool output is masked unless the LLM endpoint is provably
+local. Set `KLAXON_LLM_BASE_URL` to a loopback address (e.g.
+`http://localhost:11434` for Ollama) and a local model keeps receiving
+**unchanged** data; an unset endpoint is treated as external, which is the
+GDPR-safe failure.
+
+**How masking works.** Two passes plus a gate:
+
+1. *Structured pass* — values under configured fields (`source.ip`,
+   `user.name`, `wazuh.agent.name`, `wazuh.agent.id`, `host.hostname`, ...) are
+   replaced wholesale with **deterministic placeholders**: the same value
+   always maps to the same placeholder. With hashing on (default) they look
+   like `[IP_abc123]`, `[USER_def789]`, `[HOST_xyz456]`, `[AGENT_ghi012]`,
+   `[EMAIL_jkl345]` (MD5 or SHA-256, first six hex digits); with hashing off
+   they are generic labels (`[IP_ADDRESS]`, `[USERNAME]`, ...).
+2. *Text pass* — IP addresses, e-mails and usernames in their log context
+   (`user=admin`, `Failed login for admin from 192.168.1.100`) are masked
+   anywhere in the rendered output, including free-text log lines.
+3. *Gate* — the masked output is scanned for residuals. With the whitelist
+   enabled (default), a response that still contains an IP or e-mail is
+   **blocked**: you get a `GDPR BLOCKED` notice instead of the data, so no
+   unmasked PII can reach an external model.
+
+**What is and is not guaranteed.** Every value under a configured field is
+masked — that is structural and exact. IP addresses, e-mails and the standard
+username formulations are masked in free text. A username that appears in free
+text in an unrecognised form is the one thing a regex cannot be certain about;
+treat the gate's residual scan as the guarantee that matters for the reliably
+detectable classes (IPs and e-mails). Review the rules by adding your own
+fields to `KLAXON_ANONYMIZATION_MASK_FIELDS` or the `anonymization:` block of a
+YAML config file (`KLAXON_CONFIG`, precedence env > YAML > default):
+
+```yaml
+anonymization:
+  enabled: true
+  llm_base_url: "https://api.deepseek.com/v1"
+  use_hash: true
+  hash_algorithm: "md5"        # or "sha256"
+  mask_fields:                 # or KLAXON_ANONYMIZATION_MASK_FIELDS
+    - "source.ip"
+    - "destination.ip"
+    - "user.name"
+    - "host.hostname"
+    - "wazuh.agent.name"
+    - "wazuh.agent.id"
+  whitelist_enabled: true
+  log_path: "llm_prompts.log"
+  log_raw: false
+```
+
+**Audit trail.** Every masked exchange is logged with a UTC timestamp to
+`KLAXON_ANONYMIZATION_LOG` (default `llm_prompts.log`), MASKED output only — no
+raw PII is persisted unless you explicitly set `KLAXON_ANONYMIZATION_LOG_RAW=true`
+(and then the log is itself a personal-data store; the server warns about that).
+
+**Compliance tooling** (no Wazuh environment needed):
+
+```bash
+klaxon-mcp --anonymization-status            # enabled? for which LLM?
+klaxon-mcp --anonymization-report            # GDPR compliance report (stdout)
+klaxon-mcp --anonymization-report report.txt # ... or to a file
+klaxon-mcp --anonymization-export export.log # anonymized log for access requests
+```
+
+The export drops RAW lines, so the artifact handed over for data-subject access
+requests (Auskunftsanfragen) contains no unmasked personal data.
+
+In the Docker image the server runs as an unprivileged user and the working
+directory is not writable, so point `KLAXON_ANONYMIZATION_LOG` at a writable
+path (e.g. `/tmp/llm_prompts.log`) when you enable anonymization there. If the
+log cannot be written the masking still applies — only the audit trail is lost,
+and the server logs that as an error.
 
 ---
 

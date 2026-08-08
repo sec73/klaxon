@@ -250,6 +250,65 @@ shape from `proto/src/tester.proto:23-32` and `:135-142` (v5.0.0-beta4).
 
 ---
 
+## Anonymization (GDPR)
+
+Applied to **every tool output** when enabled and the LLM client is not local.
+Off by default. See the README section for the full story; this page records
+the settings and what the gate does.
+
+| Setting | Env var | YAML (`anonymization:`) | Default |
+|---|---|---|---|
+| master switch | `KLAXON_ANONYMIZE_EXTERNAL_LLM` | `enabled` | `false` |
+| LLM endpoint (local detection) | `KLAXON_LLM_BASE_URL` | `llm_base_url` | unset → assumed external |
+| deterministic placeholders | `KLAXON_ANONYMIZATION_USE_HASH` | `use_hash` | `true` |
+| placeholder hash | `KLAXON_ANONYMIZATION_HASH_ALGORITHM` | `hash_algorithm` | `md5` (`sha256`) |
+| masked fields | `KLAXON_ANONYMIZATION_MASK_FIELDS` | `mask_fields` | see below |
+| block on residual PII | `KLAXON_ANONYMIZATION_WHITELIST_ENABLED` | `whitelist_enabled` | `true` |
+| audit log | `KLAXON_ANONYMIZATION_LOG` | `log_path` | `llm_prompts.log` |
+| persist unmasked output | `KLAXON_ANONYMIZATION_LOG_RAW` | `log_raw` | `false` |
+| per-line log cap | `KLAXON_ANONYMIZATION_LOG_MAX_LEN` | `log_max_len` | `20000` |
+| YAML config path | `KLAXON_CONFIG` | — | `config.yaml` |
+
+Precedence is always **env > YAML > default**. The YAML file is optional and
+only the `anonymization:` block is read.
+
+Default masked fields: `source.ip`, `destination.ip`, `client.ip`, `server.ip`,
+`related.ip`, `source.domain`, `destination.domain`, `host.hostname`,
+`host.name`, `user.name`, `user.id`, `source.user.name`,
+`destination.user.name`, `wazuh.agent.name`, `wazuh.agent.id`, `agent.name`,
+`agent.id`. A field listed here has its value replaced wholesale; the
+placeholder family follows the field name (`.ip` → `[IP_…]`, `user.name` →
+`[USER_…]`, `agent.name`/`host.hostname` → `[HOST_…]`, `agent.id` → `[AGENT_…]`).
+A custom field not in the built-in table falls back to `[USER_…]`.
+
+**Activation.** `active = enabled and not (llm_base_url on loopback)`. An unset
+endpoint is treated as external, and the server logs a warning saying so.
+
+**The gate.** After the structured and text passes, `verify` scans for residual
+IP addresses and e-mails. With `whitelist_enabled` (default) a hit **blocks the
+response** — the caller receives a `GDPR BLOCKED` notice instead of data, and
+the exchange is logged. With it off, the masked response is returned and the
+warning is logged only.
+
+**Audit log format** (`llm_prompts.log`, one line per exchange):
+
+```
+2026-08-08T12:34:56+00:00 - [EXTERNAL_LLM] - search MASKED: {"hits": {...}}
+2026-08-08T12:34:56+00:00 - [EXTERNAL_LLM] - manager BLOCKED: residual PII (IP) ...
+```
+
+RAW lines appear only with `KLAXON_ANONYMIZATION_LOG_RAW=true`.
+
+**CLI commands** (none require the Wazuh environment, none serve):
+
+```bash
+klaxon-mcp --anonymization-status
+klaxon-mcp --anonymization-report [OUTFILE]
+klaxon-mcp --anonymization-export [OUTFILE]   # RAW lines dropped
+```
+
+---
+
 ## Transport options
 
 | Variable | Flag | Default |

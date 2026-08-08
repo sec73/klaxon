@@ -52,7 +52,85 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Default INFO.",
     )
+    anonymization = parser.add_argument_group(
+        "anonymization",
+        "One-shot commands for the PII anonymization layer (GDPR). "
+        "None of them require the Wazuh environment, and none of them serve.",
+    )
+    anonymization.add_argument(
+        "--anonymization-status",
+        action="store_true",
+        help="Print whether anonymization is enabled and for which LLM, then exit.",
+    )
+    anonymization.add_argument(
+        "--anonymization-report",
+        nargs="?",
+        const="",
+        metavar="OUTFILE",
+        help="Generate the DSGVO/GDPR compliance report. With OUTFILE, write it "
+        "there instead of stdout.",
+    )
+    anonymization.add_argument(
+        "--anonymization-export",
+        nargs="?",
+        const="",
+        metavar="OUTFILE",
+        help="Export the anonymized (MASKED/BLOCKED) prompt log — the artifact "
+        "for data-subject access requests. RAW lines are dropped, so the export "
+        "contains no unmasked personal data. With OUTFILE, write it there instead "
+        "of stdout.",
+    )
     return parser.parse_args(argv)
+
+
+def _run_anonymization_command(args: argparse.Namespace) -> int:
+    """Handle the one-shot anonymization commands without touching Wazuh."""
+    from .anonymization import Anonymizer
+    from .config import AnonymizationConfig, ConfigError
+
+    try:
+        config = AnonymizationConfig.from_env()
+    except ConfigError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    anon = Anonymizer(config)
+
+    if args.anonymization_status:
+        print(anon.status_text())
+        return 0
+
+    if args.anonymization_report is not None:
+        report = anon.report_text()
+        if args.anonymization_report:
+            try:
+                with open(args.anonymization_report, "w", encoding="utf-8") as fh:
+                    fh.write(report + "\n")
+            except OSError as exc:
+                print(f"report write failed: {exc}", file=sys.stderr)
+                return 1
+            print(f"report written to {args.anonymization_report}")
+        else:
+            print(report)
+        return 0
+
+    if args.anonymization_export is not None:
+        text = Anonymizer.export_masked_log(
+            config.log_path, args.anonymization_export or None
+        )
+        if text.startswith("export failed"):
+            print(text, file=sys.stderr)
+            return 1
+        if args.anonymization_export:
+            print(
+                f"anonymized log exported to {args.anonymization_export} "
+                f"(source: {config.log_path})"
+            )
+        else:
+            print(text)
+        return 0
+
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -85,6 +163,15 @@ def main(argv: list[str] | None = None) -> int:
         overrides["allowed_hosts"] = tuple(args.allowed_hosts)
     if overrides:
         cfg = replace(cfg, **overrides)  # type: ignore[arg-type]
+
+    # The one-shot anonymization commands need no Wazuh environment and must
+    # not be blocked by its absence, so they run before Config.from_env().
+    if (
+        args.anonymization_status
+        or args.anonymization_report is not None
+        or args.anonymization_export is not None
+    ):
+        return _run_anonymization_command(args)
 
     # Imported here so that --help works without the Wazuh environment set.
     from .server import mcp

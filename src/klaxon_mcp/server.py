@@ -29,6 +29,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from . import coverage, diagnostics, overview
+from .anonymization import Anonymizer
 from .clients import (
     EngineClient,
     IndexerClient,
@@ -96,6 +97,7 @@ _config: Config | None = None
 _indexer: IndexerClient | None = None
 _manager: ManagerClient | None = None
 _engine: EngineClient | None = None
+_anonymizer: Anonymizer | None = None
 
 
 def get_config() -> Config:
@@ -106,6 +108,13 @@ def get_config() -> Config:
         except ConfigError as exc:
             raise ToolError(str(exc)) from exc
     return _config
+
+
+def get_anonymizer() -> Anonymizer:
+    global _anonymizer
+    if _anonymizer is None:
+        _anonymizer = Anonymizer(get_config().anonymization)
+    return _anonymizer
 
 
 def get_indexer() -> IndexerClient:
@@ -187,6 +196,48 @@ def _cap_size(body: Any, limit: int) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# The anonymization guard
+# --------------------------------------------------------------------------- #
+
+
+def _render(
+    tool: str,
+    notices: list[str],
+    response: Response,
+    *,
+    summary: str | None = None,
+    footer: str | None = None,
+) -> str:
+    """diagnostics.render plus the anonymization layer when it is active.
+
+    The raw render is computed first — that is what the audit log's RAW line
+    records when RAW logging is enabled. The response body is then masked
+    structurally, the whole rendered output gets the text-level pass, and
+    `finish` verifies and either returns the masked output or blocks it.
+    """
+    raw = diagnostics.render(notices, response, summary=summary, footer=footer)
+    anon = get_anonymizer()
+    if not anon.active:
+        return raw
+    masked_response = anon.mask_response(response)
+    if masked_response is not response:
+        masked = diagnostics.render(
+            notices, masked_response, summary=summary, footer=footer
+        )
+    else:
+        masked = raw
+    return anon.finish(tool, raw, anon.mask_text(masked))
+
+
+def _guarded_text(tool: str, text: str) -> str:
+    """Run a plain rendered string through the anonymization layer."""
+    anon = get_anonymizer()
+    if not anon.active:
+        return text
+    return anon.finish(tool, text, anon.mask_text(text))
+
+
+# --------------------------------------------------------------------------- #
 # 1. search
 # --------------------------------------------------------------------------- #
 
@@ -239,7 +290,7 @@ async def search(index: str, body: str) -> str:
         raise ToolError(str(exc)) from exc
 
     notices.extend(diagnostics.search_notices(safe_index, parsed_body, response))
-    return diagnostics.render(notices, response)
+    return _render("search", notices, response)
 
 
 # --------------------------------------------------------------------------- #
@@ -341,7 +392,7 @@ async def schema(
                     f"[INDEX NOT FOUND] Nothing matches {safe_index!r}. "
                     f"Valid starting points: {', '.join(SUGGESTED_PATTERNS)}."
                 )
-        return diagnostics.render(notices, caps.response)
+        return _render("schema", notices, caps.response)
 
     mapped = caps.fields
     truncated = False
@@ -456,7 +507,7 @@ def _schema_output(
         parts.append("listing:          TRUNCATED")
     parts.append("")
     parts.append(body)
-    return "\n".join(parts)
+    return _guarded_text("schema", "\n".join(parts))
 
 
 # --------------------------------------------------------------------------- #
@@ -544,11 +595,18 @@ async def logtest(
     else:
         notices.extend(_logtest_notices(response))
 
-    return diagnostics.render(
-        notices,
-        response,
-        footer=f"request: POST {LOGTEST_ENDPOINT}\n{json.dumps(payload, indent=2)}",
-    )
+    footer = f"request: POST {LOGTEST_ENDPOINT}\n{json.dumps(payload, indent=2)}"
+    if get_anonymizer().active:
+        # The footer echoes the raw event line; mask it so the request recap
+        # carries no more personal data than the (already masked) response.
+        masked_payload = dict(payload)
+        masked_payload["event"] = get_anonymizer().mask_text(payload["event"])
+        footer = (
+            f"request: POST {LOGTEST_ENDPOINT}\n"
+            f"{json.dumps(masked_payload, indent=2)}"
+        )
+
+    return _render("logtest", notices, response, footer=footer)
 
 
 def _logtest_notices(response: Response) -> list[str]:
@@ -659,7 +717,7 @@ async def manager(path: str, params: dict[str, Any] | None = None) -> str:
             f"[HTTP {response.status_code}] Returned unmodified from the manager API."
         )
 
-    return diagnostics.render(notices, response, footer=f"request: GET {safe_path}")
+    return _render("manager", notices, response, footer=f"request: GET {safe_path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -718,8 +776,8 @@ async def detectors(
                 f"[HTTP {response.status_code}] Returned unmodified from the "
                 f"Security Analytics plugin."
             )
-        return diagnostics.render(
-            notices, response, footer=f"request: GET {DETECTORS_BASE}/{safe_id}"
+        return _render(
+            "detectors", notices, response, footer=f"request: GET {DETECTORS_BASE}/{safe_id}"
         )
 
     if size < 1:
@@ -757,8 +815,8 @@ async def detectors(
                         f"raise `size` to check."
                     )
 
-    return diagnostics.render(
-        notices, response, footer=f"request: POST {DETECTORS_SEARCH}"
+    return _render(
+        "detectors", notices, response, footer=f"request: POST {DETECTORS_SEARCH}"
     )
 
 
@@ -843,7 +901,8 @@ async def tester_sessions(action: str = "list") -> str:
         raise ToolError(str(exc)) from exc
 
     if response.status_code in (401, 403):
-        return diagnostics.render(
+        return _render(
+            "tester_sessions",
             [
                 f"[HTTP {response.status_code}] The engine's internal API refused the "
                 f"request. Klaxon sends no credentials to it: the auth scheme of "
@@ -857,7 +916,8 @@ async def tester_sessions(action: str = "list") -> str:
         )
 
     if response.status_code == 404:
-        return diagnostics.render(
+        return _render(
+            "tester_sessions",
             [
                 f"[HTTP 404] {TESTER_TABLE_GET} does not exist at "
                 f"{get_config().engine_url!r}. Either this build predates the route, "
@@ -869,7 +929,8 @@ async def tester_sessions(action: str = "list") -> str:
         )
 
     if not response.ok:
-        return diagnostics.render(
+        return _render(
+            "tester_sessions",
             [
                 f"[HTTP {response.status_code}] The engine rejected the session table "
                 f"request. The unmodified body is below."
@@ -882,7 +943,8 @@ async def tester_sessions(action: str = "list") -> str:
     notices = diagnostics.tester_notices(parsed)
     sessions = diagnostics.tester_sessions(parsed)
 
-    return diagnostics.render(
+    return _render(
+        "tester_sessions",
         notices,
         response,
         summary=f"sessions: {len(sessions)}\n\n{_render_sessions(sessions)}",
@@ -935,6 +997,22 @@ def _summary_output(
         parts.append("")
         parts.append(footer)
     return "\n".join(parts)
+
+
+def _guarded_summary(
+    tool: str, notices: list[str], head: str, body: str, footer: str | None = None
+) -> str:
+    """_summary_output plus the anonymization layer.
+
+    The structured pass for the convenience tools happens before rendering (the
+    caller masks the parsed Overview), so the raw string is already free of
+    field-level PII; the text pass and the residual scan still run here.
+    """
+    raw = _summary_output(notices, head, body, footer)
+    anon = get_anonymizer()
+    if not anon.active:
+        return raw
+    return anon.finish(tool, raw, anon.mask_text(raw))
 
 
 @mcp.tool()
@@ -1015,7 +1093,8 @@ async def findings_overview(
             f"data, and `detectors` to check that anything is writing findings at "
             f"all."
         )
-        return _summary_output(
+        return _guarded_summary(
+            "findings_overview",
             notices,
             overview.header(FINDINGS_PATTERN, hours, None, 0),
             "(no severity breakdown — the field is empty index-wide)",
@@ -1036,9 +1115,11 @@ async def findings_overview(
             f"against {FINDINGS_PATTERN!r}. No summary was produced; the unmodified "
             f"error body is below."
         )
-        return diagnostics.render(notices, response, footer=footer)
+        return _render("findings_overview", notices, response, footer=footer)
 
     result = overview.parse(response.json())
+    if get_anonymizer().active:
+        result = get_anonymizer().mask_overview(result)
 
     if result.total == 0:
         scope = (
@@ -1055,7 +1136,8 @@ async def findings_overview(
             f"severity level.{scope} Widen `hours` before concluding the deployment "
             f"is quiet."
         )
-        return _summary_output(
+        return _guarded_summary(
+            "findings_overview",
             notices,
             overview.header(FINDINGS_PATTERN, hours, 0, level_docs),
             f"(no findings in the last {hours}h)",
@@ -1066,7 +1148,8 @@ async def findings_overview(
     notices.extend(overview.overview_notices(result, hours))
     notices.append(overview.SCALE_NOTICE)
 
-    return _summary_output(
+    return _guarded_summary(
+        "findings_overview",
         notices,
         overview.header(FINDINGS_PATTERN, hours, result.total, level_docs),
         overview.render(result),
@@ -1167,7 +1250,7 @@ async def field_coverage(
                     f"[INDEX NOT FOUND] Nothing matches {safe_index!r}. "
                     f"Valid starting points: {', '.join(SUGGESTED_PATTERNS)}."
                 )
-        return diagnostics.render(notices, caps.response)
+        return _render("field_coverage", notices, caps.response)
 
     mapped = caps.fields
     if not mapped:
@@ -1181,7 +1264,8 @@ async def field_coverage(
         hint = _shadow_hint(prefix)
         if hint:
             notices.append(f"[HINT] {hint}")
-        return _summary_output(
+        return _guarded_summary(
+            "field_coverage",
             notices,
             coverage.header(safe_index, prefix, hours, None, None, 0, 0),
             "(no fields to measure)",
@@ -1218,7 +1302,7 @@ async def field_coverage(
                 f"{label} failed, so there is no denominator and no coverage can be "
                 f"computed. The unmodified error body is below."
             )
-            return diagnostics.render(notices, response)
+            return _render("field_coverage", notices, response)
 
     if grand_total is None or window_total is None:
         notices.append(
@@ -1226,7 +1310,8 @@ async def field_coverage(
             "readable hits.total. No percentage is reported rather than one "
             "derived from a guessed denominator."
         )
-        return _summary_output(
+        return _guarded_summary(
+            "field_coverage",
             notices,
             coverage.header(
                 safe_index, prefix, hours, window_total, grand_total, len(mapped), 0
@@ -1242,7 +1327,8 @@ async def field_coverage(
             f"0% fields, it is an empty index. Check the pattern before concluding "
             f"the normalisation is broken."
         )
-        return _summary_output(
+        return _guarded_summary(
+            "field_coverage",
             notices,
             coverage.header(safe_index, prefix, hours, 0, 0, len(mapped), 0),
             "(no documents in scope)",
@@ -1393,7 +1479,8 @@ async def field_coverage(
         + (", 1 _source sample)" if unmeasurable else ")")
     )
 
-    return _summary_output(
+    return _guarded_summary(
+        "field_coverage",
         notices,
         coverage.header(
             safe_index,

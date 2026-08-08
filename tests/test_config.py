@@ -13,10 +13,11 @@ request — and a default is what most deployments will actually run with.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import pytest
 
-from klaxon_mcp.config import Config, ConfigError
+from klaxon_mcp.config import AnonymizationConfig, Config, ConfigError
 
 WAZUH_VARS = (
     "WAZUH_INDEXER_URL",
@@ -35,11 +36,24 @@ WAZUH_VARS = (
     "WAZUH_LOGTEST_SPACE",
 )
 
+KLAXON_VARS = (
+    "KLAXON_ANONYMIZE_EXTERNAL_LLM",
+    "KLAXON_LLM_BASE_URL",
+    "KLAXON_ANONYMIZATION_USE_HASH",
+    "KLAXON_ANONYMIZATION_HASH_ALGORITHM",
+    "KLAXON_ANONYMIZATION_MASK_FIELDS",
+    "KLAXON_ANONYMIZATION_WHITELIST_ENABLED",
+    "KLAXON_ANONYMIZATION_LOG",
+    "KLAXON_ANONYMIZATION_LOG_RAW",
+    "KLAXON_ANONYMIZATION_LOG_MAX_LEN",
+    "KLAXON_CONFIG",
+)
+
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """A developer's own .env must not decide what the defaults look like."""
-    for name in WAZUH_VARS:
+    for name in (*WAZUH_VARS, *KLAXON_VARS):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("WAZUH_INDEXER_URL", "https://indexer.example:9200")
 
@@ -108,3 +122,99 @@ class TestRequiredAndOptional:
         monkeypatch.setenv("WAZUH_SEARCH_MAX_SIZE", "lots")
         with pytest.raises(ConfigError, match="must be an integer"):
             Config.from_env()
+
+
+class TestAnonymizationDefaults:
+    def test_anonymization_is_off_by_default(self) -> None:
+        """The feature is opt-in: no env var, no masking, nothing touches output."""
+        config = Config.from_env()
+        assert config.anonymization.enabled is False
+        assert config.anonymization.active is False
+
+    def test_sensible_security_defaults(self) -> None:
+        config = Config.from_env().anonymization
+        # Hash placeholders and the strict whitelist are the safe readings.
+        assert config.use_hash is True
+        assert config.hash_algorithm == "md5"
+        assert config.whitelist_enabled is True
+        assert config.log_raw is False
+        assert config.log_path == "llm_prompts.log"
+
+
+class TestAnonymizationEnv:
+    def test_master_switch_turns_it_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZE_EXTERNAL_LLM", "true")
+        assert Config.from_env().anonymization.enabled is True
+
+    def test_external_endpoint_is_active(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZE_EXTERNAL_LLM", "true")
+        monkeypatch.setenv("KLAXON_LLM_BASE_URL", "https://api.deepseek.com/v1")
+        assert Config.from_env().anonymization.active is True
+
+    def test_loopback_endpoint_means_local_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZE_EXTERNAL_LLM", "true")
+        monkeypatch.setenv("KLAXON_LLM_BASE_URL", "http://localhost:11434")
+        assert Config.from_env().anonymization.active is False
+
+    def test_hash_algorithm_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_HASH_ALGORITHM", "sha256")
+        assert Config.from_env().anonymization.hash_algorithm == "sha256"
+
+    def test_invalid_hash_algorithm_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_HASH_ALGORITHM", "rot13")
+        with pytest.raises(ConfigError, match="must be 'md5' or 'sha256'"):
+            AnonymizationConfig.from_env()
+
+    def test_mask_fields_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "KLAXON_ANONYMIZATION_MASK_FIELDS", "source.ip,user.name, custom.field"
+        )
+        config = AnonymizationConfig.from_env()
+        assert config.mask_fields == ("source.ip", "user.name", "custom.field")
+
+
+class TestAnonymizationYaml:
+    def test_yaml_enables_when_env_unset(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "anonymization:\n  enabled: true\n  hash_algorithm: sha256\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        config = AnonymizationConfig.from_env()
+        assert config.enabled is True
+        assert config.hash_algorithm == "sha256"
+
+    def test_env_beats_yaml(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text("anonymization:\n  enabled: true\n", encoding="utf-8")
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        monkeypatch.setenv("KLAXON_ANONYMIZE_EXTERNAL_LLM", "false")
+        config = AnonymizationConfig.from_env()
+        assert config.enabled is False
+
+    def test_missing_yaml_is_ignored(self) -> None:
+        config = AnonymizationConfig.from_env()
+        assert config.enabled is False
+
+    def test_yaml_mask_fields(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "anonymization:\n  mask_fields:\n    - source.ip\n    - user.name\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        config = AnonymizationConfig.from_env()
+        assert config.mask_fields == ("source.ip", "user.name")

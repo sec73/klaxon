@@ -10,6 +10,12 @@ dist/
 # Never commit credentials. .env.example is the template.
 .env
 
+# The anonymization audit log (llm_prompts.log) is a runtime artifact and can
+# contain personal data — never commit it. Its export and the compliance report
+# are generated on demand.
+llm_prompts.log
+dsgvo_compliance_report.txt
+
 # Personal Claude Code settings; the shared ones belong in .claude/settings.json.
 .claude/*.local.json
 .claude/

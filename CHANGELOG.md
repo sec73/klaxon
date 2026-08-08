@@ -4,9 +4,9 @@ All notable changes to Klaxon are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-While the version stays below `1.0.0`, a minor bump may change behaviour.
 
-## [Unreleased]
+
+## ## [0.1.3] — 2026-08-08
 
 ### Added
 
@@ -41,6 +41,36 @@ While the version stays below `1.0.0`, a minor bump may change behaviour.
 
 - Open WebUI setup guide in the README, covering v0.6.31+ native MCP
   registration and connecting DeepSeek V4 Flash as the chat model.
+
+### Added
+
+- **PII anonymization for external LLM clients (GDPR).** A new layer masks
+  personal data in every tool output before it is returned to the MCP client,
+  so no unmasked PII reaches a cloud model (DeepSeek, Mistral, ...). Off by
+  default; enabled with `KLAXON_ANONYMIZE_EXTERNAL_LLM=true` and active unless
+  `KLAXON_LLM_BASE_URL` points at loopback (a local model keeps receiving
+  unchanged data; an unset endpoint is treated as external).
+
+  Two masking passes plus a gate: a structured pass replaces values under
+  configured fields (`source.ip`, `user.name`, `wazuh.agent.name`, ...) with
+  **deterministic placeholders** (`[IP_abc123]`, `[USER_def789]`, ...; MD5 or
+  SHA-256 via `KLAXON_ANONYMIZATION_HASH_ALGORITHM`), a text pass masks
+  e-mails, IP addresses and usernames in their log context anywhere in the
+  rendered output, and the gate blocks a response that still carries residual
+  IPs/e-mails (`KLAXON_ANONYMIZATION_WHITELIST_ENABLED`, on by default) instead
+  of sending it.
+
+  Every exchange is logged with a UTC timestamp to `llm_prompts.log` (MASKED
+  output only; `KLAXON_ANONYMIZATION_LOG_RAW=true` persists raw output and
+  warns that the log is then a personal-data store). New one-shot CLI commands
+  — `--anonymization-status`, `--anonymization-report [OUTFILE]`,
+  `--anonymization-export [OUTFILE]` (RAW lines dropped) — need no Wazuh
+  environment and serve the compliance report and access requests.
+
+  The `anonymization:` block can also be configured in an optional YAML file
+  (`KLAXON_CONFIG`, default `./config.yaml`; precedence env > YAML > default),
+  which adds `pyyaml` as a runtime dependency and `types-PyYAML` to the dev
+  extras. Custom rules are added by extending `mask_fields`.
 
 ### Fixed
 
