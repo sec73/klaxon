@@ -34,6 +34,9 @@ dev = [
 
 [project.scripts]
 klaxon-mcp = "klaxon_mcp.__main__:main"
+# The DSGVO plausibility checker as a standalone CLI (`klaxon-mcp --gdpr-check`
+# is the same code with the same flags).
+klaxon_check_gdpr = "klaxon_mcp.__main__:gdpr_cli_main"
 
 [build-system]
 requires = ["hatchling"]

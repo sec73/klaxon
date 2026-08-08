@@ -16,6 +16,11 @@ dist/
 llm_prompts.log
 dsgvo_compliance_report.txt
 
+# The DSGVO plausibility checker's runtime artifacts: audit log and
+# auto-generated compliance report.
+gdpr_check.log
+gdpr_compliance_report.json
+
 # Personal Claude Code settings; the shared ones belong in .claude/settings.json.
 .claude/*.local.json
 .claude/

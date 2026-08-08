@@ -92,10 +92,9 @@ def _yaml_get(cfg: dict[str, Any] | None, key: str, default: Any) -> Any:
     return cfg.get(key, default)
 
 
-def _anonymization_yaml(path: str) -> dict[str, Any] | None:
-    """Read the `anonymization:` section of an optional YAML config file.
+def _load_yaml_file(path: str) -> dict[str, Any] | None:
+    """Read a YAML file into a dict, tolerating absence and parse errors.
 
-    Returns None when the file is absent, unreadable or has no such section.
     The YAML dependency is optional at runtime: a missing pyyaml simply means
     the file is ignored and the environment remains the only source.
     """
@@ -108,10 +107,22 @@ def _anonymization_yaml(path: str) -> dict[str, Any] | None:
             data = yaml.safe_load(fh)
     except (OSError, yaml.YAMLError):
         return None
-    if not isinstance(data, dict):
-        return None
-    section = data.get("anonymization")
+    return data if isinstance(data, dict) else None
+
+
+def _section(data: dict[str, Any] | None, name: str) -> dict[str, Any] | None:
+    section = data.get(name) if data else None
     return section if isinstance(section, dict) else None
+
+
+def _anonymization_yaml(path: str) -> dict[str, Any] | None:
+    """Read the `anonymization:` section of an optional YAML config file."""
+    return _section(_load_yaml_file(path), "anonymization")
+
+
+def _gdpr_yaml(path: str) -> dict[str, Any] | None:
+    """Read the `gdpr_checker:` section of an optional YAML config file."""
+    return _section(_load_yaml_file(path), "gdpr_checker")
 
 
 # Fields treated as personal data by default. The value under each is replaced
@@ -269,6 +280,72 @@ _DEFAULT_ANONYMIZATION = AnonymizationConfig()
 
 
 @dataclass(frozen=True)
+class GdprConfig:
+    """Settings for the DSGVO plausibility checker (`gdpr_check` tool / CLI).
+
+    Environment-driven like everything else, with the optional YAML file
+    (KLAXON_CONFIG, `gdpr_checker:` block) as the second tier. Custom rules are
+    YAML-only — a rule is structured data (field, type, priority, regex) that
+    does not fit an environment variable.
+    """
+
+    log_path: str = "gdpr_check.log"
+    report_path: str = "gdpr_compliance_report.json"
+    # How many documents to sample for content-based classification.
+    sample_size: int = 10
+    # When true, `search` appends a DSGVO notice naming sensitive fields that
+    # appear in the hits. Cheap: a name-pattern scan, no extra cluster calls.
+    check_on_search: bool = False
+    # `gdpr_checker.custom_patterns` — each: field (exact or glob), type,
+    # priority (high|medium|low), optional regex validated against samples.
+    custom_patterns: tuple[dict[str, Any], ...] = ()
+    config_file: str = "config.yaml"
+
+    @classmethod
+    def from_env(cls) -> GdprConfig:
+        config_file = _env_str("KLAXON_CONFIG", "config.yaml") or "config.yaml"
+        gdpr_yaml = _gdpr_yaml(config_file)
+
+        sample_size = _env_int(
+            "KLAXON_GDPR_SAMPLE_SIZE", _yaml_get(gdpr_yaml, "sample_size", 10)
+        )
+        if isinstance(sample_size, bool) or not isinstance(sample_size, int):
+            sample_size = 10
+        if sample_size < 0:
+            raise ConfigError("KLAXON_GDPR_SAMPLE_SIZE must be >= 0")
+
+        log_path = _env_str(
+            "KLAXON_GDPR_CHECK_LOG",
+            _yaml_get(gdpr_yaml, "log_path", "gdpr_check.log"),
+        ) or "gdpr_check.log"
+        report_path = _env_str(
+            "KLAXON_GDPR_REPORT",
+            _yaml_get(gdpr_yaml, "report_path", "gdpr_compliance_report.json"),
+        ) or "gdpr_compliance_report.json"
+
+        raw_patterns = _yaml_get(gdpr_yaml, "custom_patterns", None)
+        custom: tuple[dict[str, Any], ...] = ()
+        if isinstance(raw_patterns, list):
+            custom = tuple(p for p in raw_patterns if isinstance(p, dict))
+
+        return cls(
+            log_path=log_path,
+            report_path=report_path,
+            sample_size=sample_size,
+            check_on_search=_env_bool(
+                "KLAXON_GDPR_CHECK_ON_SEARCH",
+                _yaml_get(gdpr_yaml, "check_on_search", False),
+            ),
+            custom_patterns=custom,
+            config_file=config_file,
+        )
+
+
+# The frozen default shared by every Config that does not say otherwise.
+_DEFAULT_GDPR = GdprConfig()
+
+
+@dataclass(frozen=True)
 class TransportConfig:
     """How the server is served, as opposed to what it connects to.
 
@@ -386,6 +463,9 @@ class Config:
     # AnonymizationConfig for the precedence (env > YAML > default).
     anonymization: AnonymizationConfig = _DEFAULT_ANONYMIZATION
 
+    # DSGVO plausibility checker settings; see GdprConfig.
+    gdpr: GdprConfig = _DEFAULT_GDPR
+
     @classmethod
     def from_env(cls) -> Config:
         indexer_url = os.environ.get("WAZUH_INDEXER_URL", "").strip().rstrip("/")
@@ -442,4 +522,5 @@ class Config:
             ),
             logtest_default_space=os.environ.get("WAZUH_LOGTEST_SPACE", "custom"),
             anonymization=AnonymizationConfig.from_env(),
+            gdpr=GdprConfig.from_env(),
         )

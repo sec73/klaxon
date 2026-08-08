@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from klaxon_mcp.config import AnonymizationConfig, Config, ConfigError
+from klaxon_mcp.config import AnonymizationConfig, Config, ConfigError, GdprConfig
 
 WAZUH_VARS = (
     "WAZUH_INDEXER_URL",
@@ -46,6 +46,11 @@ KLAXON_VARS = (
     "KLAXON_ANONYMIZATION_LOG",
     "KLAXON_ANONYMIZATION_LOG_RAW",
     "KLAXON_ANONYMIZATION_LOG_MAX_LEN",
+    "KLAXON_GDPR_CHECK_LOG",
+    "KLAXON_GDPR_REPORT",
+    "KLAXON_GDPR_SAMPLE_SIZE",
+    "KLAXON_GDPR_CHECK_ON_SEARCH",
+    "KLAXON_GDPR_INDEX",
     "KLAXON_CONFIG",
 )
 
@@ -218,3 +223,49 @@ class TestAnonymizationYaml:
         monkeypatch.setenv("KLAXON_CONFIG", str(path))
         config = AnonymizationConfig.from_env()
         assert config.mask_fields == ("source.ip", "user.name")
+
+
+class TestGdprConfig:
+    def test_defaults(self) -> None:
+        gdpr = Config.from_env().gdpr
+        assert gdpr.sample_size == 10
+        assert gdpr.log_path == "gdpr_check.log"
+        assert gdpr.report_path == "gdpr_compliance_report.json"
+        assert gdpr.check_on_search is False
+        assert gdpr.custom_patterns == ()
+
+    def test_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLAXON_GDPR_SAMPLE_SIZE", "25")
+        monkeypatch.setenv("KLAXON_GDPR_CHECK_ON_SEARCH", "true")
+        monkeypatch.setenv("KLAXON_GDPR_CHECK_LOG", "/tmp/gdpr.log")
+        gdpr = GdprConfig.from_env()
+        assert gdpr.sample_size == 25
+        assert gdpr.check_on_search is True
+        assert gdpr.log_path == "/tmp/gdpr.log"
+
+    def test_yaml_custom_patterns(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "gdpr_checker:\n"
+            "  sample_size: 5\n"
+            "  custom_patterns:\n"
+            "    - field: custom.user_id\n"
+            "      type: USER_ID\n"
+            "      priority: high\n"
+            "      regex: '^[A-Z0-9]{8}$'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        gdpr = GdprConfig.from_env()
+        assert gdpr.sample_size == 5
+        assert gdpr.custom_patterns == (
+            {"field": "custom.user_id", "type": "USER_ID",
+             "priority": "high", "regex": "^[A-Z0-9]{8}$"},
+        )
+
+    def test_invalid_sample_size_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KLAXON_GDPR_SAMPLE_SIZE", "-1")
+        with pytest.raises(ConfigError, match="must be >= 0"):
+            GdprConfig.from_env()

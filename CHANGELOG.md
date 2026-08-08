@@ -72,6 +72,25 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which adds `pyyaml` as a runtime dependency and `types-PyYAML` to the dev
   extras. Custom rules are added by extending `mask_fields`.
 
+- **DSGVO plausibility checker.** A new `gdpr_check` tool (plus
+  `klaxon-mcp --gdpr-check`, `--check-gdpr-on-startup` and the standalone
+  `klaxon_check_gdpr` script) finds sensitive fields in an index and merges
+  them into the anonymization list. Classification is three-layered: custom
+  rules from `gdpr_checker.custom_patterns` in config.yaml (field glob, type,
+  priority, optional content regex) beat field-name patterns (`source.ip`,
+  `user.name`, `host.hostname`, `user.email`, ...), which beat sampled values
+  (a custom field holding `192.168.1.100` is an IP by content; a free-text
+  field embedding IPs/e-mails/usernames is flagged as FREETEXT).
+
+  Priorities follow the spec (IPs/usernames/e-mails high, hostnames/agent-ids
+  medium); fields already in `mask_fields` are reported as covered, not
+  re-suggested. `apply=true` / `--gdpr-auto-add` merges the suggestions into
+  `anonymization.mask_fields` of config.yaml, appends to `gdpr_check.log` and
+  writes `gdpr_compliance_report.json` (the artifact to forward to a SIEM for
+  central compliance monitoring). Without it the check dry-runs, or confirms
+  per field on a TTY. `KLAXON_GDPR_CHECK_ON_SEARCH=true` makes `search` append
+  a `[GDPR]` notice naming sensitive fields present in the hits.
+
 ### Fixed
 
 - **DNS rebinding protection rejected every request when only

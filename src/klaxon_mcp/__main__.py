@@ -13,9 +13,12 @@ client — see the "Remote deployment" section of the README before using them.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
+import os
 import sys
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from .config import ConfigError, TransportConfig
 from .transport import serve
@@ -80,6 +83,63 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "contains no unmasked personal data. With OUTFILE, write it there instead "
         "of stdout.",
     )
+    gdpr = parser.add_argument_group(
+        "gdpr check",
+        "The DSGVO plausibility checker. Needs the Wazuh indexer "
+        "(WAZUH_INDEXER_URL) and exits after running — it does not serve.",
+    )
+    gdpr.add_argument(
+        "--gdpr-check",
+        nargs="?",
+        const="",
+        metavar="INDEX",
+        help="Run the DSGVO plausibility check and exit. INDEX defaults to "
+        "wazuh-events-v5-* (or KLAXON_GDPR_INDEX).",
+    )
+    gdpr.add_argument(
+        "--gdpr-prefix",
+        metavar="PREFIX",
+        help="Restrict the analysis to a field namespace, e.g. user. or source.",
+    )
+    gdpr.add_argument(
+        "--gdpr-sample",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Documents to sample for content analysis (default 10; 0 disables).",
+    )
+    gdpr.add_argument(
+        "--gdpr-auto-add",
+        action="store_true",
+        help="Add the suggested fields to config.yaml without prompting.",
+    )
+    gdpr.add_argument(
+        "--gdpr-dry-run",
+        action="store_true",
+        help="Show suggestions only; change nothing.",
+    )
+    gdpr.add_argument(
+        "--gdpr-exclude",
+        metavar="FIELDS",
+        help="Comma-separated fields to skip (internal fields without GDPR "
+        "relevance).",
+    )
+    gdpr.add_argument(
+        "--gdpr-json",
+        action="store_true",
+        help="Emit the machine-readable JSON report instead of the table.",
+    )
+    gdpr.add_argument(
+        "--gdpr-out",
+        metavar="FILE",
+        help="Write the JSON report to FILE (in addition to stdout).",
+    )
+    gdpr.add_argument(
+        "--check-gdpr-on-startup",
+        action="store_true",
+        help="Run a non-interactive DSGVO check before serving. Applies the "
+        "suggestions only when --gdpr-auto-add is set, else dry-runs.",
+    )
     return parser.parse_args(argv)
 
 
@@ -133,6 +193,245 @@ def _run_anonymization_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prompt_yes_no(prompt: str) -> bool:
+    """Interactive confirmation; non-TTY input defaults to 'no' (change nothing)."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        return False
+    return answer in {"", "y", "yes"}
+
+
+def _gdpr_check_once(
+    *,
+    index: str,
+    prefix: str | None,
+    sample: int,
+    auto_add: bool,
+    dry_run: bool,
+    exclude: set[str],
+    as_json: bool,
+    out_file: str | None,
+    interactive: bool,
+) -> int:
+    """Analyse an index and optionally merge the suggestions into config.yaml.
+
+    Shared by `--gdpr-check`, `--check-gdpr-on-startup` and the
+    `klaxon_check_gdpr` console script. Needs the Wazuh indexer.
+    """
+    from . import server
+    from .config import Config, ConfigError
+    from .gdpr import (
+        GdprLog,
+        env_hint,
+        render_json,
+        run_check,
+        update_mask_fields,
+        write_compliance_report,
+    )
+
+    try:
+        config = Config.from_env()
+    except ConfigError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    already = set(server.get_anonymizer().config.mask_fields)
+    try:
+        result = asyncio.run(
+            run_check(
+                server.get_indexer(),
+                index,
+                prefix,
+                sample,
+                config.gdpr.custom_patterns,
+                already,
+                exclude,
+            )
+        )
+    except RuntimeError as exc:
+        print(f"gdpr check failed: {exc}", file=sys.stderr)
+        return 1
+
+    if result.caps_failed is not None:
+        print(
+            f"gdpr check failed: HTTP {result.caps_failed.status_code} for "
+            f"{index!r}. The unmodified error body is below.",
+            file=sys.stderr,
+        )
+        print(result.caps_failed.text[:500], file=sys.stderr)
+        return 1
+
+    if as_json:
+        report = render_json(result)
+        print(report)
+        if out_file:
+            try:
+                with open(out_file, "w", encoding="utf-8") as fh:
+                    fh.write(report + "\n")
+            except OSError as exc:
+                print(f"report write failed: {exc}", file=sys.stderr)
+                return 1
+    else:
+        print(f"=== DSGVO PLAUSIBILITY CHECK ===")
+        print(f"index:    {index}")
+        print(
+            f"checked:  {result.mapped_total} mapped field(s)"
+            f" (sampled {sample} document(s) for content)"
+        )
+        print()
+        from .gdpr import render_table
+
+        print(render_table(result.sensitive))
+        print()
+        print(
+            f"{len(result.sensitive)} DSGVO-relevant field(s); "
+            f"{len(result.new_fields)} to add."
+        )
+        if result.new_fields:
+            print(f"env equivalent: {env_hint(result.new_fields)}")
+        print()
+
+    # Decide what to apply. Non-interactive defaults to no change, which is the
+    # safe reading: a check that quietly edits a config file is a surprise.
+    to_add = list(result.new_fields)
+    if to_add and not dry_run and not auto_add:
+        if interactive:
+            accepted: list[str] = []
+            for field in result.sensitive:
+                if field.already_configured:
+                    continue
+                if _prompt_yes_no(
+                    f'Feld "{field.field}" ({field.kind}, {field.priority}) ist '
+                    f"DSGVO-relevant. Zur Anonymisierungsliste hinzufügen? [Y/n] "
+                ):
+                    accepted.append(field.field)
+            to_add = accepted
+        else:
+            print(
+                "(non-interactive: use --gdpr-auto-add to apply, or --gdpr-dry-run)",
+                file=sys.stderr,
+            )
+            to_add = []
+
+    changed = False
+    if to_add and not dry_run:
+        changed, merged, warning = update_mask_fields(config.gdpr.config_file, to_add)
+        log = GdprLog(config.gdpr.log_path)
+        if changed:
+            log.write(
+                f'Felder "{", ".join(to_add)}" zur Anonymisierungsliste hinzugefügt '
+                f"(index {index})."
+            )
+            print(
+                f"config.yaml updated ({config.gdpr.config_file}): "
+                f"{len(merged)} field(s) in mask_fields. Restart the server to "
+                f"pick it up."
+            )
+        else:
+            print("no fields added (all already configured or write failed).")
+        if warning:
+            log.write(f"Warnung: {warning}")
+            print(f"warning: {warning}", file=sys.stderr)
+
+    report_error = write_compliance_report(
+        config.gdpr.report_path,
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "index": index,
+            "checked_fields": result.mapped_total,
+            "sensitive_fields_found": len(result.sensitive),
+            "anonymization_updated": changed,
+            "fields_added": to_add if changed else [],
+        },
+    )
+    if report_error:
+        print(report_error, file=sys.stderr)
+        return 1
+
+    if not to_add and not dry_run and not auto_add:
+        print("dry run: no changes made. Re-run with --gdpr-auto-add to apply.")
+    return 0
+
+
+def _run_gdpr_command(args: argparse.Namespace) -> int:
+    index = args.gdpr_check or os.environ.get(
+        "KLAXON_GDPR_INDEX", "wazuh-events-v5-*"
+    )
+    sample = (
+        args.gdpr_sample
+        if args.gdpr_sample is not None
+        else _default_gdpr_sample()
+    )
+    return _gdpr_check_once(
+        index=index,
+        prefix=args.gdpr_prefix,
+        sample=sample,
+        auto_add=args.gdpr_auto_add,
+        dry_run=args.gdpr_dry_run,
+        exclude=set(
+            f.strip() for f in (args.gdpr_exclude or "").split(",") if f.strip()
+        ),
+        as_json=args.gdpr_json,
+        out_file=args.gdpr_out,
+        interactive=not args.gdpr_dry_run,
+    )
+
+
+def _default_gdpr_sample() -> int:
+    from .config import GdprConfig
+
+    return GdprConfig.from_env().sample_size
+
+
+def gdpr_cli_main(argv: list[str] | None = None) -> int:
+    """Console entry point `klaxon_check_gdpr`: the checker as a CLI tool.
+
+    `klaxon-mcp --gdpr-check` is the same code with the same flags; this name
+    exists for scripts that call the checker directly.
+    """
+    parser = argparse.ArgumentParser(
+        prog="klaxon_check_gdpr",
+        description="DSGVO plausibility checker for a Wazuh 5 index.",
+    )
+    parser.add_argument("--index", default="wazuh-events-v5-*", metavar="INDEX")
+    parser.add_argument("--prefix", metavar="PREFIX")
+    parser.add_argument("--sample", type=int, default=None, metavar="N")
+    parser.add_argument("--auto-add", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--exclude", metavar="FIELDS")
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    parser.add_argument("--out", metavar="FILE")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        stream=sys.stderr,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    return _gdpr_check_once(
+        index=args.index,
+        prefix=args.prefix,
+        sample=args.sample if args.sample is not None else _default_gdpr_sample(),
+        auto_add=args.auto_add,
+        dry_run=args.dry_run,
+        exclude=set(
+            f.strip() for f in (args.exclude or "").split(",") if f.strip()
+        ),
+        as_json=args.as_json,
+        out_file=args.out,
+        interactive=not args.dry_run,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
@@ -172,6 +471,37 @@ def main(argv: list[str] | None = None) -> int:
         or args.anonymization_export is not None
     ):
         return _run_anonymization_command(args)
+
+    # The DSGVO plausibility check needs the Wazuh indexer but not the MCP
+    # listener; it runs and exits.
+    if args.gdpr_check is not None:
+        return _run_gdpr_command(args)
+
+    # Optional compliance check before serving. Never prompts: applies only
+    # with --gdpr-auto-add, dry-runs otherwise, and serves regardless.
+    if args.check_gdpr_on_startup:
+        rc = _gdpr_check_once(
+            index=os.environ.get("KLAXON_GDPR_INDEX", "wazuh-events-v5-*"),
+            prefix=args.gdpr_prefix,
+            sample=(
+                args.gdpr_sample
+                if args.gdpr_sample is not None
+                else _default_gdpr_sample()
+            ),
+            auto_add=args.gdpr_auto_add,
+            dry_run=not args.gdpr_auto_add,
+            exclude=set(
+                f.strip() for f in (args.gdpr_exclude or "").split(",") if f.strip()
+            ),
+            as_json=False,
+            out_file=None,
+            interactive=False,
+        )
+        if rc != 0:
+            print(
+                "startup DSGVO check did not complete cleanly; serving anyway.",
+                file=sys.stderr,
+            )
 
     # Imported here so that --help works without the Wazuh environment set.
     from .server import mcp

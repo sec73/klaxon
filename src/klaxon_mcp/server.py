@@ -23,12 +23,13 @@ JSON, and both put the request they issued in the footer.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import coverage, diagnostics, overview
+from . import coverage, diagnostics, gdpr, overview
 from .anonymization import Anonymizer
 from .clients import (
     EngineClient,
@@ -290,6 +291,16 @@ async def search(index: str, body: str) -> str:
         raise ToolError(str(exc)) from exc
 
     notices.extend(diagnostics.search_notices(safe_index, parsed_body, response))
+    if get_config().gdpr.check_on_search:
+        sensitive = gdpr.scan_hits(response.json(), get_config().gdpr.custom_patterns)
+        if sensitive:
+            masking = "active" if get_anonymizer().active else "inactive"
+            notices.append(
+                f"[GDPR] The response carries {len(sensitive)} DSGVO-relevant "
+                f"field(s) in its hits: {', '.join(sensitive)}. Masking is "
+                f"{masking}. Run the `gdpr_check` tool to review and extend "
+                f"the anonymization list."
+            )
     return _render("search", notices, response)
 
 
@@ -1494,6 +1505,151 @@ async def field_coverage(
         coverage.render(kept, window_measured),
         footer,
     )
+
+
+# --------------------------------------------------------------------------- #
+# 9. gdpr_check
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+async def gdpr_check(
+    index: str,
+    prefix: str | None = None,
+    sample_docs: int | None = None,
+    apply: bool = False,
+    exclude: list[str] | None = None,
+    as_json: bool = False,
+) -> str:
+    """Run the DSGVO plausibility check on an index: find sensitive fields.
+
+    Reads the index mappings, samples a few documents, and classifies the
+    fields by three heuristics in decreasing certainty: custom rules from
+    config.yaml (`gdpr_checker.custom_patterns`), field-name patterns
+    (`source.ip`, `user.name`, `host.hostname`, `user.email`, ...), and sampled
+    values (an actual value like `192.168.1.100` reveals an IP even when the
+    field name does not).
+
+    Priorities: IPs, usernames and e-mails are directly personal (high);
+    hostnames and agent ids are indirectly personal (medium); free-text fields
+    that embed personal data are flagged as such. Fields already in the
+    anonymization `mask_fields` are reported as covered, not re-suggested.
+
+    With `apply=true` the suggested fields are merged into
+    `anonymization.mask_fields` of config.yaml (KLAXON_CONFIG), the action is
+    appended to `gdpr_check.log`, and `gdpr_compliance_report.json` is
+    written. The change takes effect for the running server on restart unless
+    KLAXON_ANONYMIZATION_MASK_FIELDS is set, which always overrides the file.
+    `apply=false` (default) is a dry run: suggestions only, nothing changed.
+
+    Args:
+        index: Index or datastream pattern, e.g. "wazuh-events-v5-*".
+        prefix: Restrict to a field namespace, e.g. "user." or "source.".
+        sample_docs: Documents to sample for content analysis. Defaults to
+            KLAXON_GDPR_SAMPLE_SIZE (10). 0 disables sampling.
+        apply: When true, merge the suggested fields into config.yaml and log.
+        exclude: Field names to skip (e.g. internal fields without GDPR
+            relevance).
+        as_json: When true, return a machine-readable JSON report instead of
+            the table.
+    """
+    try:
+        safe_index = validate_index(index)
+    except ValidationError as exc:
+        raise ToolError(str(exc)) from exc
+
+    prefix = _safe_prefix(prefix)
+    config = get_config()
+    gdpr_cfg = config.gdpr
+    sample = sample_docs if sample_docs is not None else gdpr_cfg.sample_size
+    excluded = set(exclude or ())
+    already = set(get_anonymizer().config.mask_fields)
+
+    try:
+        result = await gdpr.run_check(
+            get_indexer(),
+            safe_index,
+            prefix,
+            sample,
+            gdpr_cfg.custom_patterns,
+            already,
+            excluded,
+        )
+    except RuntimeError as exc:
+        raise ToolError(str(exc)) from exc
+
+    if result.caps_failed is not None:
+        notices = [
+            f"[HTTP {result.caps_failed.status_code}] _field_caps failed for "
+            f"{safe_index!r}; no DSGVO analysis was produced. The unmodified "
+            f"error body is below."
+        ]
+        return _render("gdpr_check", notices, result.caps_failed)
+
+    if as_json:
+        return gdpr.render_json(result)
+
+    head = (
+        "=== DSGVO PLAUSIBILITY CHECK ===\n"
+        f"index:    {safe_index}\n"
+        f"checked:  {result.mapped_total} mapped field(s)"
+        f" (sampled {result.sample_size} document(s) for content)"
+    )
+    body = gdpr.render_table(result.sensitive)
+
+    summary = []
+    total = len(result.sensitive)
+    covered = sum(1 for f in result.sensitive if f.already_configured)
+    to_add = result.new_fields
+    summary.append(f"{total} DSGVO-relevant field(s) found; {covered} already "
+                   f"in mask_fields; {len(to_add)} to add.")
+    if to_add:
+        summary.append(
+            f"env equivalent: {gdpr.env_hint(to_add)}"
+        )
+    if apply and to_add:
+        changed, merged, warning = gdpr.update_mask_fields(
+            gdpr_cfg.config_file, to_add
+        )
+        gdpr_log = gdpr.GdprLog(gdpr_cfg.log_path)
+        if changed:
+            joined = ", ".join(to_add)
+            gdpr_log.write(
+                f'Felder "{joined}" zur Anonymisierungsliste hinzugefügt '
+                f"(index {safe_index})."
+            )
+        if warning:
+            gdpr_log.write(f"Warnung: {warning}")
+        gdpr.write_compliance_report(
+            gdpr_cfg.report_path,
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "index": safe_index,
+                "checked_fields": result.mapped_total,
+                "sensitive_fields_found": total,
+                "anonymization_updated": changed,
+                "fields_added": to_add if changed else [],
+            },
+        )
+        if changed:
+            summary.append(
+                f"config.yaml updated ({gdpr_cfg.config_file}): "
+                f"{len(merged)} field(s) in mask_fields. The running server "
+                f"picks this up on restart."
+            )
+        else:
+            summary.append("nothing added (all fields already configured or rejected).")
+    elif apply and not to_add:
+        summary.append("nothing to add — every sensitive field is already covered.")
+    else:
+        summary.append(
+            "dry run (apply=false): nothing changed. Re-run with apply=true to "
+            "merge the fields into config.yaml."
+        )
+
+    parts = [head, "", body, "", "--- summary ---"]
+    parts.extend(f"- {line}" for line in summary)
+    return _guarded_text("gdpr_check", "\n".join(parts))
 
 
 # --------------------------------------------------------------------------- #

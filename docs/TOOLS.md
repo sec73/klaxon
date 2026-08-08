@@ -309,6 +309,64 @@ klaxon-mcp --anonymization-export [OUTFILE]   # RAW lines dropped
 
 ---
 
+## `gdpr_check`
+
+The DSGVO plausibility checker: find the sensitive fields an index actually
+carries and merge them into the anonymization list.
+
+| Parameter | Type | |
+|---|---|---|
+| `index` | string | required — pattern, e.g. `wazuh-events-v5-*` |
+| `prefix` | string | optional — restrict to a namespace, e.g. `user.` |
+| `sample_docs` | int | optional — docs to sample (default `KLAXON_GDPR_SAMPLE_SIZE`, 10; 0 disables) |
+| `apply` | bool | default `false` — merge suggestions into `config.yaml` |
+| `exclude` | list[string] | optional — fields to skip |
+| `as_json` | bool | default `false` — machine-readable report |
+
+Reads `GET /{index}/_field_caps`, pulls a small `_source` sample, and classifies
+each field by three layers: `gdpr_checker.custom_patterns` from config.yaml
+(highest), field-name patterns (`source.ip` → IP, `user.name` → USERNAME,
+`host.hostname` / `wazuh.agent.name` → HOSTNAME, `wazuh.agent.id` → AGENT_ID,
+`user.email` → EMAIL), and sampled values (a field holding `192.168.1.100` is
+an IP by content; a free-text field embedding IPs/e-mails/usernames is flagged
+as FREETEXT). Priorities: IP/username/e-mail = high, hostname/agent-id/domain =
+medium, free text = medium.
+
+Output is a table (FIELD / TYPE / PRIORITY / EVIDENCE / MASK / COVERED) plus a
+summary; `as_json=true` returns the shape scripts parse:
+
+```json
+{
+  "index": "wazuh-events-v5-*",
+  "checked_fields": 5,
+  "sensitive_fields": [
+    {"field": "source.ip", "type": "IP_ADDRESS", "priority": "high",
+     "suggested_mask": "[IP_ADDRESS]", "already_configured": false,
+     "evidence": "field-name pattern"}
+  ],
+  "action_required": true,
+  "fields_to_add": ["source.ip"]
+}
+```
+
+**Apply.** `apply=true` (or the CLI `--gdpr-auto-add`) merges `fields_to_add`
+into `anonymization.mask_fields` of `KLAXON_CONFIG`, appends to
+`KLAXON_GDPR_CHECK_LOG` (`gdpr_check.log`) and writes the compliance report
+`KLAXON_GDPR_REPORT` (`gdpr_compliance_report.json`). If
+`KLAXON_ANONYMIZATION_MASK_FIELDS` is set, the environment overrides the file
+and the checker warns. A `mask_fields` update takes effect on server restart.
+`apply=false` is a dry run: nothing is written.
+
+**CLI / triggers.** `klaxon-mcp --gdpr-check [INDEX]` (flags: `--gdpr-prefix`,
+`--gdpr-sample`, `--gdpr-auto-add`, `--gdpr-dry-run`, `--gdpr-exclude`,
+`--gdpr-json`, `--gdpr-out`) and the standalone `klaxon_check_gdpr` script
+(`--index`, `--auto-add`, `--dry-run`, `--json`, ...) run the same code.
+`--check-gdpr-on-startup` runs a non-interactive check before serving.
+`KLAXON_GDPR_CHECK_ON_SEARCH=true` makes `search` append a `[GDPR]` notice
+naming sensitive fields present in the hits.
+
+---
+
 ## Transport options
 
 | Variable | Flag | Default |

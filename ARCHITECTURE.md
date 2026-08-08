@@ -415,6 +415,50 @@ vLLM on localhost) are exempted by a loopback `KLAXON_LLM_BASE_URL`.
 
 ---
 
+## The DSGVO plausibility checker
+
+The anonymization layer masks what is *configured*; the checker (see
+`src/klaxon_mcp/gdpr.py`) answers what *should* be configured. It is the 
+discovery half: it reads the mappings, samples `_source`, and classifies each
+field, so an operator finds the personal data they did not know they were
+collecting.
+
+The classification is ordered by certainty, and the ordering is the design:
+
+1. **Custom rules** (`gdpr_checker.custom_patterns`) always win. They are the
+   operator's own knowledge, and heuristics must never override an explicit
+   statement about a field. A rule names a field (exact or glob), a type, a
+   priority and optionally a content regex that the sampled values must match.
+2. **Field-name patterns.** A dotted ECS-style name says what a field means
+   *without looking at a document*: `source.ip` is an IP by construction,
+   `user.name` a username, `wazuh.agent.name` a hostname. These are ordered —
+   `user.name` before `user.id`, `agent.name` before `agent.id` — because a
+   generic suffix would swallow the specific one.
+3. **Sampled values.** A few full `_source` documents are flattened to dotted
+   paths and the actual values are matched against value patterns. This is what
+   catches the fields a name pattern missed: `custom.peer` holding
+   `192.168.1.100` is an IP by content, and a free-text field (`event.original`)
+   embedding `Failed login for admin from 192.168.1.100` is flagged as FREETEXT
+   carrying personal data. The sample is capped at five distinct values per
+   field — it only has to establish the *kind*, not a census.
+
+**Honesty about the limits.** The name patterns and value patterns are
+heuristics. A genuinely custom field whose name and sample values give nothing
+away is not flagged; the checker reports what it can establish and the 
+`checked_fields`/`sensitive_fields_found` counts make the gap visible. Custom
+rules close that gap, which is why they take precedence.
+
+**Side effects are small and explicit.** `apply` merges the suggested fields
+into `anonymization.mask_fields` of config.yaml, appends one line to
+`gdpr_check.log`, and writes `gdpr_compliance_report.json`. Nothing else is
+written, nothing touches the cluster (it is read-only like every tool), and a
+dry run writes nothing at all. The environment precedence that governs the
+anonymization block applies here too: if `KLAXON_ANONYMIZATION_MASK_FIELDS` is
+set it overrides the file, and the checker says so rather than pretending the
+file alone takes effect.
+
+---
+
 ## Deliberately not built
 
 - **No tool per data category.** The eight categories are parameter values.
