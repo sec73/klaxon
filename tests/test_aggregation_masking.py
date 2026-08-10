@@ -14,6 +14,7 @@ tool against a stub indexer and assert on the rendered output.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from collections.abc import Iterator
 from typing import Any
@@ -25,10 +26,14 @@ from klaxon_mcp.clients import Response
 from klaxon_mcp.config import AnonymizationConfig, Config
 from klaxon_mcp.server import search
 
+TEST_SALT = "klaxon-test-salt"
+
 
 def ph(kind: str, value: str) -> str:
-    digest = hashlib.md5(value.encode("utf-8")).hexdigest()
-    return f"[{kind}_{digest[:6]}]"
+    digest = hmac.new(
+        TEST_SALT.encode("utf-8"), f"{kind}:{value}".encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return f"[{kind}_{digest[:16]}]"
 
 
 def config_with(*, enabled: bool, mask_agg_keys: bool) -> Config:
@@ -56,6 +61,7 @@ def config_with(*, enabled: bool, mask_agg_keys: bool) -> Config:
                 "user.name",
                 "wazuh.agent.name",
             ),
+            salt=TEST_SALT,
             log_path="/tmp/klaxon-test-agg-masking.log",
         ),
     )

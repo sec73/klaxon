@@ -261,9 +261,11 @@ the settings and what the gate does.
 | master switch | `KLAXON_ANONYMIZE_EXTERNAL_LLM` | `enabled` | `false` |
 | LLM endpoint (local detection) | `KLAXON_LLM_BASE_URL` | `llm_base_url` | unset → assumed external |
 | deterministic placeholders | `KLAXON_ANONYMIZATION_USE_HASH` | `use_hash` | `true` |
-| placeholder hash | `KLAXON_ANONYMIZATION_HASH_ALGORITHM` | `hash_algorithm` | `md5` (`sha256`) |
+| token salt (HMAC key) | `KLAXON_ANONYMIZATION_SALT` | `salt` | auto-generated + persisted (`*.salt`) |
 | masked fields | `KLAXON_ANONYMIZATION_MASK_FIELDS` | `mask_fields` | see below |
 | aggregation key masking | `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS` | `mask_aggregation_keys` | `false` |
+| free-text username masking | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS` | `mask_free_text_users` | `true` |
+| extra free-text fields | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS` | `mask_free_text_fields` | empty (hint pattern) |
 | block on residual PII | `KLAXON_ANONYMIZATION_WHITELIST_ENABLED` | `whitelist_enabled` | `true` |
 | audit log | `KLAXON_ANONYMIZATION_LOG` | `log_path` | `llm_prompts.log` |
 | persist unmasked output | `KLAXON_ANONYMIZATION_LOG_RAW` | `log_raw` | `false` |
@@ -275,7 +277,7 @@ only the `anonymization:` block is read.
 
 Default masked fields: `source.ip`, `destination.ip`, `client.ip`, `server.ip`,
 `related.ip`, `source.domain`, `destination.domain`, `host.hostname`,
-`host.name`, `user.name`, `user.id`, `source.user.name`,
+`host.name`, `user.name`, `user.id`, `user.effective.name`, `source.user.name`,
 `destination.user.name`, `wazuh.agent.name`, `wazuh.agent.id`, `agent.name`,
 `agent.id`. A field listed here has its value replaced wholesale; the
 placeholder family follows the field name (`.ip` → `[IP_…]`, `user.name` →
@@ -294,6 +296,27 @@ touched; `doc_count` and aggregation metadata survive unchanged; `top_hits`
 embedded documents go through the normal `_source` masking. Aggregations whose
 request could not be mapped to fields (saved searches, scripted aggs) are left
 alone.
+
+**Free-text usernames.** A `message` line can name a user without the structured
+`user.name` being present (`uid=marcomoenig,ou=users,dc=sec73,dc=io`,
+`session opened for user root(uid=0)`, `Accepted publickey for root ...`). With
+`mask_free_text_users` on (the default) the free-text pass masks those usernames
+with the *same* tokens as the structured fields: it builds a registry of the
+response's known identities (`user.name`, `related.user`, `user.effective.name`,
+...) and replaces them at word boundaries, and it also matches precise context
+patterns (`uid=...`, `for/by user ...`, `Accepted publickey for ...`,
+`username=/user=...`, `login as/for ...`). Common English words (`root`,
+`user`, `data`, ...) are never replaced by the registry on their own — only
+inside username formulations — to avoid false positives, and numeric ids
+(`uid=0`) are not usernames and are left alone.
+
+**Token format.** Tokens are `[FAMILY_…]` with 16 hex chars (64 bits of
+entropy), derived by keyed HMAC-SHA256 over `salt` with the family as context,
+so `[USER_…]` and `[HOST_…]` never collide for the same value and dictionary
+reversal of a token is infeasible. Set `KLAXON_ANONYMIZATION_SALT` for a stable
+salt across restarts; when unset a random salt is generated once and persisted
+next to the config file (`config.yaml.salt`, gitignored) with a warning. Tokens
+are per-response and never stored, so changing the salt needs no reindex.
 
 **Activation.** `active = enabled and not (llm_base_url on loopback)`. An unset
 endpoint is treated as external, and the server logs a warning saying so.

@@ -23,7 +23,12 @@ from mcp.server.mcpserver.exceptions import ToolError
 from klaxon_mcp import server
 from klaxon_mcp.anonymization import Anonymizer
 from klaxon_mcp.clients import Response
-from klaxon_mcp.config import AnonymizationConfig, Config, GdprConfig
+from klaxon_mcp.config import (
+    DEFAULT_GDPR_CUSTOM_PATTERNS,
+    AnonymizationConfig,
+    Config,
+    GdprConfig,
+)
 from klaxon_mcp.fields import FieldInfo
 from klaxon_mcp.gdpr import (
     AGENT_ID,
@@ -201,6 +206,19 @@ class TestAlreadyConfigured:
         names = [f.field for f in found]
         assert "source.ip" in names  # still reported, flagged as covered
         assert found[0].already_configured is True
+
+    def test_user_effective_name_covered_by_default_rule(self) -> None:
+        """The built-in custom rule pins user.effective.name as a username."""
+        found = classify(
+            "user.effective.name",
+            custom=DEFAULT_GDPR_CUSTOM_PATTERNS,
+            already={"user.effective.name"},
+        )
+        assert found is not None
+        assert found.kind == USERNAME
+        assert found.priority == "high"
+        assert found.evidence == "custom rule"
+        assert found.already_configured is True
 
 
 class TestAnalyze:

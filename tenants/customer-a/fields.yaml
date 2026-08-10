@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: 2026 sec73 GmbH <https://www.sec73.io>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Option B single source of truth for tenant `customer-a`.
+#
+# Everything else is GENERATED from this file:
+#   python -m klaxon_mcp.generate_masking --tenant customer-a
+# produces tenants/customer-a/generated/klaxon-config.yaml (Klaxon config
+# fragment) and the pipeline template. CI (`verify-masking-config`) and the
+# pre-commit hook fail on any hand-edit of those generated files that is not
+# reflected here. The deployable pipeline (with the real salt) is produced by
+# `klaxon-mcp apply-masked-infra --tenant customer-a` from the salt in
+# KLAXON_ANONYMIZATION_SALT — the salt is never committed.
+
+tenant: customer-a
+salt_env: KLAXON_ANONYMIZATION_SALT
+mask_free_text_users: true
+
+# Free-text fields carry raw log lines; the pipeline runs the username pass
+# (context patterns + per-document identity registry) over them so usernames,
+# e-mails and IPs inside prose are tokenised too.
+free_text_fields:
+  - field: message
+
+# Structured fields whose whole value is replaced with a deterministic token.
+# `related.hash` is deliberately NOT listed — file hashes are security IOCs,
+# not personal data, and the loader refuses it.
+fields:
+  - field: destination.ip
+    family: IP
+  - field: source.ip
+    family: IP
+  - field: source.address
+    family: IP
+  - field: user.name
+    family: USER
+  - field: user.id
+    family: USER
+  - field: user.effective.name
+    family: USER
+  - field: client.user.name
+    family: USER
+  - field: host.hostname
+    family: HOST
+  - field: source.domain
+    family: HOST
+  - field: url.domain
+    family: HOST
+  - field: event.dataset
+    family: HOST
+  - field: log.logger
+    family: HOST
+  - field: wazuh.agent.id
+    family: AGENT
+  - field: wazuh.agent.name
+    family: HOST
+  - field: wazuh.agent.host.hostname
+    family: HOST
+  - field: event.original
+    family: USER
+  - field: related.ip
+    family: IP
+    array: true
+  - field: related.user
+    family: USER
+    array: true
+  - field: related.hosts
+    family: HOST
+    array: true
+  # related.hash bewusst NICHT aufnehmen (IOCs — file hashes are security
+  # indicators, not personal data).

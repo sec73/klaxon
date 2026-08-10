@@ -83,6 +83,76 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "contains no unmasked personal data. With OUTFILE, write it there instead "
         "of stdout.",
     )
+    masked_stream = parser.add_argument_group(
+        "option b masked stream",
+        "Generate/sync/verify the separate masked data stream. All resources are "
+        "namespaced klaxon-*; the raw Wazuh streams are never modified. See "
+        "docs/option-b-masked-stream.md.",
+    )
+    masked_stream.add_argument(
+        "--tenant",
+        metavar="TENANT",
+        help="Tenant (directory under tenants/) whose fields.yaml is the source "
+        "of truth, e.g. customer-a.",
+    )
+    masked_stream.add_argument(
+        "--generate-masking",
+        action="store_true",
+        help="Regenerate the Klaxon config fragment + pipeline template from "
+        "tenants/<tenant>/fields.yaml (writes files; no Wazuh needed).",
+    )
+    masked_stream.add_argument(
+        "--generate-masking-check",
+        action="store_true",
+        help="Verify committed generated artifacts match fields.yaml (no writes); "
+        "exit non-zero on drift. Used by CI and pre-commit.",
+    )
+    masked_stream.add_argument(
+        "--sync-masked",
+        action="store_true",
+        help="Reindex the recent window from wazuh-events-v5-* through the "
+        "klaxon-mask-<tenant> pipeline into the masked stream (checkpoint + "
+        "preflight). Needs the indexer.",
+    )
+    masked_stream.add_argument(
+        "--verify-config",
+        action="store_true",
+        help="Drift audit: fields.yaml vs committed config fragment vs effective "
+        "Klaxon config vs deployed pipeline. Exit non-zero on drift. Needs the indexer.",
+    )
+    masked_stream.add_argument(
+        "--apply-masked-infra",
+        action="store_true",
+        help="PUT the masking pipeline (real salt), ISM policy, index template and "
+        "data stream for a tenant. Needs the indexer.",
+    )
+    masked_stream.add_argument(
+        "--overlap-hours",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Sync overlap window (default 1h): docs within this much of the "
+        "checkpoint are re-scanned to catch late arrivals.",
+    )
+    masked_stream.add_argument(
+        "--initial-lookback-hours",
+        type=int,
+        default=None,
+        metavar="N",
+        help="First sync lookback when no checkpoint exists (default 24h).",
+    )
+    masked_stream.add_argument(
+        "--retention-days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Masked-stream retention in days (default 30). Raw stream untouched.",
+    )
+    masked_stream.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would happen without writing or advancing checkpoints.",
+    )
     gdpr = parser.add_argument_group(
         "gdpr check",
         "The DSGVO plausibility checker. Needs the Wazuh indexer "
@@ -472,10 +542,46 @@ def main(argv: list[str] | None = None) -> int:
     ):
         return _run_anonymization_command(args)
 
+    # Option B generator: needs no Wazuh environment, just files.
+    if args.generate_masking or args.generate_masking_check:
+        from .generate_masking import main as generate_main
+
+        argv = []
+        if args.tenant:
+            argv += ["--tenant", args.tenant]
+        if args.generate_masking_check:
+            argv.append("--check")
+        return generate_main(argv)
+
     # The DSGVO plausibility check needs the Wazuh indexer but not the MCP
     # listener; it runs and exits.
     if args.gdpr_check is not None:
         return _run_gdpr_command(args)
+
+    # Option B operational commands (need the indexer, not the MCP listener).
+    if args.sync_masked or args.verify_config or args.apply_masked_infra:
+        if not args.tenant:
+            print(
+                "--tenant is required for the masked-stream commands",
+                file=sys.stderr,
+            )
+            return 2
+        from . import sync_masked
+
+        if args.sync_masked:
+            return sync_masked.sync_command(
+                args.tenant,
+                overlap_hours=args.overlap_hours or 1,
+                initial_lookback_hours=args.initial_lookback_hours or 24,
+                dry_run=args.dry_run,
+            )
+        if args.verify_config:
+            return sync_masked.verify_command(args.tenant)
+        return sync_masked.apply_infra_command(
+            args.tenant,
+            retention_days=args.retention_days or 30,
+            dry_run=args.dry_run,
+        )
 
     # Optional compliance check before serving. Never prompts: applies only
     # with --gdpr-auto-add, dry-runs otherwise, and serves regardless.

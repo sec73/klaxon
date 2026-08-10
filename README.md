@@ -288,28 +288,36 @@ masked — that is structural and exact. With `mask_aggregation_keys` on (off by
 default), aggregation bucket keys whose source field is configured get the same
 deterministic tokens as `_source` — `terms` on `related.hosts` returns
 `[HOST_…]` tokens, and `composite` `after_key` stays consistent with the
-tokenised keys, so pagination keeps working. IP addresses, e-mails and the
-standard username formulations are masked in free text. A username that
-appears in free text in an unrecognised form is the one thing a regex cannot be
-certain about; treat the gate's residual scan as the guarantee that matters for
-the reliably detectable classes (IPs and e-mails). Review the rules by adding
-your own fields to `KLAXON_ANONYMIZATION_MASK_FIELDS` or the `anonymization:`
-block of a YAML config file (`KLAXON_CONFIG`, precedence env > YAML > default):
+tokenised keys, so pagination keeps working. With `mask_free_text_users` on (the
+default), usernames inside free-text fields (`message`, `*.log`, `raw`, ...) are
+masked too, with the same tokens as the structured fields — a `uid=marcomoenig`
+inside a log line becomes the same `[USER_…]` token as `user.name` in the same
+document. IP addresses, e-mails and the standard username formulations are
+masked in free text. A username that appears in free text in an unrecognised
+form is the one thing a regex cannot be certain about; treat the gate's residual
+scan as the guarantee that matters for the reliably detectable classes (IPs and
+e-mails). Review the rules by adding your own fields to
+`KLAXON_ANONYMIZATION_MASK_FIELDS` or the `anonymization:` block of a YAML
+config file (`KLAXON_CONFIG`, precedence env > YAML > default):
 
 ```yaml
 anonymization:
   enabled: true
   llm_base_url: "https://api.deepseek.com/v1"
   use_hash: true
-  hash_algorithm: "md5"        # or "sha256"
+  salt: "change-me-to-a-long-random-secret"  # or KLAXON_ANONYMIZATION_SALT
   mask_fields:                 # or KLAXON_ANONYMIZATION_MASK_FIELDS
     - "source.ip"
     - "destination.ip"
     - "user.name"
+    - "user.effective.name"
     - "host.hostname"
     - "wazuh.agent.name"
     - "wazuh.agent.id"
   mask_aggregation_keys: true  # or KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS
+  mask_free_text_users: true   # or KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS
+  mask_free_text_fields:       # or KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS
+    - "message"
   whitelist_enabled: true
   log_path: "llm_prompts.log"
   log_raw: false

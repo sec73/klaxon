@@ -106,6 +106,14 @@ class IndexerClient:
     ) -> Response:
         return await self.request("POST", path, params=params, body=body)
 
+    async def put(
+        self, path: str, *, body: Any | None = None, params: dict[str, Any] | None = None
+    ) -> Response:
+        return await self.request("PUT", path, params=params, body=body)
+
+    async def delete(self, path: str, *, params: dict[str, Any] | None = None) -> Response:
+        return await self.request("DELETE", path, params=params)
+
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()

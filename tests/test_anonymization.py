@@ -15,7 +15,9 @@ the structured field pass (which knows what a field means), the text pass
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -37,15 +39,27 @@ from klaxon_mcp.clients import Response
 from klaxon_mcp.config import AnonymizationConfig
 
 
+# Fixed test salt: the token helpers compute expected tokens with it, so `anon()`
+# must inject the same salt into every Anonymizer it builds.
+TEST_SALT = "klaxon-test-salt"
+
+
 def anon(**overrides: Any) -> Anonymizer:
+    overrides.setdefault("salt", TEST_SALT)
     return Anonymizer(
         AnonymizationConfig(enabled=overrides.pop("enabled", True), **overrides)
     )
 
 
-def ip_ph(value: str, algo: str = "md5") -> str:
-    digest = hashlib.new(algo, value.encode("utf-8")).hexdigest()
-    return f"[IP_{digest[:6]}]"
+def token(kind: str, value: str) -> str:
+    digest = hmac.new(
+        TEST_SALT.encode("utf-8"), f"{kind}:{value}".encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return f"[{kind}_{digest[:16]}]"
+
+
+def ip_ph(value: str) -> str:
+    return token(IP, value)
 
 
 # --------------------------------------------------------------------------- #
@@ -89,8 +103,7 @@ class TestValueMasking:
     def test_email_is_masked(self) -> None:
         out = anon().mask_text("contact user@example.com now")
         assert "user@example.com" not in out
-        digest = hashlib.md5(b"user@example.com").hexdigest()
-        assert f"[EMAIL_{digest[:6]}]" in out
+        assert token(EMAIL, "user@example.com") in out
 
     def test_port_numbers_and_versions_are_not_ips(self) -> None:
         out = anon().mask_text("listen on :9200, version 1.2.3, pattern wazuh-events-v5-*")
@@ -133,14 +146,6 @@ class TestValueMasking:
             out = anon().mask_text(line)
             assert "[USER_" in out, f"expected a username mask in {line!r}"
 
-    def test_sha256_placeholders_differ_from_md5(self) -> None:
-        md5 = anon(hash_algorithm="md5").mask_text("1.2.3.4")
-        sha = anon(hash_algorithm="sha256").mask_text("1.2.3.4")
-        assert md5 == ip_ph("1.2.3.4", "md5")
-        assert sha == ip_ph("1.2.3.4", "sha256")
-        assert md5 != sha
-
-
 # --------------------------------------------------------------------------- #
 # Deterministic placeholders
 # --------------------------------------------------------------------------- #
@@ -160,6 +165,27 @@ class TestDeterminism:
     def test_masked_value_is_a_placeholder_in_full(self) -> None:
         out = anon().mask_text("10.0.0.1")
         assert out == ip_ph("10.0.0.1")
+
+
+class TestHmacTokens:
+    def test_token_is_hmac_with_64_bits_of_output(self) -> None:
+        assert re.fullmatch(r"\[USER_[0-9a-f]{16}\]", token(USER, "marcomoenig"))
+
+    def test_same_value_different_families_differ(self) -> None:
+        assert token(HOST, "web01") != token(USER, "web01")
+
+    def test_same_family_same_value_same_token(self) -> None:
+        assert token(USER, "admin") == token(USER, "admin")
+
+    def test_different_salts_give_different_tokens(self) -> None:
+        a = Anonymizer(AnonymizationConfig(enabled=True, salt="salt-a"))
+        b = Anonymizer(AnonymizationConfig(enabled=True, salt="salt-b"))
+        assert a.mask_text("10.0.0.1") != b.mask_text("10.0.0.1")
+
+    def test_same_salt_same_token_across_instances(self) -> None:
+        a = Anonymizer(AnonymizationConfig(enabled=True, salt="salt-x"))
+        b = Anonymizer(AnonymizationConfig(enabled=True, salt="salt-x"))
+        assert a.mask_text("10.0.0.1") == b.mask_text("10.0.0.1")
 
 
 # --------------------------------------------------------------------------- #
@@ -240,6 +266,221 @@ class TestMaskOverview:
         assert all(not n.startswith("web-server-01") and not n.startswith("opnsense") for n in names)
         assert all(n.startswith("[HOST_") for n in names)
         assert masked.agents[0].count == 6
+
+
+class TestFreeTextUsernameMasking:
+    """Gap 1: usernames inside free-text fields get the same tokens as the
+    structured fields, without false-positive prose masking."""
+
+    MASK_FIELDS = (
+        "user.name",
+        "user.id",
+        "related.user",
+        "user.effective.name",
+        "source.ip",
+    )
+
+    def mask_doc(self, doc: dict[str, Any]) -> tuple[dict[str, Any], Anonymizer]:
+        a = anon(mask_fields=self.MASK_FIELDS)
+        response = Response(
+            200,
+            json.dumps({"hits": {"hits": [{"_source": doc}]}}),
+            "https://indexer.example/_search",
+        )
+        out = a.mask_response(response).json()
+        return out["hits"]["hits"][0]["_source"], a
+
+    def test_ldap_dn_uid_matches_structured_token(self) -> None:
+        source, _ = self.mask_doc(
+            {
+                "user": {"name": "marcomoenig"},
+                "message": (
+                    'conn=1086 op=13353 ENTRY dn="uid=marcomoenig,'
+                    'ou=users,dc=sec73,dc=io"'
+                ),
+            }
+        )
+        assert source["user"]["name"] == token(USER, "marcomoenig")
+        assert source["message"] == (
+            'conn=1086 op=13353 ENTRY dn="uid='
+            + token(USER, "marcomoenig")
+            + ',ou=users,dc=sec73,dc=io"'
+        )
+
+    def test_pam_session_line_both_usernames_masked(self) -> None:
+        source, _ = self.mask_doc(
+            {
+                "user": {"name": "root"},
+                "message": (
+                    "pam_unix(sshd:session): session opened for user "
+                    "root(uid=0) by root(uid=0)"
+                ),
+            }
+        )
+        u = token(USER, "root")
+        assert source["message"] == (
+            f"pam_unix(sshd:session): session opened for user {u}(uid=0) "
+            f"by {u}(uid=0)"
+        )
+
+    def test_ssh_publickey_line_masks_user_and_ip(self) -> None:
+        source, _ = self.mask_doc(
+            {
+                "user": {"name": "root"},
+                "message": "Accepted publickey for root from 192.168.1.5 port 46638",
+            }
+        )
+        assert source["message"] == (
+            f"Accepted publickey for {token(USER, 'root')} "
+            f"from {ip_ph('192.168.1.5')} port 46638"
+        )
+
+    def test_user_effective_name_whole_value_masked(self) -> None:
+        source, _ = self.mask_doc(
+            {
+                "user": {"effective": {"name": "root(uid=0)"}},
+                "message": "auth attempt by root(uid=0) rejected",
+            }
+        )
+        assert source["user"]["effective"]["name"] == token(USER, "root(uid=0)")
+        # The literal effective-name value in free text reuses its own token
+        # (registry runs before the context patterns), so `_source` and
+        # `message` stay consistent for the same value.
+        assert source["message"] == (
+            f"auth attempt by {token(USER, 'root(uid=0)')} rejected"
+        )
+
+    def test_known_identity_replaced_in_unrecognized_position(self) -> None:
+        source, _ = self.mask_doc(
+            {
+                "user": {"name": "marcomoenig"},
+                "message": "marcomoenig opened a session",
+            }
+        )
+        assert source["message"] == f"{token(USER, 'marcomoenig')} opened a session"
+
+    def test_common_word_not_blindly_replaced(self) -> None:
+        # "root" is a known identity here, but masking it in generic prose is the
+        # false positive the stoplist avoids; context patterns still catch it in
+        # username formulations.
+        source, _ = self.mask_doc(
+            {
+                "user": {"name": "root"},
+                "message": "the root filesystem check passed",
+            }
+        )
+        assert source["message"] == "the root filesystem check passed"
+
+    def test_free_text_users_off_restores_today_behaviour(self) -> None:
+        a = anon(mask_fields=self.MASK_FIELDS, mask_free_text_users=False)
+        doc = {
+            "user": {"name": "marcomoenig"},
+            "message": 'dn="uid=marcomoenig,ou=users,dc=sec73,dc=io"',
+        }
+        response = Response(
+            200,
+            json.dumps({"hits": {"hits": [{"_source": doc}]}}),
+            "https://indexer.example/_search",
+        )
+        out = a.mask_response(response).json()["hits"]["hits"][0]["_source"]
+        assert out["user"]["name"] == token(USER, "marcomoenig")
+        assert out["message"] == 'dn="uid=marcomoenig,ou=users,dc=sec73,dc=io"'
+
+    def test_bare_user_does_not_mask_common_words(self) -> None:
+        # Security-review finding 1: "user <common English word>" in prose must
+        # not be masked — the guard is derived from the full stoplist.
+        for phrase in (
+            "the user system reported",
+            "user policy requires",
+            "the user root directory",
+            "user manager said",
+        ):
+            assert anon().mask_text(phrase) == phrase
+
+    def test_bare_user_masks_distinctive_name(self) -> None:
+        out = anon().mask_text("user marcomoenig logged in")
+        assert token(USER, "marcomoenig") in out
+        assert "marcomoenig" not in out
+
+    def test_case_variant_maps_to_structured_token(self) -> None:
+        # Security-review finding 2: a case-shifted username in free text reuses
+        # the structured token (registry runs before the context patterns).
+        source, _ = self.mask_doc(
+            {
+                "user": {"name": "MarcoMoenig"},
+                "message": "uid=marcomoenig,ou=users,dc=sec73,dc=io",
+            }
+        )
+        structured = token(USER, "MarcoMoenig")
+        assert source["user"]["name"] == structured
+        assert source["message"] == (
+            "uid=" + structured + ",ou=users,dc=sec73,dc=io"
+        )
+
+    def test_unicode_username_masked_consistently(self) -> None:
+        # Security-review finding 2: German umlauts are handled and share the
+        # structured token, in both registry and context-pattern positions.
+        source, _ = self.mask_doc(
+            {
+                "user": {"name": "Müller"},
+                "message": "login as müller from 10.0.0.9; uid=Müller,ou=users",
+            }
+        )
+        structured = token(USER, "Müller")
+        assert source["user"]["name"] == structured
+        message = source["message"]
+        assert structured in message
+        assert "müller" not in message
+        assert "Müller" not in message
+        assert ip_ph("10.0.0.9") in message
+
+    def test_identity_from_one_hit_does_not_mask_prose_in_another(self) -> None:
+        # Security-review finding 3: identities are scoped per document, so a
+        # username in one hit must not mask the same word in prose in another.
+        a = anon(mask_fields=self.MASK_FIELDS)
+        payload = {
+            "hits": {
+                "hits": [
+                    {
+                        "_source": {
+                            "user": {"name": "marcomoenig"},
+                            "message": "uid=marcomoenig,ou=users",
+                        }
+                    },
+                    {"_source": {"message": "the marcomoenig cena movie"}},
+                ]
+            }
+        }
+        response = Response(
+            200, json.dumps(payload), "https://indexer.example/_search"
+        )
+        hits = a.mask_response(response).json()["hits"]["hits"]
+        assert hits[0]["_source"]["user"]["name"] == token(USER, "marcomoenig")
+        # Same-document prose is still masked via the per-document registry.
+        assert hits[0]["_source"]["message"] == (
+            "uid=" + token(USER, "marcomoenig") + ",ou=users"
+        )
+        # The second document's prose is untouched (no cross-document registry).
+        assert hits[1]["_source"]["message"] == "the marcomoenig cena movie"
+
+    def test_email_and_ip_still_masked_everywhere(self) -> None:
+        # Regression: the value-type passes are untouched by the username pass.
+        source, _ = self.mask_doc(
+            {
+                "user": {"name": "marcomoenig"},
+                "message": (
+                    "login for marcomoenig from 192.168.1.5 contact "
+                    "marco@sec73.io"
+                ),
+            }
+        )
+        message = source["message"]
+        assert token(USER, "marcomoenig") in message
+        assert ip_ph("192.168.1.5") in message
+        assert token(EMAIL, "marco@sec73.io") in message
+        assert "marcomoenig" not in message
+        assert "192.168.1.5" not in message
+        assert "marco@sec73.io" not in message
 
 
 # --------------------------------------------------------------------------- #
@@ -346,8 +587,7 @@ class TestReport:
 
 
 def ph(kind: str, value: str) -> str:
-    digest = hashlib.md5(value.encode("utf-8")).hexdigest()
-    return f"[{kind}_{digest[:6]}]"
+    return token(kind, value)
 
 
 # The 18-field mask list from the feature spec; representative of a real config.

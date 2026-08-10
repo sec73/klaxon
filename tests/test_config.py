@@ -17,7 +17,13 @@ from typing import Any
 
 import pytest
 
-from klaxon_mcp.config import AnonymizationConfig, Config, ConfigError, GdprConfig
+from klaxon_mcp.config import (
+    DEFAULT_GDPR_CUSTOM_PATTERNS,
+    AnonymizationConfig,
+    Config,
+    ConfigError,
+    GdprConfig,
+)
 
 WAZUH_VARS = (
     "WAZUH_INDEXER_URL",
@@ -40,9 +46,12 @@ KLAXON_VARS = (
     "KLAXON_ANONYMIZE_EXTERNAL_LLM",
     "KLAXON_LLM_BASE_URL",
     "KLAXON_ANONYMIZATION_USE_HASH",
-    "KLAXON_ANONYMIZATION_HASH_ALGORITHM",
+    "KLAXON_ANONYMIZATION_SALT",
     "KLAXON_ANONYMIZATION_MASK_FIELDS",
+    "KLAXON_ANONYMIZATION_MASKED_STREAMS",
     "KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS",
+    "KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS",
+    "KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS",
     "KLAXON_ANONYMIZATION_WHITELIST_ENABLED",
     "KLAXON_ANONYMIZATION_LOG",
     "KLAXON_ANONYMIZATION_LOG_RAW",
@@ -57,11 +66,14 @@ KLAXON_VARS = (
 
 
 @pytest.fixture(autouse=True)
-def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     """A developer's own .env must not decide what the defaults look like."""
     for name in (*WAZUH_VARS, *KLAXON_VARS):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("WAZUH_INDEXER_URL", "https://indexer.example:9200")
+    # Point the optional config file (and its auto-generated .salt) at tmp so
+    # from_env() never writes salt files into the repo.
+    monkeypatch.setenv("KLAXON_CONFIG", str(tmp_path / "config.yaml"))
 
 
 class TestVerifySsl:
@@ -93,7 +105,9 @@ class TestVerifySsl:
     ) -> None:
         with caplog.at_level(logging.WARNING, logger="klaxon_mcp.config"):
             Config.from_env()
-        assert caplog.text == ""
+        # Verify_ssl default says nothing (the salt auto-generation warning may
+        # fire on a fresh config path, which is unrelated to TLS verification).
+        assert "WAZUH_VERIFY_SSL" not in caplog.text
 
 
 class TestRequiredAndOptional:
@@ -139,12 +153,15 @@ class TestAnonymizationDefaults:
 
     def test_sensible_security_defaults(self) -> None:
         config = Config.from_env().anonymization
-        # Hash placeholders and the strict whitelist are the safe readings.
+        # Keyed tokens and the strict whitelist are the safe readings.
         assert config.use_hash is True
-        assert config.hash_algorithm == "md5"
         assert config.whitelist_enabled is True
         assert config.log_raw is False
         assert config.log_path == "llm_prompts.log"
+        # The LLM-safe free-text username pass is on by default; aggregation
+        # keys and per-run salts opt in (or are stable via env).
+        assert config.mask_free_text_users is True
+        assert config.mask_aggregation_keys is False
 
 
 class TestAnonymizationEnv:
@@ -168,17 +185,6 @@ class TestAnonymizationEnv:
         monkeypatch.setenv("KLAXON_LLM_BASE_URL", "http://localhost:11434")
         assert Config.from_env().anonymization.active is False
 
-    def test_hash_algorithm_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("KLAXON_ANONYMIZATION_HASH_ALGORITHM", "sha256")
-        assert Config.from_env().anonymization.hash_algorithm == "sha256"
-
-    def test_invalid_hash_algorithm_is_rejected(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("KLAXON_ANONYMIZATION_HASH_ALGORITHM", "rot13")
-        with pytest.raises(ConfigError, match="must be 'md5' or 'sha256'"):
-            AnonymizationConfig.from_env()
-
     def test_mask_fields_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(
             "KLAXON_ANONYMIZATION_MASK_FIELDS", "source.ip,user.name, custom.field"
@@ -193,6 +199,60 @@ class TestAnonymizationEnv:
         monkeypatch.setenv("KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS", "true")
         assert AnonymizationConfig.from_env().mask_aggregation_keys is True
 
+    def test_salt_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_SALT", "super-secret")
+        assert AnonymizationConfig.from_env().salt == "super-secret"
+
+    def test_salt_is_persisted_and_reused(self, tmp_path: Any) -> None:
+        first = AnonymizationConfig.from_env().salt
+        second = AnonymizationConfig.from_env().salt
+        assert first and first == second
+        salt_file = tmp_path / "config.yaml.salt"
+        assert salt_file.exists()
+        assert salt_file.read_text(encoding="ascii").strip() == first
+
+    def test_mask_free_text_users_defaults_on(self) -> None:
+        assert Config.from_env().anonymization.mask_free_text_users is True
+
+    def test_mask_free_text_users_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS", "false")
+        assert AnonymizationConfig.from_env().mask_free_text_users is False
+
+    def test_mask_free_text_fields_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS", "message, event.original"
+        )
+        assert AnonymizationConfig.from_env().mask_free_text_fields == (
+            "message",
+            "event.original",
+        )
+
+    def test_default_mask_fields_include_user_effective_name(self) -> None:
+        assert "user.effective.name" in Config.from_env().anonymization.mask_fields
+
+    def test_masked_streams_defaults_empty(self) -> None:
+        assert Config.from_env().anonymization.masked_streams == ()
+
+    def test_masked_streams_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "KLAXON_ANONYMIZATION_MASKED_STREAMS",
+            "klaxon-masked-customer-a-v5-*,klaxon-masked-customer-b-v5-*",
+        )
+        assert AnonymizationConfig.from_env().masked_streams == (
+            "klaxon-masked-customer-a-v5-*",
+            "klaxon-masked-customer-b-v5-*",
+        )
+
+    def test_masked_streams_env_tolerates_whitespace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "KLAXON_ANONYMIZATION_MASKED_STREAMS", " klaxon-masked-a-v5-* "
+        )
+        assert AnonymizationConfig.from_env().masked_streams == (
+            "klaxon-masked-a-v5-*",
+        )
+
 
 class TestAnonymizationYaml:
     def test_yaml_enables_when_env_unset(
@@ -200,13 +260,24 @@ class TestAnonymizationYaml:
     ) -> None:
         path = tmp_path / "config.yaml"
         path.write_text(
-            "anonymization:\n  enabled: true\n  hash_algorithm: sha256\n",
+            "anonymization:\n  enabled: true\n",
             encoding="utf-8",
         )
         monkeypatch.setenv("KLAXON_CONFIG", str(path))
         config = AnonymizationConfig.from_env()
         assert config.enabled is True
-        assert config.hash_algorithm == "sha256"
+
+    def test_yaml_mask_free_text(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "anonymization:\n  mask_free_text_users: false\n"
+            "  mask_free_text_fields:\n    - message\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        cfg = AnonymizationConfig.from_env()
+        assert cfg.mask_free_text_users is False
+        assert cfg.mask_free_text_fields == ("message",)
 
     def test_env_beats_yaml(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
@@ -251,6 +322,64 @@ class TestAnonymizationYaml:
         monkeypatch.setenv("KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS", "false")
         assert AnonymizationConfig.from_env().mask_aggregation_keys is False
 
+    def test_yaml_masked_streams(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "anonymization:\n  masked_streams:\n    - klaxon-masked-customer-a-v5-*\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        assert AnonymizationConfig.from_env().masked_streams == (
+            "klaxon-masked-customer-a-v5-*",
+        )
+
+    def test_env_beats_yaml_masked_streams(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "anonymization:\n  masked_streams:\n    - klaxon-masked-a-v5-*\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        monkeypatch.setenv(
+            "KLAXON_ANONYMIZATION_MASKED_STREAMS", "klaxon-masked-b-v5-*"
+        )
+        assert AnonymizationConfig.from_env().masked_streams == (
+            "klaxon-masked-b-v5-*",
+        )
+
+    def test_env_and_yaml_mask_fields_conflict_is_fail_closed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """Both env and YAML set mask_fields differently -> refuse to start."""
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "anonymization:\n  mask_fields:\n    - source.ip\n    - user.name\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        monkeypatch.setenv(
+            "KLAXON_ANONYMIZATION_MASK_FIELDS", "source.ip,user.name,user.id"
+        )
+        with pytest.raises(ConfigError, match="mask_fields"):
+            AnonymizationConfig.from_env()
+
+    def test_env_and_yaml_mask_fields_agreement_is_allowed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "anonymization:\n  mask_fields:\n    - source.ip\n    - user.name\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        monkeypatch.setenv(
+            "KLAXON_ANONYMIZATION_MASK_FIELDS", "source.ip, user.name"
+        )
+        cfg = AnonymizationConfig.from_env()
+        assert cfg.mask_fields == ("source.ip", "user.name")
+
 
 class TestGdprConfig:
     def test_defaults(self) -> None:
@@ -259,7 +388,9 @@ class TestGdprConfig:
         assert gdpr.log_path == "gdpr_check.log"
         assert gdpr.report_path == "gdpr_compliance_report.json"
         assert gdpr.check_on_search is False
-        assert gdpr.custom_patterns == ()
+        assert gdpr.custom_patterns == (
+            {"field": "user.effective.name", "type": "USERNAME", "priority": "high"},
+        )
 
     def test_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("KLAXON_GDPR_SAMPLE_SIZE", "25")
@@ -285,7 +416,8 @@ class TestGdprConfig:
         monkeypatch.setenv("KLAXON_CONFIG", str(path))
         gdpr = GdprConfig.from_env()
         assert gdpr.sample_size == 5
-        assert gdpr.custom_patterns == (
+        # Built-in rules are always present; the YAML rules are merged on top.
+        assert gdpr.custom_patterns == DEFAULT_GDPR_CUSTOM_PATTERNS + (
             {"field": "custom.user_id", "type": "USER_ID",
              "priority": "high", "regex": "^[A-Z0-9]{8}$"},
         )
