@@ -192,9 +192,25 @@ class TenantConfig:
         return f"tenants/{self.tenant}/fields.yaml"
 
 
+def find_repo_root(start: str | Path | None = None) -> Path:
+    """Locate the repo root by walking up from `start` (default: cwd) to the
+    nearest ancestor that contains a `tenants/` directory (the Option B marker).
+
+    Falls back to `start`/cwd if no ancestor qualifies. The lookup is
+    independent of where the package is installed, so it works both from the
+    `src/` layout and from a site-packages install (e.g. `pip install .` in
+    CI, where `__file__` lives outside the checkout).
+    """
+    current = Path(start or Path.cwd()).resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / "tenants").is_dir():
+            return candidate
+    return current
+
+
 def find_tenant_dir(tenant: str, root: str | Path | None = None) -> Path:
     """The `tenants/<tenant>` directory (repo root by default)."""
-    base = Path(root) if root is not None else Path(__file__).resolve().parents[2]
+    base = Path(root) if root is not None else find_repo_root()
     return base / "tenants" / tenant
 
 

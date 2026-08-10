@@ -37,6 +37,7 @@ from .masked_stream import (
     TenantConfig,
     build_config_fragment,
     build_pipeline_template,
+    find_repo_root,
     find_tenant_dir,
     load_tenant_config,
 )
@@ -129,14 +130,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--root",
         type=Path,
         default=None,
-        help="Repo root (default: derived from this file's location).",
+        help="Repo root (default: nearest ancestor of the working directory "
+        "that contains tenants/).",
     )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    root = args.root or Path(__file__).resolve().parents[2]
+    root = args.root or find_repo_root()
 
     tenants = [args.tenant] if args.tenant else tenants_in_repo(root)
     if not tenants:
