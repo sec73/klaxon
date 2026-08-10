@@ -171,6 +171,13 @@ class AnonymizationConfig:
     use_hash: bool = True
     hash_algorithm: Literal["md5", "sha256"] = "md5"
     mask_fields: tuple[str, ...] = DEFAULT_ANONYMIZATION_MASK_FIELDS
+    # Mask the `key` values of aggregation buckets (terms / significant_terms /
+    # significant_text / multi_terms / composite) in `search` responses when the
+    # aggregation's source field is in `mask_fields`. Off by default; bucket keys
+    # of non-field aggregations (date_histogram, histogram, range, filters,
+    # metrics) are never touched. Aggregation keys and `_source` values use the
+    # same deterministic tokens, so the two stay aligned for one entity.
+    mask_aggregation_keys: bool = False
     # Whitelist semantics for this server: only responses that mask cleanly go
     # out. true => a residual PII hit blocks the response entirely; false => it
     # is logged as a warning and the masked response is still returned.
@@ -260,6 +267,10 @@ class AnonymizationConfig:
             ),
             hash_algorithm=hash_algorithm,  # type: ignore[arg-type]  # checked above
             mask_fields=mask_fields,
+            mask_aggregation_keys=_env_bool(
+                "KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS",
+                _yaml_get(anon_yaml, "mask_aggregation_keys", False),
+            ),
             whitelist_enabled=_env_bool(
                 "KLAXON_ANONYMIZATION_WHITELIST_ENABLED",
                 _yaml_get(anon_yaml, "whitelist_enabled", True),

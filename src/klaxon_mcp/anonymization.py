@@ -47,6 +47,8 @@ import os
 import re
 import threading
 from collections import Counter
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -89,6 +91,7 @@ _FIELD_KIND: dict[str, str] = {
     "host.name": HOST,
     "agent.name": HOST,
     "wazuh.agent.name": HOST,
+    "related.hosts": HOST,
     "agent.id": AGENT,
     "wazuh.agent.id": AGENT,
     "source.domain": HOST,
@@ -113,6 +116,96 @@ def _field_kind(field: str) -> str:
         if field.endswith(suffix):
             return kind
     return USER
+
+
+# --------------------------------------------------------------------------- #
+# Aggregation key mapping. `search` responses carry a raw `aggregations` block;
+# bucket keys are computed on indexed values and would otherwise leak the same
+# personal data the `_source` pass masks (a terms agg on `related.hosts` returns
+# `nc02web`, `yun`, ...). The request body is walked to record which aggregation
+# name derives its keys from which field, and the response walker then tokenises
+# those keys with the very same deterministic token function the `_source` pass
+# uses — so one entity maps to one token in both places.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class AggSpec:
+    """Field mapping for one aggregation, used to mask its bucket keys.
+
+    Only aggregations whose keys derive from a source field are recorded:
+    `terms`-family and `multi_terms` carry an ordered `fields` tuple, `composite`
+    carries `(source_name, field)` pairs in request order. Everything else
+    (date_histogram, histogram, range, filters, metrics, scripted aggs) is
+    `agg_type=None`, and its keys are never tokenised — a key is masked only when
+    its recorded source field is in `mask_fields`.
+    """
+
+    agg_type: str | None
+    fields: tuple[str, ...] = ()
+    sources: tuple[tuple[str, str], ...] = ()
+
+
+def parse_agg_fields(body: Any) -> dict[str, AggSpec]:
+    """Map aggregation name -> AggSpec for a forwarded search request body.
+
+    Walks the top-level `aggs` tree recursively, so nested sub-aggregations
+    (`agents -> categories`) are recorded under their own names. Opaque bodies
+    (saved searches, scripted aggs, unknown shapes) simply yield no spec for
+    that aggregation, and its keys pass through unmasked — never guessed at.
+    """
+    specs: dict[str, AggSpec] = {}
+    if isinstance(body, dict):
+        aggs = body.get("aggs")
+        if isinstance(aggs, dict):
+            _walk_aggs(aggs, specs)
+    return specs
+
+
+def _walk_aggs(aggs: dict[str, Any], specs: dict[str, AggSpec]) -> None:
+    for name, agg in aggs.items():
+        specs[name] = _agg_spec(agg)
+        nested = agg.get("aggs") if isinstance(agg, dict) else None
+        if isinstance(nested, dict):
+            _walk_aggs(nested, specs)
+
+
+def _agg_spec(agg: Any) -> AggSpec:
+    """The AggSpec for one request-body aggregation object."""
+    if not isinstance(agg, dict):
+        return AggSpec(None)
+    for kind in ("terms", "significant_terms", "significant_text"):
+        inner = agg.get(kind)
+        if isinstance(inner, dict) and isinstance(inner.get("field"), str):
+            return AggSpec(kind, (inner["field"],))
+    inner = agg.get("multi_terms")
+    if isinstance(inner, dict) and isinstance(inner.get("terms"), list):
+        fields = tuple(
+            t["field"]
+            for t in inner["terms"]
+            if isinstance(t, dict) and isinstance(t.get("field"), str)
+        )
+        if fields:
+            return AggSpec("multi_terms", fields)
+        return AggSpec(None)
+    inner = agg.get("composite")
+    if isinstance(inner, dict) and isinstance(inner.get("sources"), list):
+        sources: list[tuple[str, str]] = []
+        for entry in inner["sources"]:
+            if not isinstance(entry, dict):
+                continue
+            for name, source_spec in entry.items():
+                spec = _agg_spec(source_spec)
+                if spec.fields:
+                    sources.append((name, spec.fields[0]))
+        if sources:
+            return AggSpec("composite", sources=tuple(sources))
+        return AggSpec(None)
+    if "top_hits" in agg:
+        # A marker, not a field mapping: the response embeds documents whose
+        # `_source` must run through the normal document-masking path.
+        return AggSpec("top_hits")
+    return AggSpec(None)
 
 
 # --------------------------------------------------------------------------- #
@@ -269,35 +362,233 @@ class Anonymizer:
 
     def mask_json(self, obj: Any, path: str = "") -> Any:
         """Deep-walk a parsed response and mask personal data in place-free."""
+        return self._mask_json(obj, path, skip_aggregations=False)
+
+    def _mask_json(
+        self, obj: Any, path: str = "", skip_aggregations: bool = False
+    ) -> Any:
+        """The structural pass; optionally leaves the `aggregations` subtree alone.
+
+        With `skip_aggregations` (aggregation-key masking active) the top-level
+        `aggregations` block is not walked here — `mask_aggregations` owns it and
+        already tokenised its keys. Walking it again would run the value-type
+        pass over tokenised keys and drift aggregation tokens apart from their
+        `_source` twins.
+        """
         if isinstance(obj, dict):
-            return {
-                key: self.mask_json(value, f"{path}.{key}" if path else key)
-                for key, value in obj.items()
-            }
+            out: dict[str, Any] = {}
+            for key, value in obj.items():
+                if skip_aggregations and not path and key == "aggregations":
+                    out[key] = value
+                    continue
+                child_path = f"{path}.{key}" if path else key
+                out[key] = self._mask_json(value, child_path, skip_aggregations)
+            return out
         if isinstance(obj, list):
             # List indices do not belong to the field path.
-            return [self.mask_json(item, path) for item in obj]
+            return [self._mask_json(item, path, skip_aggregations) for item in obj]
         if isinstance(obj, str):
             return self._mask_string_value(path, obj)
         return obj
 
-    def mask_response(self, response: Response) -> Response:
+    def mask_response(
+        self,
+        response: Response,
+        agg_map: Mapping[str, AggSpec] | None = None,
+    ) -> Response:
         """A clone of the response with the JSON body masked, or the original.
 
-        The original is returned unchanged when anonymization is inactive or the
-        body is not JSON — a non-JSON body gets its free-text pass in `finish`.
+        `agg_map` (from `parse_agg_fields` over the forwarded request) drives
+        aggregation-key masking when `mask_aggregation_keys` is on: keys whose
+        source field is in `mask_fields` become the same deterministic tokens the
+        `_source` pass produces. Aggregation keys are tokenised before the
+        structural pass, which then skips the `aggregations` subtree so no pass
+        double-masks a key. The original is returned unchanged when
+        anonymization is inactive or the body is not JSON — a non-JSON body gets
+        its free-text pass in `finish`.
         """
         if not self.active:
             return response
         parsed = response.json()
         if not isinstance(parsed, (dict, list)):
             return response
-        masked = self.mask_json(parsed)
+        if self.config.mask_aggregation_keys:
+            masked = self.mask_aggregations(parsed, agg_map)
+            masked = self._mask_json(masked, "", skip_aggregations=True)
+        else:
+            masked = self.mask_json(parsed)
         return Response(
             response.status_code,
             json.dumps(masked, indent=2, ensure_ascii=False),
             response.url,
         )
+
+    # ------------------------------------------------------------------ #
+    # Aggregation-key masking
+    # ------------------------------------------------------------------ #
+
+    def mask_aggregations(
+        self, obj: Any, agg_map: Mapping[str, AggSpec] | None
+    ) -> Any:
+        """Mask personal data in the `aggregations` block of a search response.
+
+        Only fires when `mask_aggregation_keys` is on. Returns a copy of the
+        parsed response with every bucket key whose source field is in
+        `mask_fields` replaced by the deterministic token the `_source` pass
+        produces. Counts and metadata — `doc_count`,
+        `doc_count_error_upper_bound`, `sum_other_doc_count` — and the keys of
+        non-field aggregations (date_histogram, histogram, range, filters,
+        metrics) are left byte-identical. Embedded `top_hits` documents run
+        through the normal `_source` masking path.
+        """
+        if not self.active or not self.config.mask_aggregation_keys:
+            return obj
+        if not isinstance(obj, dict) or "aggregations" not in obj:
+            return obj
+        out = dict(obj)
+        out["aggregations"] = self._mask_agg_map(out["aggregations"], agg_map or {})
+        return out
+
+    def _mask_agg_map(
+        self, aggs: Any, agg_map: Mapping[str, AggSpec]
+    ) -> Any:
+        """Walk a response `aggregations` map (name -> aggregation object)."""
+        if not isinstance(aggs, dict):
+            return aggs
+        return {
+            name: self._mask_agg_obj(agg_obj, agg_map.get(name), agg_map)
+            for name, agg_obj in aggs.items()
+        }
+
+    def _mask_agg_obj(
+        self,
+        agg_obj: Any,
+        spec: AggSpec | None,
+        agg_map: Mapping[str, AggSpec],
+    ) -> Any:
+        """Mask one aggregation object: buckets, after_key, nested aggs, top_hits."""
+        if not isinstance(agg_obj, dict):
+            return agg_obj
+        out: dict[str, Any] = {}
+        for key, value in agg_obj.items():
+            if key == "buckets":
+                out[key] = self._mask_buckets(value, spec, agg_map)
+            elif (
+                key == "after_key"
+                and spec is not None
+                and spec.agg_type == "composite"
+            ):
+                # Composite pagination: the tokenised after_key must match the
+                # tokenised bucket keys, or the next page never matches.
+                out[key] = self._mask_composite_key(value, spec)
+            elif spec is not None and spec.agg_type == "top_hits" and key == "hits":
+                # top_hits embeds documents; mask their `_source` through the
+                # same document-masking path as the top-level hits. The response
+                # carries no "top_hits" marker — the spec (from the request) is
+                # what tells us this is one.
+                out[key] = self.mask_json(value, "top_hits")
+            elif key == "aggregations":
+                out[key] = self._mask_agg_map(value, agg_map)
+            elif key == "top_hits":
+                # A response that does carry an explicit top_hits marker.
+                out[key] = self.mask_json(value, "top_hits")
+            else:
+                # doc_count, doc_count_error_upper_bound, sum_other_doc_count,
+                # the aggregation definition and metric values: never touched.
+                out[key] = value
+        return out
+
+    def _mask_buckets(
+        self,
+        buckets: Any,
+        spec: AggSpec | None,
+        agg_map: Mapping[str, AggSpec],
+    ) -> Any:
+        if isinstance(buckets, list):
+            return [self._mask_bucket(bucket, spec, agg_map) for bucket in buckets]
+        if isinstance(buckets, dict):
+            # Named `filters` buckets: filter names are labels, not field values,
+            # and are never tokenised — only their sub-aggregations are walked.
+            return {
+                name: self._mask_bucket(bucket, None, agg_map)
+                for name, bucket in buckets.items()
+            }
+        return buckets
+
+    def _mask_bucket(
+        self,
+        bucket: Any,
+        spec: AggSpec | None,
+        agg_map: Mapping[str, AggSpec],
+    ) -> Any:
+        if not isinstance(bucket, dict):
+            return bucket
+        out: dict[str, Any] = {}
+        for key, value in bucket.items():
+            if key == "key":
+                out[key] = self._mask_key(value, spec)
+            elif key == "key_as_string":
+                out[key] = self._mask_key_as_string(value, spec)
+            elif key == "aggregations":
+                out[key] = self._mask_agg_map(value, agg_map)
+            else:
+                # doc_count and any bucket metadata are never touched.
+                out[key] = value
+        return out
+
+    def _mask_key(self, value: Any, spec: AggSpec | None) -> Any:
+        """Mask a bucket key according to the recorded aggregation type."""
+        if spec is None or spec.agg_type is None:
+            return value
+        if spec.agg_type == "composite":
+            return self._mask_composite_key(value, spec)
+        if spec.agg_type == "multi_terms":
+            if not isinstance(value, list):
+                return value
+            return [
+                self._mask_key_value(field, item)
+                for field, item in zip(spec.fields, value)
+            ]
+        field = spec.fields[0] if spec.fields else ""
+        return self._mask_key_value(field, value)
+
+    def _mask_key_as_string(self, value: Any, spec: AggSpec | None) -> Any:
+        """Keep `key_as_string` consistent with a tokenised `key` when present."""
+        if (
+            spec is None
+            or spec.agg_type not in {"terms", "significant_terms", "significant_text"}
+            or not spec.fields
+        ):
+            return value
+        return self._mask_key_value(spec.fields[0], value)
+
+    def _mask_composite_key(self, value: Any, spec: AggSpec) -> Any:
+        """Tokenise the named entries of a composite `key` / `after_key`."""
+        if not isinstance(value, dict):
+            return value
+        out = dict(value)
+        for name, field in spec.sources:
+            if name in out:
+                out[name] = self._mask_key_value(field, out[name])
+        return out
+
+    def _mask_key_value(self, field: str, value: Any) -> Any:
+        """The same deterministic token the `_source` pass uses for `field`.
+
+        Fires only when `field` is a configured mask field. Anything else —
+        including a value that is already a token (masked at ingest elsewhere) —
+        is either left alone or re-tokenised deterministically; the walker never
+        guesses at a value by its type here.
+        """
+        if not isinstance(value, str) or not value:
+            return value
+        matched = self._field_for_path(field)
+        if matched is None:
+            return value
+        kind, matched_field = matched
+        with self._lock:
+            self._field_hits[matched_field] += 1
+        return self._register(kind, value)
 
     def mask_overview(self, result: Any) -> Any:
         """Mask the PII-bearing keys of a parsed findings Overview.

@@ -31,6 +31,7 @@ from klaxon_mcp.anonymization import (
     IP,
     USER,
     Anonymizer,
+    parse_agg_fields,
 )
 from klaxon_mcp.clients import Response
 from klaxon_mcp.config import AnonymizationConfig
@@ -337,6 +338,514 @@ class TestReport:
     def test_status_says_disabled(self) -> None:
         a = Anonymizer(AnonymizationConfig(enabled=False))
         assert "DISABLED" in a.status_text()
+
+
+# --------------------------------------------------------------------------- #
+# Aggregation-key masking: the `aggregations` block leaks nothing it should not
+# --------------------------------------------------------------------------- #
+
+
+def ph(kind: str, value: str) -> str:
+    digest = hashlib.md5(value.encode("utf-8")).hexdigest()
+    return f"[{kind}_{digest[:6]}]"
+
+
+# The 18-field mask list from the feature spec; representative of a real config.
+MASK_FIELDS_18: tuple[str, ...] = (
+    "destination.ip",
+    "source.ip",
+    "user.name",
+    "user.id",
+    "client.user.name",
+    "related.ip",
+    "related.user",
+    "related.hosts",
+    "source.address",
+    "source.domain",
+    "url.domain",
+    "host.hostname",
+    "wazuh.agent.id",
+    "wazuh.agent.name",
+    "wazuh.agent.host.hostname",
+    "event.dataset",
+    "event.original",
+    "log.logger",
+)
+
+
+class TestAggregationKeyMasking:
+    """Aggregation bucket keys are masked with the same tokens as `_source`."""
+
+    def agg_anon(self, **overrides: Any) -> Anonymizer:
+        return anon(
+            mask_aggregation_keys=True,
+            mask_fields=MASK_FIELDS_18,
+            **overrides,
+        )
+
+    def mask(self, response_body: Any, request_body: Any) -> tuple[Any, Anonymizer]:
+        a = self.agg_anon()
+        response = Response(
+            200, json.dumps(response_body), "https://indexer.example/_search"
+        )
+        masked = a.mask_response(response, agg_map=parse_agg_fields(request_body))
+        return masked.json(), a
+
+    def test_terms_on_related_hosts_masked(self) -> None:
+        body = {"size": 0, "aggs": {"hosts": {"terms": {"field": "related.hosts"}}}}
+        response = {
+            "aggregations": {
+                "hosts": {
+                    "buckets": [
+                        {"key": "nc02web", "doc_count": 5},
+                        {"key": "yun", "doc_count": 3},
+                    ],
+                    "doc_count_error_upper_bound": 0,
+                    "sum_other_doc_count": 1,
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        agg = masked["aggregations"]["hosts"]
+        assert [b["key"] for b in agg["buckets"]] == [
+            ph("HOST", "nc02web"),
+            ph("HOST", "yun"),
+        ]
+        # counts and metadata are untouched
+        assert [b["doc_count"] for b in agg["buckets"]] == [5, 3]
+        assert agg["doc_count_error_upper_bound"] == 0
+        assert agg["sum_other_doc_count"] == 1
+
+    def test_terms_on_user_name_masked(self) -> None:
+        body = {"aggs": {"users": {"terms": {"field": "user.name"}}}}
+        response = {
+            "aggregations": {
+                "users": {
+                    "buckets": [
+                        {"key": "root", "doc_count": 7},
+                        {"key": "marcomoenig", "doc_count": 1},
+                    ]
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        assert [b["key"] for b in masked["aggregations"]["users"]["buckets"]] == [
+            ph("USER", "root"),
+            ph("USER", "marcomoenig"),
+        ]
+
+    def test_agg_key_token_equals_source_token(self) -> None:
+        """One entity -> one token in `_source` and in the aggregation key."""
+        body = {"aggs": {"hosts": {"terms": {"field": "related.hosts"}}}}
+        response = {
+            "hits": {
+                "hits": [
+                    {"_source": {"related": {"hosts": ["nc02web", "yun"]}}},
+                ]
+            },
+            "aggregations": {
+                "hosts": {"buckets": [{"key": "nc02web", "doc_count": 5}]}
+            },
+        }
+        masked, _ = self.mask(response, body)
+        assert masked["hits"]["hits"][0]["_source"]["related"]["hosts"] == [
+            ph("HOST", "nc02web"),
+            ph("HOST", "yun"),
+        ]
+        assert masked["aggregations"]["hosts"]["buckets"][0]["key"] == ph(
+            "HOST", "nc02web"
+        )
+
+    def test_terms_on_unmasked_field_unchanged(self) -> None:
+        body = {
+            "aggs": {"cats": {"terms": {"field": "wazuh.integration.category"}}}
+        }
+        response = {
+            "aggregations": {
+                "cats": {
+                    "buckets": [
+                        {"key": "cloud-services", "doc_count": 2},
+                        {"key": "security", "doc_count": 1},
+                    ]
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        assert [b["key"] for b in masked["aggregations"]["cats"]["buckets"]] == [
+            "cloud-services",
+            "security",
+        ]
+
+    def test_date_histogram_keys_unchanged(self) -> None:
+        body = {
+            "aggs": {
+                "by_time": {
+                    "date_histogram": {
+                        "field": "@timestamp",
+                        "calendar_interval": "day",
+                    }
+                }
+            }
+        }
+        response = {
+            "aggregations": {
+                "by_time": {
+                    "buckets": [
+                        {
+                            "key_as_string": "2026-08-09T00:00:00.000Z",
+                            "key": 1754697600000,
+                            "doc_count": 4,
+                        },
+                        {
+                            "key_as_string": "2026-08-10T00:00:00.000Z",
+                            "key": 1754784000000,
+                            "doc_count": 6,
+                        },
+                    ]
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        buckets = masked["aggregations"]["by_time"]["buckets"]
+        assert buckets[0]["key_as_string"] == "2026-08-09T00:00:00.000Z"
+        assert buckets[0]["key"] == 1754697600000
+        assert buckets[1]["doc_count"] == 6
+
+    def test_nested_sub_aggregations_masked_at_both_levels(self) -> None:
+        body = {
+            "aggs": {
+                "agents": {
+                    "terms": {"field": "wazuh.agent.name"},
+                    "aggs": {
+                        "categories": {
+                            "terms": {"field": "wazuh.integration.category"}
+                        }
+                    },
+                }
+            }
+        }
+        response = {
+            "aggregations": {
+                "agents": {
+                    "buckets": [
+                        {
+                            "key": "web-server-01",
+                            "doc_count": 3,
+                            "aggregations": {
+                                "categories": {
+                                    "buckets": [
+                                        {"key": "cloud-services", "doc_count": 2},
+                                        {"key": "security", "doc_count": 1},
+                                    ]
+                                }
+                            },
+                        },
+                        {
+                            "key": "opnsense",
+                            "doc_count": 2,
+                            "aggregations": {
+                                "categories": {
+                                    "buckets": [
+                                        {"key": "network-activity", "doc_count": 2}
+                                    ]
+                                }
+                            },
+                        },
+                    ]
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        agents = masked["aggregations"]["agents"]["buckets"]
+        assert agents[0]["key"] == ph("HOST", "web-server-01")
+        assert agents[1]["key"] == ph("HOST", "opnsense")
+        assert [b["doc_count"] for b in agents] == [3, 2]
+        assert [
+            c["key"] for c in agents[0]["aggregations"]["categories"]["buckets"]
+        ] == ["cloud-services", "security"]
+
+    def test_composite_masks_key_and_after_key(self) -> None:
+        body = {
+            "aggs": {
+                "comp": {
+                    "composite": {
+                        "sources": [
+                            {"src_ip": {"terms": {"field": "source.ip"}}},
+                            {"username": {"terms": {"field": "user.name"}}},
+                        ]
+                    }
+                }
+            }
+        }
+        response = {
+            "aggregations": {
+                "comp": {
+                    "after_key": {"src_ip": "10.0.0.1", "username": "admin"},
+                    "buckets": [
+                        {
+                            "key": {"src_ip": "10.0.0.1", "username": "admin"},
+                            "doc_count": 4,
+                        },
+                        {
+                            "key": {"src_ip": "10.0.0.2", "username": "root"},
+                            "doc_count": 2,
+                        },
+                    ],
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        comp = masked["aggregations"]["comp"]
+        assert comp["after_key"] == {
+            "src_ip": ph("IP", "10.0.0.1"),
+            "username": ph("USER", "admin"),
+        }
+        assert comp["buckets"][0]["key"] == {
+            "src_ip": ph("IP", "10.0.0.1"),
+            "username": ph("USER", "admin"),
+        }
+        assert comp["buckets"][1]["key"] == {
+            "src_ip": ph("IP", "10.0.0.2"),
+            "username": ph("USER", "root"),
+        }
+        assert [b["doc_count"] for b in comp["buckets"]] == [4, 2]
+
+    def test_multi_terms_masks_only_masked_element(self) -> None:
+        body = {
+            "aggs": {
+                "pairs": {
+                    "multi_terms": {
+                        "terms": [
+                            {"field": "user.name"},
+                            {"field": "wazuh.integration.category"},
+                        ]
+                    }
+                }
+            }
+        }
+        response = {
+            "aggregations": {
+                "pairs": {
+                    "buckets": [{"key": ["root", "cloud-services"], "doc_count": 3}]
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        assert masked["aggregations"]["pairs"]["buckets"][0]["key"] == [
+            ph("USER", "root"),
+            "cloud-services",
+        ]
+
+    def test_filters_named_keys_untouched(self) -> None:
+        body = {
+            "aggs": {
+                "f": {
+                    "filters": {
+                        "filters": {
+                            "admin-logins": {"term": {"user.name": "root"}},
+                            "everything-else": {"match_all": {}},
+                        }
+                    }
+                }
+            }
+        }
+        response = {
+            "aggregations": {
+                "f": {
+                    "buckets": {
+                        "admin-logins": {"doc_count": 2},
+                        "everything-else": {"doc_count": 10},
+                    }
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        assert list(masked["aggregations"]["f"]["buckets"].keys()) == [
+            "admin-logins",
+            "everything-else",
+        ]
+        assert masked["aggregations"]["f"]["buckets"]["admin-logins"]["doc_count"] == 2
+
+    def test_top_hits_embedded_source_masked(self) -> None:
+        body = {"aggs": {"top": {"top_hits": {"size": 1}}}}
+        response = {
+            "aggregations": {
+                "top": {
+                    "hits": {
+                        "hits": [
+                            {
+                                "_source": {
+                                    "user": {"name": "admin"},
+                                    "source": {"ip": "10.0.0.9"},
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        src = masked["aggregations"]["top"]["hits"]["hits"][0]["_source"]
+        assert src["user"]["name"] == ph("USER", "admin")
+        assert src["source"]["ip"] == ph("IP", "10.0.0.9")
+
+    def test_unknown_agg_keys_left_alone(self) -> None:
+        # scripted / opaque request: no spec -> never guess at the key
+        body = {"aggs": {"custom": {"terms": {"script": {"source": "..."}}}}}
+        response = {
+            "aggregations": {
+                "custom": {"buckets": [{"key": "nc02web", "doc_count": 1}]}
+            }
+        }
+        masked, _ = self.mask(response, body)
+        assert masked["aggregations"]["custom"]["buckets"][0]["key"] == "nc02web"
+
+    def test_already_tokenized_value_is_re_tokenised_not_crashed(self) -> None:
+        body = {"aggs": {"hosts": {"terms": {"field": "related.hosts"}}}}
+        response = {
+            "aggregations": {
+                "hosts": {"buckets": [{"key": "[HOST_abc123]", "doc_count": 1}]}
+            }
+        }
+        masked, _ = self.mask(response, body)
+        key = masked["aggregations"]["hosts"]["buckets"][0]["key"]
+        assert key.startswith("[HOST_")
+        assert key == ph("HOST", "[HOST_abc123]")
+
+    def test_significant_terms_masked(self) -> None:
+        body = {"aggs": {"sig": {"significant_terms": {"field": "user.name"}}}}
+        response = {
+            "aggregations": {"sig": {"buckets": [{"key": "root", "doc_count": 5}]}}
+        }
+        masked, _ = self.mask(response, body)
+        assert masked["aggregations"]["sig"]["buckets"][0]["key"] == ph(
+            "USER", "root"
+        )
+
+    def test_feature_off_leaves_aggregation_keys_as_before(self) -> None:
+        a = anon()  # mask_aggregation_keys defaults to False
+        body = {"aggs": {"hosts": {"terms": {"field": "related.hosts"}}}}
+        response = Response(
+            200,
+            json.dumps(
+                {
+                    "aggregations": {
+                        "hosts": {"buckets": [{"key": "nc02web", "doc_count": 5}]}
+                    }
+                }
+            ),
+            "https://indexer.example/_search",
+        )
+        masked = a.mask_response(response, agg_map=parse_agg_fields(body))
+        assert masked is not response
+        assert masked.json()["aggregations"]["hosts"]["buckets"][0]["key"] == "nc02web"
+
+    def test_no_aggregations_is_unchanged(self) -> None:
+        body = {"query": {"match_all": {}}}
+        response = {"hits": {"hits": []}}
+        masked, _ = self.mask(response, body)
+        assert masked == response
+
+
+class TestParseAggFields:
+    def test_terms(self) -> None:
+        spec = parse_agg_fields(
+            {"aggs": {"a": {"terms": {"field": "user.name"}}}}
+        )["a"]
+        assert spec.agg_type == "terms"
+        assert spec.fields == ("user.name",)
+
+    def test_multi_terms(self) -> None:
+        spec = parse_agg_fields(
+            {
+                "aggs": {
+                    "a": {
+                        "multi_terms": {
+                            "terms": [
+                                {"field": "user.name"},
+                                {"field": "related.hosts"},
+                            ]
+                        }
+                    }
+                }
+            }
+        )["a"]
+        assert spec.agg_type == "multi_terms"
+        assert spec.fields == ("user.name", "related.hosts")
+
+    def test_composite_sources(self) -> None:
+        spec = parse_agg_fields(
+            {
+                "aggs": {
+                    "a": {
+                        "composite": {
+                            "sources": [
+                                {"src_ip": {"terms": {"field": "source.ip"}}},
+                                {"username": {"terms": {"field": "user.name"}}},
+                            ]
+                        }
+                    }
+                }
+            }
+        )["a"]
+        assert spec.agg_type == "composite"
+        assert spec.sources == (
+            ("src_ip", "source.ip"),
+            ("username", "user.name"),
+        )
+
+    def test_significant_terms_and_text(self) -> None:
+        sig = parse_agg_fields(
+            {"aggs": {"a": {"significant_terms": {"field": "user.id"}}}}
+        )["a"]
+        assert sig.agg_type == "significant_terms"
+        assert sig.fields == ("user.id",)
+        text = parse_agg_fields(
+            {"aggs": {"a": {"significant_text": {"field": "event.original"}}}}
+        )["a"]
+        assert text.agg_type == "significant_text"
+        assert text.fields == ("event.original",)
+
+    def test_top_hits_is_a_marker(self) -> None:
+        spec = parse_agg_fields({"aggs": {"a": {"top_hits": {"size": 1}}}})["a"]
+        assert spec.agg_type == "top_hits"
+
+    def test_non_field_aggs_are_none(self) -> None:
+        for agg in (
+            {"date_histogram": {"field": "@timestamp"}},
+            {"histogram": {"field": "bytes"}},
+            {"range": {"field": "bytes"}},
+            {"sum": {"field": "bytes"}},
+            {"cardinality": {"field": "user.name"}},
+            {"filters": {"filters": {}}},
+        ):
+            spec = parse_agg_fields({"aggs": {"a": agg}})["a"]
+            assert spec.agg_type is None
+            assert spec.fields == ()
+            assert spec.sources == ()
+
+    def test_nested_aggs_are_recorded(self) -> None:
+        specs = parse_agg_fields(
+            {
+                "aggs": {
+                    "agents": {
+                        "terms": {"field": "wazuh.agent.name"},
+                        "aggs": {
+                            "categories": {
+                                "terms": {"field": "wazuh.integration.category"}
+                            }
+                        },
+                    }
+                }
+            }
+        )
+        assert specs["agents"].fields == ("wazuh.agent.name",)
+        assert specs["categories"].fields == ("wazuh.integration.category",)
+
+    def test_opaque_body_yields_empty(self) -> None:
+        assert parse_agg_fields({"query": {"match_all": {}}}) == {}
+        assert parse_agg_fields(None) == {}
+        assert parse_agg_fields({"aggs": "not-a-dict"}) == {}
 
 
 # --------------------------------------------------------------------------- #

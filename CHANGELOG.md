@@ -6,6 +6,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 0.1.4 – 2026-08-10
+
+### Added
+
+- **Opt-in masking of aggregation bucket keys.** When anonymization is enabled
+  and `mask_aggregation_keys` is on (`KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS`,
+  default off), the `search` tool tokenises the `key` values of `terms` /
+  `significant_terms` / `significant_text` / `multi_terms` / `composite` buckets
+  whose source field is in `mask_fields`, using the same deterministic tokens as
+  the `_source` pass — so one entity maps to one token in both places. `composite`
+  `after_key` is tokenised the same way so pagination keeps working;
+  `date_histogram`, `histogram`, `range`, `filters` and metric aggs are never
+  touched, `doc_count` and aggregation metadata are preserved, and `top_hits`
+  embedded documents go through the normal `_source` masking path. Off by
+  default, so responses are byte-identical to before until the option is
+  enabled. `related.hosts` now maps to the `HOST_` token family (it previously
+  fell back to `USER_`).
+
+
 ## ## [0.1.3] — 2026-08-08
 
 ### Added

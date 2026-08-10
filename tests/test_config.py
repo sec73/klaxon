@@ -42,6 +42,7 @@ KLAXON_VARS = (
     "KLAXON_ANONYMIZATION_USE_HASH",
     "KLAXON_ANONYMIZATION_HASH_ALGORITHM",
     "KLAXON_ANONYMIZATION_MASK_FIELDS",
+    "KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS",
     "KLAXON_ANONYMIZATION_WHITELIST_ENABLED",
     "KLAXON_ANONYMIZATION_LOG",
     "KLAXON_ANONYMIZATION_LOG_RAW",
@@ -185,6 +186,13 @@ class TestAnonymizationEnv:
         config = AnonymizationConfig.from_env()
         assert config.mask_fields == ("source.ip", "user.name", "custom.field")
 
+    def test_mask_aggregation_keys_defaults_off(self) -> None:
+        assert Config.from_env().anonymization.mask_aggregation_keys is False
+
+    def test_mask_aggregation_keys_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS", "true")
+        assert AnonymizationConfig.from_env().mask_aggregation_keys is True
+
 
 class TestAnonymizationYaml:
     def test_yaml_enables_when_env_unset(
@@ -223,6 +231,25 @@ class TestAnonymizationYaml:
         monkeypatch.setenv("KLAXON_CONFIG", str(path))
         config = AnonymizationConfig.from_env()
         assert config.mask_fields == ("source.ip", "user.name")
+
+    def test_yaml_mask_aggregation_keys(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "anonymization:\n  mask_aggregation_keys: true\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        assert AnonymizationConfig.from_env().mask_aggregation_keys is True
+
+    def test_env_beats_yaml_mask_aggregation_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "anonymization:\n  mask_aggregation_keys: true\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS", "false")
+        assert AnonymizationConfig.from_env().mask_aggregation_keys is False
 
 
 class TestGdprConfig:

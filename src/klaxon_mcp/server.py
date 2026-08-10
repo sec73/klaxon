@@ -30,7 +30,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from . import coverage, diagnostics, gdpr, overview
-from .anonymization import Anonymizer
+from .anonymization import AggSpec, Anonymizer, parse_agg_fields
 from .clients import (
     EngineClient,
     IndexerClient,
@@ -208,6 +208,7 @@ def _render(
     *,
     summary: str | None = None,
     footer: str | None = None,
+    agg_map: dict[str, AggSpec] | None = None,
 ) -> str:
     """diagnostics.render plus the anonymization layer when it is active.
 
@@ -220,7 +221,7 @@ def _render(
     anon = get_anonymizer()
     if not anon.active:
         return raw
-    masked_response = anon.mask_response(response)
+    masked_response = anon.mask_response(response, agg_map=agg_map)
     if masked_response is not response:
         masked = diagnostics.render(
             notices, masked_response, summary=summary, footer=footer
@@ -269,6 +270,11 @@ async def search(index: str, body: str) -> str:
     limit before the query is sent, and the diagnostics block says so. Use
     "size": 0 with aggregations to count without pulling documents.
 
+    When anonymization is enabled and KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS
+    is on, aggregation bucket keys for masked fields (terms, multi_terms,
+    composite) are replaced with the same deterministic tokens as the `_source`
+    pass — so aggregation keys and hits stay aligned for the same entity.
+
     Args:
         index: Index or datastream pattern, e.g. "wazuh-events-v5-network-activity*".
         body: OpenSearch query DSL as a JSON string.
@@ -301,7 +307,16 @@ async def search(index: str, body: str) -> str:
                 f"{masking}. Run the `gdpr_check` tool to review and extend "
                 f"the anonymization list."
             )
-    return _render("search", notices, response)
+    # Aggregation-key masking (opt-in): map agg name -> source fields from the
+    # forwarded request so the response walker can tokenise bucket keys with the
+    # same tokens the `_source` pass produces.
+    anon = get_anonymizer()
+    agg_map = (
+        parse_agg_fields(parsed_body)
+        if anon.active and anon.config.mask_aggregation_keys
+        else None
+    )
+    return _render("search", notices, response, agg_map=agg_map)
 
 
 # --------------------------------------------------------------------------- #

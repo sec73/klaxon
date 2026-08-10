@@ -263,6 +263,7 @@ the settings and what the gate does.
 | deterministic placeholders | `KLAXON_ANONYMIZATION_USE_HASH` | `use_hash` | `true` |
 | placeholder hash | `KLAXON_ANONYMIZATION_HASH_ALGORITHM` | `hash_algorithm` | `md5` (`sha256`) |
 | masked fields | `KLAXON_ANONYMIZATION_MASK_FIELDS` | `mask_fields` | see below |
+| aggregation key masking | `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS` | `mask_aggregation_keys` | `false` |
 | block on residual PII | `KLAXON_ANONYMIZATION_WHITELIST_ENABLED` | `whitelist_enabled` | `true` |
 | audit log | `KLAXON_ANONYMIZATION_LOG` | `log_path` | `llm_prompts.log` |
 | persist unmasked output | `KLAXON_ANONYMIZATION_LOG_RAW` | `log_raw` | `false` |
@@ -280,6 +281,19 @@ Default masked fields: `source.ip`, `destination.ip`, `client.ip`, `server.ip`,
 placeholder family follows the field name (`.ip` → `[IP_…]`, `user.name` →
 `[USER_…]`, `agent.name`/`host.hostname` → `[HOST_…]`, `agent.id` → `[AGENT_…]`).
 A custom field not in the built-in table falls back to `[USER_…]`.
+
+**Aggregation keys.** Bucket keys are computed on indexed values, so without a
+masking pass a `terms` agg on `related.hosts` returns raw hostnames even when
+`_source` is clean. With `mask_aggregation_keys` on (off by default), the
+`search` response walker tokenises the `key` of `terms` / `significant_terms` /
+`significant_text` / `multi_terms` / `composite` buckets whose source field is
+in `mask_fields`, using the same deterministic tokens as `_source`. `composite`
+`after_key` is tokenised the same way so pagination stays consistent.
+`date_histogram`, `histogram`, `range`, `filters` and metric aggs are never
+touched; `doc_count` and aggregation metadata survive unchanged; `top_hits`
+embedded documents go through the normal `_source` masking. Aggregations whose
+request could not be mapped to fields (saved searches, scripted aggs) are left
+alone.
 
 **Activation.** `active = enabled and not (llm_base_url on loopback)`. An unset
 endpoint is treated as external, and the server logs a warning saying so.
