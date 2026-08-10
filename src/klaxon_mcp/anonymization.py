@@ -41,10 +41,12 @@ switched on).
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 from collections import Counter
 from collections.abc import Mapping
@@ -52,6 +54,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from . import gdpr as _gdpr
 from . import overview as _overview
 from .clients import Response
 from .config import AnonymizationConfig
@@ -76,6 +79,19 @@ _NO_HASH_LABELS: dict[str, str] = {
     AGENT: "[AGENT_ID]",
     EMAIL: "[EMAIL]",
 }
+
+# Fallback secret when neither KLAXON_ANONYMIZATION_SALT nor a persisted salt
+# file is configured: one random value per process, shared by every Anonymizer
+# in it. Config resolution normally provides a stable salt; this only guards
+# direct construction.
+_PROCESS_SALT: str | None = None
+
+
+def _process_salt() -> str:
+    global _PROCESS_SALT
+    if _PROCESS_SALT is None:
+        _PROCESS_SALT = secrets.token_hex(32)
+    return _PROCESS_SALT
 
 # Dotted field-name suffix -> placeholder family. The suffix match runs against
 # the full dotted path, so "user.name" also covers "source.user.name". A
@@ -244,22 +260,81 @@ _USERNAME_AUTH_RE = re.compile(
     r"\s+(?:as|for|by)\s+(?:\buser\b\s+)?(?P<name>[A-Za-z0-9_.@%+=-]{2,64})\b"
 )
 
+# Values the registry-based free-text pass must not blindly replace: common
+# English words that are not evidence of a username on their own. The context
+# patterns still mask them inside username formulations.
+_COMMON_WORDS = frozenset(
+    {
+        "user", "data", "root", "host", "server", "system", "login",
+        "account", "group", "name", "id", "admin", "agent", "manager",
+        "index", "log", "level", "rule", "event", "file", "process",
+        "network", "service", "session", "message", "value", "time",
+        "type", "status", "error", "info", "warning", "debug", "trace",
+        "audit", "policy", "role", "result", "total", "size", "count",
+        "default", "custom",
+    }
+)
+
+# Unicode-aware name characters for usernames in free text (this deployment has
+# German data): \w is the Unicode word class, so umlauts are covered.
+_NAME_CHARS = r"\w.@%+=-"
+_LETTER = r"[^\W\d_]"  # a Unicode letter (not a digit/underscore): uid=0 stays an id
+
+# Gap 1: username forms in free text that the structured fields may miss. Each
+# captures `name` and runs only when mask_free_text_users is on. `uid=` requires
+# a leading letter so numeric ids (`uid=0`) are never mistaken for usernames.
+_UID_EQ_RE = re.compile(
+    rf"(?i)\buid\s*=\s*(?P<name>{_LETTER}[{_NAME_CHARS}]{{1,63}})\b"
+)
+_FOR_USER_RE = re.compile(
+    rf"(?i)\b(?:for|by)\s+user\s+(?P<name>[{_NAME_CHARS}]{{2,64}})\b"
+)
+_SSH_PUBKEY_RE = re.compile(
+    rf"(?i)\bAccepted\s+publickey\s+for\s+(?P<name>[{_NAME_CHARS}]{{2,64}})\b"
+)
+_UID_PAREN_RE = re.compile(
+    rf"(?i)\b(?:by|as|for)\s+(?P<name>[{_NAME_CHARS}]{{2,64}})\s*"
+    r"\(\s*uid\s*=\s*\d+\s*\)"
+)
+# Bare "user <name>", guarded against the common English words that follow
+# "user" in prose ("user session", "user data", "user account", ...). The guard
+# is derived from the full _COMMON_WORDS stoplist, so a common word is never
+# masked by this pattern alone.
+_USER_BARE_GUARD = "|".join(re.escape(w) + r"\b" for w in sorted(_COMMON_WORDS))
+_USER_BARE_RE = re.compile(
+    rf"(?i)\buser\s+(?!{_USER_BARE_GUARD})"
+    rf"(?P<name>[{_NAME_CHARS}]{{2,64}})\b"
+)
+_USERNAME_CONTEXT_PATTERNS = (
+    _UID_EQ_RE,
+    _FOR_USER_RE,
+    _SSH_PUBKEY_RE,
+    _UID_PAREN_RE,
+    _USER_BARE_RE,
+)
+
 _EMAIL = "EMAIL"
 _IP = "IP"
 _USER = "USER"
+
+# A value already in this shape is a token from the masked stream (Option B) or
+# ingest-time masking: leave it alone, never re-mask (idempotent). Kept in sync
+# with masked_stream.TOKEN_RE.
+_TOKEN_RE = re.compile(r"^\[(?:IP|USER|HOST|AGENT)_[0-9a-f]{16}\]$")
 
 
 class Anonymizer:
     """Mask, verify, block and log tool output for external LLM clients.
 
-    Deterministic by construction: with hashing on, the placeholder is derived
-    from the value itself (MD5 or SHA-256, first six hex digits), so the same
-    input always maps to the same placeholder and no cross-request state is
-    required. The in-memory counters only feed the compliance report.
+    Deterministic by construction: with hashing on, the token is an
+    HMAC-SHA256 over the salt keyed by the placeholder family, so the same
+    value always maps to the same token and no cross-request state is required.
+    The in-memory counters only feed the compliance report.
     """
 
     def __init__(self, config: AnonymizationConfig) -> None:
         self.config = config
+        self._salt = (config.salt or _process_salt()).encode("utf-8")
         self._lock = threading.Lock()
         self._exchanges = 0
         self._blocked = 0
@@ -301,21 +376,29 @@ class Anonymizer:
     # Placeholders
     # ------------------------------------------------------------------ #
 
-    def _placeholder(self, kind: str, value: str) -> str:
-        if self.config.use_hash:
-            digest = hashlib.new(
-                self.config.hash_algorithm, value.encode("utf-8")
-            ).hexdigest()
-            return f"[{kind}_{digest[:6]}]"
-        return _NO_HASH_LABELS[kind]
+    def _token(self, kind: str, value: str) -> str:
+        """Deterministic, keyed token for a value in one placeholder family.
+
+        HMAC-SHA256 over the salt with the family as context, truncated to 64
+        bits of output: dictionary reversal of a single token is infeasible, and
+        the same value in different families gets different tokens. The
+        `[PREFIX_xxxx]` display shape is unchanged, so existing consumers keep
+        parsing it. use_hash=false falls back to the generic labels.
+        """
+        if not self.config.use_hash:
+            return _NO_HASH_LABELS[kind]
+        digest = hmac.new(
+            self._salt, f"{kind}:{value}".encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        return f"[{kind}_{digest[:16]}]"
 
     def _register(self, kind: str, value: str) -> str:
-        """Record a masked value for the report and return its placeholder."""
+        """Record a masked value for the report and return its token."""
         with self._lock:
             counts = self._counts[kind]
             if len(counts) < _MAX_TRACKED_VALUES:
                 counts[value] += 1
-        return self._placeholder(kind, value)
+        return self._token(kind, value)
 
     # ------------------------------------------------------------------ #
     # Structured pass
@@ -336,9 +419,14 @@ class Anonymizer:
                 return _field_kind(field), field
         return None
 
-    def _mask_string_value(self, path: str, value: str) -> str:
+    def _mask_string_value(
+        self, path: str, value: str, identities: Mapping[str, str] | None = None
+    ) -> str:
         """Mask a single string leaf of the response, given its dotted path."""
         if not value:
+            return value
+        if _TOKEN_RE.fullmatch(value):
+            # Already a token (masked stream): idempotent passthrough.
             return value
 
         matched = self._field_for_path(path)
@@ -350,7 +438,8 @@ class Anonymizer:
 
         # Unconfigured field: mask by value type. Whole-value matches first
         # (a field that holds nothing but an IP is an IP), then embedded
-        # occurrences inside free text.
+        # occurrences inside free text. Free-text fields additionally get the
+        # username pass (known identities + context patterns) when enabled.
         stripped = value.strip()
         if _EMAIL_RE.fullmatch(stripped):
             return self._register(_EMAIL, value)
@@ -358,14 +447,24 @@ class Anonymizer:
             return self._register(_IP, value)
         if _FQDN_RE.fullmatch(stripped) and "://" not in stripped:
             return self._register(HOST, value)
+        if self._is_free_text_field(path):
+            return self.mask_text(value, identities)
         return self.mask_text(value)
 
-    def mask_json(self, obj: Any, path: str = "") -> Any:
+    def mask_json(
+        self, obj: Any, path: str = "", identities: Mapping[str, str] | None = None
+    ) -> Any:
         """Deep-walk a parsed response and mask personal data in place-free."""
-        return self._mask_json(obj, path, skip_aggregations=False)
+        return self._mask_json(
+            obj, path, skip_aggregations=False, identities=identities
+        )
 
     def _mask_json(
-        self, obj: Any, path: str = "", skip_aggregations: bool = False
+        self,
+        obj: Any,
+        path: str = "",
+        skip_aggregations: bool = False,
+        identities: Mapping[str, str] | None = None,
     ) -> Any:
         """The structural pass; optionally leaves the `aggregations` subtree alone.
 
@@ -373,7 +472,8 @@ class Anonymizer:
         `aggregations` block is not walked here — `mask_aggregations` owns it and
         already tokenised its keys. Walking it again would run the value-type
         pass over tokenised keys and drift aggregation tokens apart from their
-        `_source` twins.
+        `_source` twins. `identities` (raw value -> token for the response's
+        known usernames) feeds the free-text username pass.
         """
         if isinstance(obj, dict):
             out: dict[str, Any] = {}
@@ -382,13 +482,28 @@ class Anonymizer:
                     out[key] = value
                     continue
                 child_path = f"{path}.{key}" if path else key
-                out[key] = self._mask_json(value, child_path, skip_aggregations)
+                if key == "_source" and self.config.mask_free_text_users:
+                    # Per-document identities: the free-text pass must not
+                    # borrow identities from other documents in the same
+                    # response, or a username in one hit would mask the same
+                    # word in ordinary prose in another.
+                    local = self._collect_identities(value, child_path)
+                    out[key] = self._mask_json(
+                        value, child_path, skip_aggregations, local
+                    )
+                else:
+                    out[key] = self._mask_json(
+                        value, child_path, skip_aggregations, identities
+                    )
             return out
         if isinstance(obj, list):
             # List indices do not belong to the field path.
-            return [self._mask_json(item, path, skip_aggregations) for item in obj]
+            return [
+                self._mask_json(item, path, skip_aggregations, identities)
+                for item in obj
+            ]
         if isinstance(obj, str):
-            return self._mask_string_value(path, obj)
+            return self._mask_string_value(path, obj, identities)
         return obj
 
     def mask_response(
@@ -412,6 +527,8 @@ class Anonymizer:
         parsed = response.json()
         if not isinstance(parsed, (dict, list)):
             return response
+        # Free-text identities are built per document (inside the walk, at each
+        # `_source`), so a username in one hit never masks prose in another.
         if self.config.mask_aggregation_keys:
             masked = self.mask_aggregations(parsed, agg_map)
             masked = self._mask_json(masked, "", skip_aggregations=True)
@@ -428,7 +545,10 @@ class Anonymizer:
     # ------------------------------------------------------------------ #
 
     def mask_aggregations(
-        self, obj: Any, agg_map: Mapping[str, AggSpec] | None
+        self,
+        obj: Any,
+        agg_map: Mapping[str, AggSpec] | None,
+        identities: Mapping[str, str] | None = None,
     ) -> Any:
         """Mask personal data in the `aggregations` block of a search response.
 
@@ -446,17 +566,24 @@ class Anonymizer:
         if not isinstance(obj, dict) or "aggregations" not in obj:
             return obj
         out = dict(obj)
-        out["aggregations"] = self._mask_agg_map(out["aggregations"], agg_map or {})
+        out["aggregations"] = self._mask_agg_map(
+            out["aggregations"], agg_map or {}, identities=identities
+        )
         return out
 
     def _mask_agg_map(
-        self, aggs: Any, agg_map: Mapping[str, AggSpec]
+        self,
+        aggs: Any,
+        agg_map: Mapping[str, AggSpec],
+        identities: Mapping[str, str] | None = None,
     ) -> Any:
         """Walk a response `aggregations` map (name -> aggregation object)."""
         if not isinstance(aggs, dict):
             return aggs
         return {
-            name: self._mask_agg_obj(agg_obj, agg_map.get(name), agg_map)
+            name: self._mask_agg_obj(
+                agg_obj, agg_map.get(name), agg_map, identities=identities
+            )
             for name, agg_obj in aggs.items()
         }
 
@@ -465,6 +592,7 @@ class Anonymizer:
         agg_obj: Any,
         spec: AggSpec | None,
         agg_map: Mapping[str, AggSpec],
+        identities: Mapping[str, str] | None = None,
     ) -> Any:
         """Mask one aggregation object: buckets, after_key, nested aggs, top_hits."""
         if not isinstance(agg_obj, dict):
@@ -472,7 +600,9 @@ class Anonymizer:
         out: dict[str, Any] = {}
         for key, value in agg_obj.items():
             if key == "buckets":
-                out[key] = self._mask_buckets(value, spec, agg_map)
+                out[key] = self._mask_buckets(
+                    value, spec, agg_map, identities=identities
+                )
             elif (
                 key == "after_key"
                 and spec is not None
@@ -486,12 +616,12 @@ class Anonymizer:
                 # same document-masking path as the top-level hits. The response
                 # carries no "top_hits" marker — the spec (from the request) is
                 # what tells us this is one.
-                out[key] = self.mask_json(value, "top_hits")
+                out[key] = self.mask_json(value, "top_hits", identities=identities)
             elif key == "aggregations":
-                out[key] = self._mask_agg_map(value, agg_map)
+                out[key] = self._mask_agg_map(value, agg_map, identities=identities)
             elif key == "top_hits":
                 # A response that does carry an explicit top_hits marker.
-                out[key] = self.mask_json(value, "top_hits")
+                out[key] = self.mask_json(value, "top_hits", identities=identities)
             else:
                 # doc_count, doc_count_error_upper_bound, sum_other_doc_count,
                 # the aggregation definition and metric values: never touched.
@@ -503,14 +633,18 @@ class Anonymizer:
         buckets: Any,
         spec: AggSpec | None,
         agg_map: Mapping[str, AggSpec],
+        identities: Mapping[str, str] | None = None,
     ) -> Any:
         if isinstance(buckets, list):
-            return [self._mask_bucket(bucket, spec, agg_map) for bucket in buckets]
+            return [
+                self._mask_bucket(bucket, spec, agg_map, identities=identities)
+                for bucket in buckets
+            ]
         if isinstance(buckets, dict):
             # Named `filters` buckets: filter names are labels, not field values,
             # and are never tokenised — only their sub-aggregations are walked.
             return {
-                name: self._mask_bucket(bucket, None, agg_map)
+                name: self._mask_bucket(bucket, None, agg_map, identities=identities)
                 for name, bucket in buckets.items()
             }
         return buckets
@@ -520,6 +654,7 @@ class Anonymizer:
         bucket: Any,
         spec: AggSpec | None,
         agg_map: Mapping[str, AggSpec],
+        identities: Mapping[str, str] | None = None,
     ) -> Any:
         if not isinstance(bucket, dict):
             return bucket
@@ -530,7 +665,7 @@ class Anonymizer:
             elif key == "key_as_string":
                 out[key] = self._mask_key_as_string(value, spec)
             elif key == "aggregations":
-                out[key] = self._mask_agg_map(value, agg_map)
+                out[key] = self._mask_agg_map(value, agg_map, identities=identities)
             else:
                 # doc_count and any bucket metadata are never touched.
                 out[key] = value
@@ -582,6 +717,10 @@ class Anonymizer:
         """
         if not isinstance(value, str) or not value:
             return value
+        if _TOKEN_RE.fullmatch(value):
+            # Already a token (masked stream aggregation key / after_key): leave
+            # it, never re-tokenise (idempotent).
+            return value
         matched = self._field_for_path(field)
         if matched is None:
             return value
@@ -589,6 +728,79 @@ class Anonymizer:
         with self._lock:
             self._field_hits[matched_field] += 1
         return self._register(kind, value)
+
+    # ------------------------------------------------------------------ #
+    # Free-text username masking (Gap 1)
+    # ------------------------------------------------------------------ #
+
+    def _is_username_path(self, path: str) -> bool:
+        """Whether a dotted path plausibly holds a username value."""
+        if path == "user" or path.endswith(
+            (".user", ".user.name", ".user.id", ".username")
+        ):
+            return True
+        matched = self._field_for_path(path)
+        return matched is not None and matched[0] == USER
+
+    def _collect_identities(
+        self,
+        obj: Any,
+        path: str = "",
+        identities: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """raw username -> token for every structured username field in a subtree.
+
+        Called on a raw document's `_source` before that document is masked, so
+        the free-text pass reuses the exact token the structured pass will
+        produce for the same value — and never borrows identities from another
+        document in the same response.
+        """
+        if identities is None:
+            identities = {}
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                child = f"{path}.{key}" if path else key
+                self._collect_identities(value, child, identities)
+        elif isinstance(obj, list):
+            for item in obj:
+                self._collect_identities(item, path, identities)
+        elif isinstance(obj, str) and obj and self._is_username_path(path):
+            if not _TOKEN_RE.fullmatch(obj):
+                # An already-tokenised value is NOT a raw identity to
+                # re-tokenise (that would double-mask free text on a re-run).
+                identities.setdefault(obj, self._register(USER, obj))
+        return identities
+
+    def _is_free_text_field(self, path: str) -> bool:
+        """Whether a field plausibly carries free text (raw log lines etc.)."""
+        if _gdpr.is_freetext(path, []):
+            return True
+        return any(
+            path == f or path.endswith("." + f)
+            for f in self.config.mask_free_text_fields
+        )
+
+    def _replace_known_identities(
+        self, text: str, identities: Mapping[str, str]
+    ) -> str:
+        """Replace known raw usernames in free text with their tokens.
+
+        Whole-word only (Unicode-aware) and case-insensitive, and never for
+        common English words (that is the context patterns' job); a distinctive
+        value such as `marcomoenig` is replaced wherever it appears, including
+        inside `uid=marcomoenig,ou=users,...`. Case-insensitive so a case-shifted
+        variant of a structured username still maps to the same token.
+        """
+        for raw, token in identities.items():
+            if not raw or len(raw) < 2 or raw.lower() in _COMMON_WORDS:
+                continue
+            if _TOKEN_RE.fullmatch(raw):
+                continue  # already a token: replacing with itself is a no-op
+            pattern = re.compile(
+                rf"(?<!\w){re.escape(raw)}(?!\w)", re.IGNORECASE
+            )
+            text = pattern.sub(token, text)
+        return text
 
     def mask_overview(self, result: Any) -> Any:
         """Mask the PII-bearing keys of a parsed findings Overview.
@@ -634,20 +846,35 @@ class Anonymizer:
     # Text pass (safety net)
     # ------------------------------------------------------------------ #
 
-    def mask_text(self, text: str) -> str:
+    def mask_text(
+        self, text: str, identities: Mapping[str, str] | None = None
+    ) -> str:
         """Mask personal data anywhere in rendered output.
 
         E-mails, then IP addresses, then usernames in their log context. The
         order matters: the username pass runs after the value-type passes so a
-        source address can never be captured as a username.
+        source address can never be captured as a username. When
+        `mask_free_text_users` is on, the broader username context patterns and
+        the per-response known-identity registry are applied as well.
         """
         if not text:
             return text
         text = _EMAIL_RE.sub(lambda m: self._register(_EMAIL, m.group(0)), text)
         text = _IPV6_RE.sub(lambda m: self._register(_IP, m.group(0)), text)
         text = _IPV4_RE.sub(lambda m: self._register(_IP, m.group(0)), text)
-        text = _USERNAME_NOUN_RE.sub(self._mask_username, text)
-        text = _USERNAME_AUTH_RE.sub(self._mask_username, text)
+        if self.config.mask_free_text_users:
+            # Known identities first: a case-shifted or Unicode variant of a
+            # structured username reuses the exact structured token before any
+            # context pattern re-tokenises it from the literal text.
+            if identities:
+                text = self._replace_known_identities(text, identities)
+            text = _USERNAME_NOUN_RE.sub(self._mask_username, text)
+            text = _USERNAME_AUTH_RE.sub(self._mask_username, text)
+            for pattern in _USERNAME_CONTEXT_PATTERNS:
+                text = pattern.sub(self._mask_username, text)
+        else:
+            text = _USERNAME_NOUN_RE.sub(self._mask_username, text)
+            text = _USERNAME_AUTH_RE.sub(self._mask_username, text)
         return text
 
     def _mask_username(self, match: re.Match[str]) -> str:
@@ -659,9 +886,13 @@ class Anonymizer:
         """
         base = match.start(0)
         start, end = match.span("name")
+        name = match.group("name")
+        if _TOKEN_RE.fullmatch(name):
+            # Already a Klaxon token: leave the match untouched (idempotent).
+            return match.group(0)
         return (
             match.group(0)[: start - base]
-            + self._register(_USER, match.group("name"))
+            + self._register(_USER, name)
             + match.group(0)[end - base :]
         )
 
@@ -785,8 +1016,9 @@ class Anonymizer:
                 "Anonymization: ENABLED",
                 f"  LLM base URL:      {endpoint}",
                 f"  classification:    {mode}",
-                f"  hash placeholders: {self.config.hash_algorithm} "
-                f"(use_hash={self.config.use_hash})",
+                f"  tokens:            HMAC-SHA256 (use_hash={self.config.use_hash}, "
+                f"salt={'set' if self.config.salt else 'per-process'})",
+                f"  free-text users:   {self.config.mask_free_text_users}",
                 f"  whitelist (block on residual PII): {self.config.whitelist_enabled}",
                 f"  prompt log:        {self.config.log_path}",
             ]
@@ -818,8 +1050,8 @@ class Anonymizer:
             f"master switch:        KLAXON_ANONYMIZE_EXTERNAL_LLM="
             f"{str(self.config.enabled).lower()}",
             f"LLM base URL:         {self.config.llm_base_url or '(unset — assumed external)'}",
-            f"placeholder hashing:  {self.config.hash_algorithm} "
-            f"(use_hash={self.config.use_hash})",
+            f"token derivation:     HMAC-SHA256 (use_hash={self.config.use_hash}, "
+            f"salt={'set' if self.config.salt else 'per-process'})",
             f"whitelist (block):    {self.config.whitelist_enabled}",
             f"prompt log:           {self.config.log_path}",
             f"raw output logged:    {self.config.log_raw}",
@@ -848,7 +1080,7 @@ class Anonymizer:
             example = next(iter(by_value))
             lines.append(
                 f"  {kind:<6} {len(by_value):>4} distinct / {total:>5} occurrences"
-                f"  (e.g. {self._placeholder(kind, example)})"
+                f"  (e.g. {self._token(kind, example)})"
             )
         if not any_masked:
             lines.append("  (nothing masked yet)")

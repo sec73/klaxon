@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 sec73 GmbH <https://www.sec73.io>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Pre-commit hooks. `language: system` uses the active Python environment, so
+# run `pip install -e ".[dev]"` before using pre-commit, or the drift-check hook
+# fails with ModuleNotFoundError. The hook re-runs the same generator check that
+# CI (verify-masking-config.yml) gates on.
+repos:
+  - repo: local
+    hooks:
+      - id: klaxon-masking-drift
+        name: klaxon masking config drift check
+        description: >-
+          tenants/<tenant>/generated/* must match fields.yaml. Regenerate with
+          `python -m klaxon_mcp.generate_masking` after editing fields.yaml.
+        entry: python -m klaxon_mcp.generate_masking --check
+        language: system
+        pass_filenames: false
+        always_run: true

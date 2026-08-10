@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
@@ -125,6 +126,53 @@ def _gdpr_yaml(path: str) -> dict[str, Any] | None:
     return _section(_load_yaml_file(path), "gdpr_checker")
 
 
+def _resolve_salt(config_file: str) -> str:
+    """The HMAC salt: environment first, then a persisted file, then a new one.
+
+    `KLAXON_ANONYMIZATION_SALT` is authoritative when set. Otherwise a salt
+    persisted next to the config file (`<config_file>.salt`) is reused, so tokens
+    stay deterministic across restarts; when neither exists a random salt is
+    generated and persisted (with a warning). The salt is never logged and is a
+    secret — `.salt` files are gitignored.
+    """
+    env_salt = _env_str("KLAXON_ANONYMIZATION_SALT", None)
+    if env_salt:
+        return env_salt
+    path = f"{config_file}.salt"
+    try:
+        with open(path, "r", encoding="ascii") as fh:
+            existing = fh.read().strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    generated = secrets.token_hex(32)
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="ascii") as fh:
+            fh.write(generated + "\n")
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        logger.warning(
+            "KLAXON_ANONYMIZATION_SALT is not set and no salt could be persisted "
+            "to %s (%s); a random per-process salt will be used, so tokens rotate "
+            "on every restart. Set KLAXON_ANONYMIZATION_SALT to a stable secret.",
+            path,
+            exc,
+        )
+        return ""
+    logger.warning(
+        "KLAXON_ANONYMIZATION_SALT is not set. A random salt was generated and "
+        "persisted to %s so tokens stay deterministic across restarts. That file "
+        "is a secret — keep it out of backups and set KLAXON_ANONYMIZATION_SALT "
+        "if you want the secret in the environment instead of on disk.",
+        path,
+    )
+    return generated
+
+
 # Fields treated as personal data by default. The value under each is replaced
 # wholesale; the placeholder family is derived from the field name (see
 # anonymization._FIELD_KIND). Every entry is dotted, so a suffix match also
@@ -141,6 +189,7 @@ DEFAULT_ANONYMIZATION_MASK_FIELDS: tuple[str, ...] = (
     "host.name",
     "user.name",
     "user.id",
+    "user.effective.name",
     "source.user.name",
     "destination.user.name",
     "wazuh.agent.name",
@@ -169,7 +218,10 @@ class AnonymizationConfig:
     enabled: bool = False
     llm_base_url: str = ""
     use_hash: bool = True
-    hash_algorithm: Literal["md5", "sha256"] = "md5"
+    # HMAC secret for token derivation (KLAXON_ANONYMIZATION_SALT, or a salt
+    # persisted next to the config file). Never logged; empty falls back to a
+    # per-process random salt (see anonymization._process_salt).
+    salt: str = ""
     mask_fields: tuple[str, ...] = DEFAULT_ANONYMIZATION_MASK_FIELDS
     # Mask the `key` values of aggregation buckets (terms / significant_terms /
     # significant_text / multi_terms / composite) in `search` responses when the
@@ -178,6 +230,18 @@ class AnonymizationConfig:
     # metrics) are never touched. Aggregation keys and `_source` values use the
     # same deterministic tokens, so the two stay aligned for one entity.
     mask_aggregation_keys: bool = False
+    # Mask usernames that appear inside free-text fields (message, event.original,
+    # ...) using known identities from the structured fields plus precise context
+    # patterns (uid=..., "for user ...", "Accepted publickey for ..."). On by
+    # default (the LLM-safe reading); false restores the pre-feature behaviour.
+    mask_free_text_users: bool = True
+    # Extra free-text fields, beyond the built-in free-text hint pattern
+    # (message, *.log, raw, ...), that get the free-text username pass.
+    mask_free_text_fields: tuple[str, ...] = ()
+    # Data streams that are already masked at ingest (Option B, e.g.
+    # klaxon-masked-<tenant>-v5-*). The response layer passes already-tokenized
+    # values through unchanged, so masking is idempotent for these streams.
+    masked_streams: tuple[str, ...] = ()
     # Whitelist semantics for this server: only responses that mask cleanly go
     # out. true => a residual PII hit blocks the response entirely; false => it
     # is logged as a warning and the masked response is still returned.
@@ -217,31 +281,64 @@ class AnonymizationConfig:
             "KLAXON_LLM_BASE_URL", _yaml_get(anon_yaml, "llm_base_url", "")
         ) or ""
 
-        hash_algorithm = _env_str(
-            "KLAXON_ANONYMIZATION_HASH_ALGORITHM",
-            _yaml_get(anon_yaml, "hash_algorithm", "md5"),
-        )
-        if hash_algorithm is None:
-            hash_algorithm = "md5"
-        hash_algorithm = hash_algorithm.strip().lower()
-        if hash_algorithm not in {"md5", "sha256"}:
-            raise ConfigError(
-                "KLAXON_ANONYMIZATION_HASH_ALGORITHM must be 'md5' or 'sha256', "
-                f"got {hash_algorithm!r}"
-            )
+        salt = _resolve_salt(config_file)
 
-        raw_fields = _env_str("KLAXON_ANONYMIZATION_MASK_FIELDS", None)
-        if raw_fields is None:
-            yaml_fields = _yaml_get(anon_yaml, "mask_fields", None)
-            if isinstance(yaml_fields, (list, tuple)):
-                mask_fields = tuple(
-                    str(f).strip() for f in yaml_fields if str(f).strip()
+        raw_free_text = _env_str("KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS", None)
+        if raw_free_text is None:
+            yaml_ft = _yaml_get(anon_yaml, "mask_free_text_fields", None)
+            if isinstance(yaml_ft, (list, tuple)):
+                mask_free_text_fields = tuple(
+                    str(f).strip() for f in yaml_ft if str(f).strip()
                 )
             else:
-                mask_fields = DEFAULT_ANONYMIZATION_MASK_FIELDS
+                mask_free_text_fields = ()
         else:
-            mask_fields = tuple(
+            mask_free_text_fields = tuple(
+                f.strip() for f in raw_free_text.split(",") if f.strip()
+            )
+
+        # Fail-closed drift guard: the environment override was the known
+        # silent-bypass vector against the generated Option B config. If both the
+        # env var and the YAML file define mask_fields and they differ, refuse to
+        # start instead of silently overriding the file.
+        raw_fields = _env_str("KLAXON_ANONYMIZATION_MASK_FIELDS", None)
+        yaml_fields = _yaml_get(anon_yaml, "mask_fields", None)
+        yaml_fields_tuple: tuple[str, ...] = ()
+        if isinstance(yaml_fields, (list, tuple)):
+            yaml_fields_tuple = tuple(
+                str(f).strip() for f in yaml_fields if str(f).strip()
+            )
+        if raw_fields is not None:
+            env_fields = tuple(
                 f.strip() for f in raw_fields.split(",") if f.strip()
+            )
+            if yaml_fields_tuple and env_fields != yaml_fields_tuple:
+                raise ConfigError(
+                    "KLAXON_ANONYMIZATION_MASK_FIELDS is set and differs from "
+                    "anonymization.mask_fields in the config file. The environment "
+                    "is a drift vector against the generated masked-stream config: "
+                    "align the two (edit tenants/<tenant>/fields.yaml and "
+                    "regenerate), or unset the variable so the file wins. See "
+                    "docs/option-b-masked-stream.md."
+                )
+            mask_fields = env_fields
+        elif yaml_fields_tuple:
+            mask_fields = yaml_fields_tuple
+        else:
+            mask_fields = DEFAULT_ANONYMIZATION_MASK_FIELDS
+
+        raw_streams = _env_str("KLAXON_ANONYMIZATION_MASKED_STREAMS", None)
+        if raw_streams is None:
+            yaml_streams = _yaml_get(anon_yaml, "masked_streams", None)
+            if isinstance(yaml_streams, (list, tuple)):
+                masked_streams = tuple(
+                    str(s).strip() for s in yaml_streams if str(s).strip()
+                )
+            else:
+                masked_streams = ()
+        else:
+            masked_streams = tuple(
+                s.strip() for s in raw_streams.split(",") if s.strip()
             )
 
         log_max_len = _env_int(
@@ -265,12 +362,18 @@ class AnonymizationConfig:
                 "KLAXON_ANONYMIZATION_USE_HASH",
                 _yaml_get(anon_yaml, "use_hash", True),
             ),
-            hash_algorithm=hash_algorithm,  # type: ignore[arg-type]  # checked above
+            salt=salt,
             mask_fields=mask_fields,
             mask_aggregation_keys=_env_bool(
                 "KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS",
                 _yaml_get(anon_yaml, "mask_aggregation_keys", False),
             ),
+            mask_free_text_users=_env_bool(
+                "KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS",
+                _yaml_get(anon_yaml, "mask_free_text_users", True),
+            ),
+            mask_free_text_fields=mask_free_text_fields,
+            masked_streams=masked_streams,
             whitelist_enabled=_env_bool(
                 "KLAXON_ANONYMIZATION_WHITELIST_ENABLED",
                 _yaml_get(anon_yaml, "whitelist_enabled", True),
@@ -288,6 +391,15 @@ class AnonymizationConfig:
 # The frozen default shared by every Config that does not say otherwise. Frozen
 # means it is safe to share: nothing can mutate it.
 _DEFAULT_ANONYMIZATION = AnonymizationConfig()
+
+
+# Built-in GDPR checker custom rules. `user.effective.name` holds values like
+# "root(uid=0)" that the generic user.name name-pattern misses; pinning it as a
+# high-priority username makes the checker report it (and, once it is in
+# mask_fields, as covered). Operator rules from the YAML file are merged on top.
+DEFAULT_GDPR_CUSTOM_PATTERNS: tuple[dict[str, Any], ...] = (
+    {"field": "user.effective.name", "type": "USERNAME", "priority": "high"},
+)
 
 
 @dataclass(frozen=True)
@@ -309,7 +421,8 @@ class GdprConfig:
     check_on_search: bool = False
     # `gdpr_checker.custom_patterns` — each: field (exact or glob), type,
     # priority (high|medium|low), optional regex validated against samples.
-    custom_patterns: tuple[dict[str, Any], ...] = ()
+    # Built-in rules are always present; YAML rules are merged on top.
+    custom_patterns: tuple[dict[str, Any], ...] = DEFAULT_GDPR_CUSTOM_PATTERNS
     config_file: str = "config.yaml"
 
     @classmethod
@@ -335,9 +448,11 @@ class GdprConfig:
         ) or "gdpr_compliance_report.json"
 
         raw_patterns = _yaml_get(gdpr_yaml, "custom_patterns", None)
-        custom: tuple[dict[str, Any], ...] = ()
+        custom: tuple[dict[str, Any], ...] = DEFAULT_GDPR_CUSTOM_PATTERNS
         if isinstance(raw_patterns, list):
-            custom = tuple(p for p in raw_patterns if isinstance(p, dict))
+            custom = DEFAULT_GDPR_CUSTOM_PATTERNS + tuple(
+                p for p in raw_patterns if isinstance(p, dict)
+            )
 
         return cls(
             log_path=log_path,

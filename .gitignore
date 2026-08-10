@@ -16,6 +16,9 @@ dist/
 llm_prompts.log
 dsgvo_compliance_report.txt
 
+# Auto-generated HMAC salt files (a secret) next to the config file.
+*.salt
+
 # The DSGVO plausibility checker's runtime artifacts: audit log and
 # auto-generated compliance report.
 gdpr_check.log

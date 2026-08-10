@@ -1,0 +1,50 @@
+{
+  "description": "Mask personal data into klaxon-masked-customer-a-v5-* (generated from tenants/customer-a/fields.yaml).",
+  "version": 1,
+  "processors": [
+    {
+      "script": {
+        "lang": "painless",
+        "source": "// Generated from tenants/customer-a/fields.yaml \u2014 do not edit by hand.\n// klaxon-mask-customer-a: deterministic masking for klaxon-masked-customer-a-v5-*.\ndef HEX = \"0123456789abcdef\";\ndef SALT = \"__SALT__\";\ndef TOKEN_RE = Pattern.compile(\"^\\\\[(?:IP|USER|HOST|AGENT)_[0-9a-f]{16}\\\\]$\");\n\nString hex16(byte[] bytes) {\n    StringBuilder sb = new StringBuilder();\n    for (int i = 0; i < 8; i++) {\n        int b = bytes[i] & 0xff;\n        sb.append(HEX.charAt(b >> 4));\n        sb.append(HEX.charAt(b & 0x0f));\n    }\n    return sb.toString();\n}\n\nString sha256hex(String input) {\n    MessageDigest md = MessageDigest.getInstance(\"SHA-256\");\n    return hex16(md.digest(input.getBytes(\"UTF-8\")));\n}\n\nString token(String family, String value) {\n    if (value == null) return value;\n    if (TOKEN_RE.matcher(value).matches()) return value;  // idempotent\n    return \"[\" + family + \"_\" + sha256hex(family + \":\" + value + \":\" + SALT) + \"]\";\n}\n\nString maskPattern(Pattern p, String text, String family) {\n    if (text == null) return text;\n    Matcher m = p.matcher(text);\n    int last = 0;\n    StringBuilder out = new StringBuilder();\n    while (m.find()) {\n        out.append(text.substring(last, m.start()));\n        out.append(token(family, m.group(1) == null ? m.group(0) : m.group(1)));\n        last = m.end();\n    }\n    out.append(text.substring(last));\n    return out.toString();\n}\n\nString maskRegistry(String text, Map source) {\n    if (text == null) return text;\n    String out = text;\n    for (def entry : FIELDS) {\n        if (entry[1] != \"USER\") continue;\n        String f = entry[0];\n        if (!source.containsKey(f)) continue;\n        def v = source.get(f);\n        List vals = new ArrayList();\n        if (v instanceof List) { for (item in v) { if (item instanceof String) vals.add(item); } }\n        else if (v instanceof String) vals.add(v);\n        for (raw in vals) {\n            String rawStr = (String) raw;\n            if (rawStr.length() < 2) continue;\n            String tok = token(\"USER\", rawStr);\n            if (tok == rawStr) continue; // already a token, nothing to do\n            Pattern p = Pattern.compile(\"(?<![\\\\w])\" + Pattern.quote(rawStr) + \"(?![\\\\w])\");\n            Matcher m = p.matcher(out);\n            int last = 0;\n            StringBuilder sb = new StringBuilder();\n            while (m.find()) {\n                sb.append(out.substring(last, m.start()));\n                sb.append(tok);\n                last = m.end();\n            }\n            sb.append(out.substring(last));\n            out = sb.toString();\n        }\n    }\n    return out;\n}\n\nString maskFreeText(String text, Map source) {\n    if (text == null) return text;\n    String out = text;\n    // Known identities first, so free text reuses the exact structured token.\n    out = maskRegistry(out, source);\n        out = maskPattern(EMAIL, out, \"EMAIL\");\n        out = maskPattern(IPV6, out, \"IP\");\n        out = maskPattern(IPV4, out, \"IP\");\n        out = maskPattern(USER_NOUN, out, \"USER\");\n        out = maskPattern(USER_AUTH, out, \"USER\");\n        out = maskPattern(UID_EQ, out, \"USER\");\n        out = maskPattern(FOR_USER, out, \"USER\");\n        out = maskPattern(SSH_PUBKEY, out, \"USER\");\n        out = maskPattern(UID_PAREN, out, \"USER\");\n    return out;\n}\n\n// Field table injected from fields.yaml \u2014 the field list lives there, not here.\ndef FIELDS = [\n    [\"destination.ip\", \"IP\", false],\n    [\"source.ip\", \"IP\", false],\n    [\"source.address\", \"IP\", false],\n    [\"user.name\", \"USER\", false],\n    [\"user.id\", \"USER\", false],\n    [\"user.effective.name\", \"USER\", false],\n    [\"client.user.name\", \"USER\", false],\n    [\"host.hostname\", \"HOST\", false],\n    [\"source.domain\", \"HOST\", false],\n    [\"url.domain\", \"HOST\", false],\n    [\"event.dataset\", \"HOST\", false],\n    [\"log.logger\", \"HOST\", false],\n    [\"wazuh.agent.id\", \"AGENT\", false],\n    [\"wazuh.agent.name\", \"HOST\", false],\n    [\"wazuh.agent.host.hostname\", \"HOST\", false],\n    [\"event.original\", \"USER\", false],\n    [\"related.ip\", \"IP\", true],\n    [\"related.user\", \"USER\", true],\n    [\"related.hosts\", \"HOST\", true]\n];\ndef FREE_TEXT = [\n    \"message\"\n];\n\nMap masked = new HashMap();\nfor (key in ctx['_source'].keySet()) { masked.put(key, ctx['_source'].get(key)); }\n\nfor (def entry : FIELDS) {\n    String f = entry[0];\n    String family = entry[1];\n    boolean array = entry[2];\n    if (!masked.containsKey(f)) continue;            // missing field: no-op\n    def v = masked.get(f);\n    if (array) {\n        if (v instanceof List) {\n            List out = new ArrayList();\n            for (item in v) {\n                if (item instanceof String) out.add(token(family, item));\n                else out.add(item);\n            }\n            masked.put(f, out);\n        }\n    } else {\n        if (v instanceof String) masked.put(f, token(family, v));\n    }\n}\n\nfor (f in FREE_TEXT) {\n    if (masked.containsKey(f) && masked.get(f) instanceof String) {\n        // Registry reads the RAW original source: free text must re-tokenise the\n        // same raw username to the exact structured token.\n        masked.put(f, maskFreeText(masked.get(f), ctx['_source']));\n    }\n}\n\n// Commit atomically: only on full success does _source change. A failure is\n// caught by the on_failure processor, which flags klaxon.masking_error and keeps\n// the (original) document so it can be filtered and fixed.\nctx['_source'].clear();\nctx['_source'].putAll(masked);\n",
+        "on_failure": [
+          {
+            "set": {
+              "field": "klaxon.masking_error",
+              "value": "{{ _ingest.on_failure_message }}"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "_meta": {
+    "source": "tenants/customer-a/fields.yaml",
+    "sha256": "79bcad9cc689ed9257b97ffec9b271fd65340752404998724606eea870f47b44",
+    "tenant": "customer-a",
+    "fields": [
+      "destination.ip",
+      "source.ip",
+      "source.address",
+      "user.name",
+      "user.id",
+      "user.effective.name",
+      "client.user.name",
+      "host.hostname",
+      "source.domain",
+      "url.domain",
+      "event.dataset",
+      "log.logger",
+      "wazuh.agent.id",
+      "wazuh.agent.name",
+      "wazuh.agent.host.hostname",
+      "event.original",
+      "related.ip",
+      "related.user",
+      "related.hosts"
+    ],
+    "free_text_fields": [
+      "message"
+    ],
+    "generated_by": "klaxon-mcp.generate_masking"
+  }
+}

@@ -6,6 +6,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 0.1.5 – 2026-08-10
+
+### Added
+
+- **Free-text username masking (Gap 1).** When anonymization is enabled and
+  `mask_free_text_users` is on (the default), usernames inside free-text fields
+  (`message`, `*.log`, `raw`, ...) are masked with the same deterministic tokens
+  as the structured fields: a per-response registry of known identities is built
+  from `user.name` / `related.user` / `user.effective.name` / ... and reused by
+  the free-text pass, which also covers precise context formulations (`uid=...`,
+  `for/by user ...`, `session opened for user ...`, `Accepted publickey for ...`,
+  `username=/user=...`, `login as/for ...`). Common English words are never
+  replaced by the registry on their own, and numeric ids (`uid=0`) are left
+  alone. `mask_free_text_users: false` restores the previous behaviour.
+  `user.effective.name` was added to the default mask list, and the GDPR checker
+  now pins it as a high-priority username via a built-in custom rule.
+
+- **Keyed HMAC tokens (Gap 2).** Tokens are now HMAC-SHA256 over
+  `KLAXON_ANONYMIZATION_SALT` with the placeholder family as context, truncated
+  to 64 bits of output (`[USER_…]`, 16 hex chars) — replacing the 24-bit
+  dictionary-reversible MD5 prefixes. When the salt is not set, a random one is
+  generated once and persisted next to the config file (`*.salt`, gitignored)
+  with a warning, so tokens stay deterministic across restarts. The display
+  shape is unchanged; tokens are computed per response and never stored, so no
+  reindex is needed.
+
+
 ## 0.1.4 – 2026-08-10
 
 ### Added
