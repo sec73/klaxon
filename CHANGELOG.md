@@ -52,7 +52,7 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fell back to `USER_`).
 
 
-## ## [0.1.3] — 2026-08-08
+## ## 0.1.3 — 2026-08-08
 
 ### Added
 
