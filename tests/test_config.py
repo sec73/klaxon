@@ -153,15 +153,15 @@ class TestAnonymizationDefaults:
 
     def test_sensible_security_defaults(self) -> None:
         config = Config.from_env().anonymization
-        # Keyed tokens and the strict whitelist are the safe readings.
+        # Keyed tokens, the strict whitelist and aggregation-key masking are the
+        # safe (fail-closed) readings: without them a terms/composite on a masked
+        # field returns raw bucket keys while `_source` is masked.
         assert config.use_hash is True
         assert config.whitelist_enabled is True
         assert config.log_raw is False
         assert config.log_path == "llm_prompts.log"
-        # The LLM-safe free-text username pass is on by default; aggregation
-        # keys and per-run salts opt in (or are stable via env).
         assert config.mask_free_text_users is True
-        assert config.mask_aggregation_keys is False
+        assert config.mask_aggregation_keys is True
 
 
 class TestAnonymizationEnv:
@@ -192,8 +192,9 @@ class TestAnonymizationEnv:
         config = AnonymizationConfig.from_env()
         assert config.mask_fields == ("source.ip", "user.name", "custom.field")
 
-    def test_mask_aggregation_keys_defaults_off(self) -> None:
-        assert Config.from_env().anonymization.mask_aggregation_keys is False
+    def test_mask_aggregation_keys_defaults_on(self) -> None:
+        # Fail-closed: bucket keys must be masked unless explicitly turned off.
+        assert Config.from_env().anonymization.mask_aggregation_keys is True
 
     def test_mask_aggregation_keys_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS", "true")

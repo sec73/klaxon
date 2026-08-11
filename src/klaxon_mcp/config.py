@@ -225,11 +225,15 @@ class AnonymizationConfig:
     mask_fields: tuple[str, ...] = DEFAULT_ANONYMIZATION_MASK_FIELDS
     # Mask the `key` values of aggregation buckets (terms / significant_terms /
     # significant_text / multi_terms / composite) in `search` responses when the
-    # aggregation's source field is in `mask_fields`. Off by default; bucket keys
-    # of non-field aggregations (date_histogram, histogram, range, filters,
-    # metrics) are never touched. Aggregation keys and `_source` values use the
-    # same deterministic tokens, so the two stay aligned for one entity.
-    mask_aggregation_keys: bool = False
+    # aggregation's source field is in `mask_fields`. ON by default (fail-closed:
+    # a terms/composite on `related.user` or `related.hosts` returns raw values
+    # otherwise — the same PII the `_source` pass masks). Set
+    # KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS=false to restore the
+    # pre-feature behaviour. Keys of non-field aggregations (date_histogram,
+    # histogram, range, filters, metrics) are never touched. Aggregation keys
+    # and `_source` values use the same deterministic tokens, so the two stay
+    # aligned for one entity.
+    mask_aggregation_keys: bool = True
     # Mask usernames that appear inside free-text fields (message, event.original,
     # ...) using known identities from the structured fields plus precise context
     # patterns (uid=..., "for user ...", "Accepted publickey for ..."). On by
@@ -366,7 +370,7 @@ class AnonymizationConfig:
             mask_fields=mask_fields,
             mask_aggregation_keys=_env_bool(
                 "KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS",
-                _yaml_get(anon_yaml, "mask_aggregation_keys", False),
+                _yaml_get(anon_yaml, "mask_aggregation_keys", True),
             ),
             mask_free_text_users=_env_bool(
                 "KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS",

@@ -963,7 +963,9 @@ class TestAggregationKeyMasking:
         )
 
     def test_feature_off_leaves_aggregation_keys_as_before(self) -> None:
-        a = anon()  # mask_aggregation_keys defaults to False
+        # Explicit opt-out (the default is now fail-closed ON; turning it off
+        # restores the pre-feature behaviour).
+        a = anon(mask_aggregation_keys=False)
         body = {"aggs": {"hosts": {"terms": {"field": "related.hosts"}}}}
         response = Response(
             200,
