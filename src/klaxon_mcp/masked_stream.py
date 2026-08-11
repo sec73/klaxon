@@ -267,7 +267,7 @@ def load_tenant_config(
         if not isinstance(entry, dict) or not isinstance(entry.get("field"), str):
             raise ValueError(f"invalid field entry in {path}: {entry!r}")
         field = entry["field"]
-        _validate_field_name(field, path)
+        _validate_field_name(field, str(path))
         if field in seen:
             raise ValueError(f"duplicate field {field!r} in {path}")
         seen.add(field)
@@ -289,7 +289,7 @@ def load_tenant_config(
         if not isinstance(entry, dict) or not isinstance(entry.get("field"), str):
             raise ValueError(f"invalid free_text_fields entry in {path}: {entry!r}")
         field = entry["field"]
-        _validate_field_name(field, path)
+        _validate_field_name(field, str(path))
         if field in seen:
             raise ValueError(f"{field!r} listed as both field and free_text_field")
         free_text_fields.append(field)
