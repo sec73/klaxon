@@ -158,6 +158,42 @@ or when the effective Klaxon config masks different fields — a stale pipeline
 would silently write unmasked data. Run `klaxon-mcp verify-config --tenant X`
 to audit all drift sources at once.
 
+### The live integration test (`klaxon masking test`)
+
+Before deploying, prove the generated pipeline actually compiles and masks
+correctly on the real indexer — without writing anything:
+
+```console
+# credentials: KLAXON_INDEXER_URL / KLAXON_INDEXER_USER / KLAXON_INDEXER_PASSWORD
+# (or a gitignored local tests/live/.env / .env.live file — see tests/live/.env.example)
+klaxon masking test --tenant customer-a
+```
+
+Two stages, both write-free:
+
+* **Stage A — ingest allowlist preflight:** `GET /_scripts/painless/_context`
+  (`context=ingest`) verifies the cluster's ingest Painless allowlist has every
+  API the generated script needs (`String.sha256()`, `Pattern`/`Matcher`,
+  `StringBuilder`, collections). `_execute` cannot compile an ingest script —
+  its `painless_test` context lacks the ingest-only `sha256` augmentation — so
+  Stage B's `_simulate` is the authoritative compile check.
+* **Stage B — pipeline simulate:** `POST /_ingest/pipeline/_simulate` with the
+  generated pipeline **inline** (nothing is deployed or persisted; `_meta` is
+  stripped because the endpoint rejects it). This compiles the script in the
+  ingest context AND asserts the masking: no `klaxon.masking_error`; `user.name`
+  and `uid=<same-username>` in `message` share one token; `user.effective.name`
+  like `root(uid=0)` masked; `related.user`/`related.hosts` arrays element-wise;
+  `event.original` → one token; `related.hash` untouched; already-tokenised
+  values unchanged.
+
+Credentials are read ONLY from `KLAXON_INDEXER_URL` / `KLAXON_INDEXER_USER` /
+`KLAXON_INDEXER_PASSWORD`. If any is unset the test **skips cleanly** (never
+fails the suite) and the password is never logged. The same assertions run as
+the pytest marked `integration`/`live` (`tests/test_live_masking.py`). For a
+self-signed lab cluster, set `KLAXON_INDEXER_VERIFY_SSL=false` (default `true`;
+the test warns) or — better — trust the cluster CA (`SSL_CERT_FILE`/system
+trust store).
+
 ### The checkpoint and the window
 
 The sync job stores a checkpoint (`@timestamp` of the last successful run) in
@@ -236,9 +272,20 @@ klaxon-mcp sync-masked --tenant <tenant>
 * **Version bumps force regeneration.** The pipeline `_meta.generator_version`
   is part of the committed artifacts, so bumping the package version without
   re-running `klaxon masking generate` shows up as drift in CI/pre-commit.
-* **Painless whitelist.** The script uses `MessageDigest`/`Pattern`/`Matcher`
-  and `StringBuilder`. Verify the cluster's `painless.whitelist` allows them on
-  your OpenSearch version before first deploy.
+* **Painless whitelist.** The script uses ONLY whitelisted APIs — the
+  ingest-context `String.sha256()` augmentation (SHA-256, byte-identical to
+  `MessageDigest`), regex literals for `Pattern`s (`Pattern.compile` is not
+  whitelisted on restricted clusters), `Pattern`/`Matcher`/`StringBuilder` and
+  the collections. `klaxon masking test` Stage A verifies the cluster's ingest
+  allowlist has all of them before you deploy.
+* **`script.painless.regex.limit-factor`.** The free-text pass applies regexes
+  to whole log messages; on the default `limit-factor` (6), a long
+  dot/digit-heavy line (e.g. many IPs, no e-mail) can trip the "Regular
+  expression considered too many characters" guard and flag the document
+  `klaxon.masking_error`. The value-type patterns use possessive quantifiers to
+  keep the scan near-linear, but for long messages raise the setting (e.g. to
+  20) in `opensearch.yml` on the indexer nodes. The live test detects this
+  error and prints the exact remediation.
 
 ## What the tests pin
 
@@ -247,11 +294,22 @@ klaxon-mcp sync-masked --tenant <tenant>
   on_failure present, no `related.hash`), config fragment ↔ fields.yaml
   agreement, the MANDATORY self-test (Painless reference == `derive_token`
   byte-for-byte; a deliberately changed scheme fails generation and emits no
-  artifacts), drift check, and the deploy-time salt helpers.
+  artifacts), the structural compile-safety check (functions before statements,
+  no `ctx['_source']`, no dropped function/declaration), drift check, and the
+  deploy-time salt helpers.
 * `tests/test_sync_masked.py` — the Python twin of the Painless logic on
   representative log lines (LDAP DN, PAM, SSH publickey, arrays, missing
   fields, already-tokenised input, `mask_free_text_users: false`), plus the
   sync job's window/checkpoint/preflight safety with a fake indexer.
+* `tests/test_live_masking.py` — **live** (marked `integration`/`live`,
+  skipped without `KLAXON_INDEXER_*`): Stage A checks the ingest allowlist has
+  the APIs the script needs; Stage B simulates the generated pipeline via
+  `_simulate` (authoritative compile + behaviour) and asserts token identity
+  for `uid=`, arrays element-wise, `event.original` single token,
+  `related.hash` untouched, idempotency, and no `klaxon.masking_error`.
+* `tests/test_live_test.py` — offline: credential resolution (env + gitignored
+  dotenv, never logged), URL sanitisation, the ingest-allowlist preflight, and
+  the Stage-B assertions validated against the Python twin.
 * `tests/test_idempotent_masking.py` — already-tokenised values pass through
   `_source`, aggregation keys and composite `after_key`; no double-masking.
 * `tests/test_config.py` — `masked_streams` env/YAML parsing and the

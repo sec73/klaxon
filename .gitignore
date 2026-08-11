@@ -10,6 +10,18 @@ dist/
 # Never commit credentials. .env.example is the template.
 .env
 
+# Live masking integration test credentials (`klaxon masking test` and the
+# integration/live pytest). Real values go into one of these local files (copy
+# from tests/live/.env.example); both are never committed.
+.env.live
+tests/live/.env
+
+# Deployable masking artifacts embed the real salt (`params.salt`) and are a
+# secret store — never commit them. `klaxon masking generate --tenant X
+# --out DIR` writes the deployable set into DIR; use an ignored directory.
+deployable/
+.deploy/
+
 # The anonymization audit log (llm_prompts.log) is a runtime artifact and can
 # contain personal data — never commit it. Its export and the compliance report
 # are generated on demand.

@@ -424,14 +424,25 @@ is the operator's/CI's job). `klaxon` and `klaxon-mcp` are the same binary.
 | `masking generate --tenant X --stdout` | print the deployable set to stdout |
 | `masking generate --check` | no writes — compare committed artifacts vs `fields.yaml` (CI/pre-commit drift gate) |
 | `masking generate --tenant X --retention-days N` | ISM delete-after (default 30) |
-| `masking selftest [--tenant X]` | prove the generated Painless token scheme == `derive_token` byte-for-byte (runs inside every `generate`; a mismatch aborts and emits nothing) |
+| `masking selftest [--tenant X]` | prove the generated Painless token scheme == `derive_token` byte-for-byte AND that the script is structurally compilable (functions before statements, no `ctx['_source']`); runs inside every `generate`; a mismatch aborts and emits nothing |
+| `masking test --tenant X` | LIVE integration test: Stage A verifies the ingest Painless allowlist has the APIs the script needs (`GET /_scripts/painless/_context`), Stage B simulates it via `POST /_ingest/pipeline/_simulate` (authoritative compile + behaviour) on the real indexer — no writes, nothing deployed (skips cleanly when credentials are missing) |
 | `masking salt-check --tenant X` | compare the DEPLOYED pipeline's `params.salt` with the current env salt (needs the indexer) |
 
 Flags: `--tenant`, `--out`, `--stdout`, `--check`, `--retention-days`, `--root`,
-`--salt`, `--salt-env`. The salt is read from `KLAXON_ANONYMIZATION_SALT` (or
-`salt_env` in `fields.yaml`); unset → random salt + warning (tokens rotate
-unless the salt is stable). `related.hash` is never masked. See
-`docs/option-b-masked-stream.md` for the full design.
+`--salt`, `--salt-env` (and `--env` for `masking test`). The salt is read from
+`KLAXON_ANONYMIZATION_SALT` (or `salt_env` in `fields.yaml`); unset → random
+salt + warning (tokens rotate unless the salt is stable). `related.hash` is
+never masked. See `docs/option-b-masked-stream.md` for the full design.
+
+`masking test` reads the indexer credentials ONLY from `KLAXON_INDEXER_URL` /
+`KLAXON_INDEXER_USER` / `KLAXON_INDEXER_PASSWORD` (optionally via a gitignored
+local `.env.live` or `tests/live/.env` file — see `tests/live/.env.example`).
+If any of the three is unset the test skips with a clear message; the password
+is never logged. The same live test runs as the pytest marked `integration`/
+`live` (`tests/test_live_masking.py`), which also skips without credentials.
+Optional, non-credential `KLAXON_INDEXER_VERIFY_SSL` (default `true`) disables
+TLS verification for a self-signed lab cluster — the test prints a warning;
+prefer trusting the cluster CA (`SSL_CERT_FILE`/system trust store) instead.
 
 ---
 

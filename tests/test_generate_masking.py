@@ -55,6 +55,7 @@ from klaxon_mcp.masking import (
     selftest_main,
     tenants_in_repo,
     verify_script_scheme,
+    verify_script_structure,
 )
 
 SALT = "test-salt"
@@ -240,7 +241,9 @@ def test_generator_selftest_fails_on_tampered_script(cfg: Any) -> None:
     derive_token scheme must be caught by the script-scheme verification."""
     source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
     assert verify_script_scheme(source) == []
-    tampered = source.replace("SHA-256", "SHA-1")
+    # The new scheme hashes via the String.sha256() augmentation; changing the
+    # hash (or the 16-hex truncation) must be flagged.
+    tampered = source.replace(".sha256().substring(0, 16)", ".sha256().substring(0, 24)")
     assert verify_script_scheme(tampered)
     assert run_generator_selftest(cfg, SALT) == []
 
@@ -260,6 +263,85 @@ def test_generator_selftest_reports_params_salt_mismatch(
     monkeypatch.setattr(masking, "build_pipeline", broken)
     problems = run_generator_selftest(cfg, SALT)
     assert any("params.salt mismatch" in p for p in problems)
+
+
+# --------------------------------------------------------------------------- #
+# Structural compile-safety of the generated Painless script
+# --------------------------------------------------------------------------- #
+
+
+def test_verify_script_structure_passes_on_generated_script(cfg: Any) -> None:
+    """The generator emits functions before statements and no ctx['_source']."""
+    source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
+    assert verify_script_structure(source) == []
+    assert "ctx['_source']" not in source
+    # Functions precede the first top-level statement.
+    first_def = source.index("def SALT =")
+    for name, rtype in (
+        ("sha256hex", "String"),
+        ("token", "String"),
+        ("TOKEN_RE", "Pattern"),
+        ("maskPattern", "String"),
+        ("isWordChar", "boolean"),
+        ("replaceWordBoundary", "String"),
+        ("maskRegistry", "String"),
+        ("maskFreeText", "String"),
+        ("EMAIL", "Pattern"),
+    ):
+        assert source.index(f"{rtype} {name}(") < first_def, name
+
+
+def test_verify_script_structure_catches_ctx_source(cfg: Any) -> None:
+    """Bug 2 regression: a leftover ctx['_source'] must fail the structure check."""
+    source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
+    tampered = source.replace("ctx.clear();", "ctx['_source'].clear();")
+    problems = verify_script_structure(tampered)
+    assert any("ctx['_source']" in p for p in problems)
+
+
+def test_verify_script_structure_catches_functions_after_statements(cfg: Any) -> None:
+    """Bug 1 regression: Painless rejects functions declared after top-level
+    statements (`unexpected token ['(']`); the structure check must too."""
+    source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
+    # Pull the whole `token` function out and re-append it after the main
+    # logic, i.e. clearly after every top-level statement.
+    token_fn = "String token(String family, String value, String SALT) {"
+    start = source.index(token_fn)
+    end = source.index("}\n", start) + len("}\n")
+    body = source[start:end]
+    tampered = source[:start] + source[end:] + "\n" + body
+    problems = verify_script_structure(tampered)
+    assert any("token" in p and "AFTER" in p for p in problems)
+
+
+def test_verify_script_structure_catches_missing_function(cfg: Any) -> None:
+    """A dropped function declaration is a compile failure at ingest time."""
+    source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
+    start = source.index("String sha256hex(String input) {")
+    end = source.index("}\n", start) + len("}\n")
+    tampered = source[:start] + source[end:]
+    problems = verify_script_structure(tampered)
+    assert any("missing function" in p and "sha256hex" in p for p in problems)
+
+
+def test_generator_selftest_includes_structure_check(
+    cfg: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tampering the emitted structure (ctx['_source']) must fail the whole
+    generator self-test, not just the scheme check."""
+    real_build = masking.build_pipeline
+
+    def broken(tenant_cfg: Any, salt: str) -> dict[str, Any]:
+        pipeline = real_build(tenant_cfg, salt)
+        script = pipeline["processors"][0]["script"]
+        script["source"] = script["source"].replace(
+            "ctx.clear();", "ctx['_source'].clear();"
+        )
+        return pipeline
+
+    monkeypatch.setattr(masking, "build_pipeline", broken)
+    problems = run_generator_selftest(cfg, SALT)
+    assert any("ctx['_source']" in p for p in problems)
 
 
 # --------------------------------------------------------------------------- #
@@ -362,20 +444,21 @@ def test_pipeline_has_no_hardcoded_field_logic(cfg: Any) -> None:
 
 
 def test_pipeline_declares_every_free_text_pattern(cfg: Any) -> None:
-    """Every Pattern symbol referenced by maskPattern() must be declared in the
-    script, or the deployed pipeline fails to compile and flags every document
-    with klaxon.masking_error (regression for a dropped {patterns} block)."""
+    """Every Pattern function referenced by maskPattern() must be declared in
+    the script, or the deployed pipeline fails to compile and flags every
+    document with klaxon.masking_error (regression for a dropped pattern-fn
+    block). Patterns are `Pattern <NAME>() { return /regex/; }` functions."""
     source = build_pipeline_template(cfg)["processors"][0]["script"]["source"]
     used = {
-        line.split("maskPattern(")[1].split(",")[0].strip()
+        line.split("maskPattern(")[1].split(",")[0].strip().removesuffix("()")
         for line in source.splitlines()
         if "maskPattern(" in line and "String maskPattern" not in line
     }
     assert used, "expected the free-text pass to reference at least one Pattern"
     for symbol in used:
         assert any(
-            f"Pattern {symbol} = Pattern.compile(" in line for line in source.splitlines()
-        ), f"script uses {symbol} but never declares it"
+            f"Pattern {symbol}() {{" in line for line in source.splitlines()
+        ), f"script uses {symbol}() but never declares it"
 
 
 # --------------------------------------------------------------------------- #
