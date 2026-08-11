@@ -413,6 +413,37 @@ is treated as external: in a GDPR context, failing to mask is the expensive
 failure, so the unknown is assumed to leave the network. Local models (Ollama,
 vLLM on localhost) are exempted by a loopback `KLAXON_LLM_BASE_URL`.
 
+### Option B: the separate masked stream
+
+For report/LLM consumers, masking once at ingest beats masking per query. The
+Option B design (full detail in `docs/option-b-masked-stream.md`) reindexes a
+recent window of the raw Wazuh stream through a generated ingest pipeline into
+a separate stream `klaxon-masked-<tenant>-v5-*`; the raw stream is never
+written to. `klaxon masking generate` is the **single** generator: it builds
+the config fragment, the ingest pipeline, the ISM policy and the index template
+from `tenants/<tenant>/fields.yaml`, with the field list injected into the
+Painless script as a table (no hardcoded field names) and the salt carried as
+the script processor's `params.salt`.
+
+Two properties of the design are load-bearing:
+
+* **The pipeline and the response layer share one token scheme.** Both derive
+  `[FAMILY_<16 hex>]` tokens deterministically, so a `_source` value and its
+  aggregation keys / composite `after_key` stay correlatable across the raw and
+  masked streams. `klaxon masking generate` runs a MANDATORY self-test that
+  proves the generated Painless token computation is byte-identical to
+  `derive_token(value, family, salt)` for representative values per family; on
+  any mismatch it aborts and emits no artifacts. Changing the scheme in
+  `derive_token` breaks generation, not the deployed pipeline.
+* **Drift is fail-closed.** Every artifact carries provenance (`_meta` source,
+  sha256 of `fields.yaml`, tenant, `generator_version`; the config fragment
+  carries a `# generated from ...` comment), and the sync-job preflight /
+  `verify-config` / CI / pre-commit all refuse to proceed when the deployed or
+  committed artifacts no longer match `fields.yaml`. The salt is read from the
+  same environment variable as the response layer; a deploy-time
+  `klaxon masking salt-check` compares the deployed pipeline's `params.salt`
+  with the current env salt and fails on a mismatch.
+
 ---
 
 ## The DSGVO plausibility checker

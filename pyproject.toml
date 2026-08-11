@@ -33,6 +33,9 @@ dev = [
 ]
 
 [project.scripts]
+# `klaxon` is the canonical name; `klaxon-mcp` is kept as a compatibility alias.
+# Both expose the same CLI, including `klaxon masking generate|selftest|salt-check`.
+klaxon = "klaxon_mcp.__main__:main"
 klaxon-mcp = "klaxon_mcp.__main__:main"
 # The DSGVO plausibility checker as a standalone CLI (`klaxon-mcp --gdpr-check`
 # is the same code with the same flags).

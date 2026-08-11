@@ -422,6 +422,42 @@ otherwise.
 
 ---
 
+## Option B: the masked stream (`klaxon masking`)
+
+Option B moves masking to the ingest side: a periodic sync job reindexes a
+window of the raw Wazuh stream through a generated ingest pipeline into a
+separate masked stream (`klaxon-masked-<tenant>-v5-*`). Full design and
+operation: `docs/option-b-masked-stream.md`.
+
+`klaxon masking` is the **single generator** for the deployable artifacts — it
+only outputs files/stdout, never writes to the indexer (deploying is the
+operator's/CI's job):
+
+```bash
+# build the 4 artifacts (config fragment, pipeline, ISM, index template) from
+# tenants/<tenant>/fields.yaml; the mandatory self-test runs first
+klaxon masking generate --tenant customer-a
+klaxon masking generate --tenant customer-a --out /tmp/deploy   # real salt in params.salt
+klaxon masking generate --tenant customer-a --stdout            # ... or to stdout
+
+# prove the generated Painless token scheme is byte-identical to derive_token
+klaxon masking selftest [--tenant customer-a]
+
+# compare the salt baked into the DEPLOYED pipeline with the current env salt
+klaxon masking salt-check --tenant customer-a
+
+# CI/pre-commit drift check: committed artifacts must match fields.yaml
+klaxon masking generate --check
+```
+
+`klaxon-mcp` is a compatibility alias for `klaxon`. The salt comes from the
+same environment variable as the response layer
+(`KLAXON_ANONYMIZATION_SALT`, or `salt_env` in `fields.yaml`); if it is unset a
+random salt is generated with a warning (tokens rotate unless the salt is
+stable). `related.hash` is never masked.
+
+---
+
 ## Docker
 
 ```bash

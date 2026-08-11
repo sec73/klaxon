@@ -1,5 +1,5 @@
-# generated from tenants/customer-a/fields.yaml (sha256: 79bcad9cc689ed9257b97ffec9b271fd65340752404998724606eea870f47b44)
-# Hand-edit only via tenants/customer-a/fields.yaml + `python -m klaxon_mcp.generate_masking`. CI enforces this.
+# generated from tenants/customer-a/fields.yaml (sha256: 00111554153d094cb7f5f004040b3c2f9f5a8251e44593a7400420dfd1c078f4)
+# Hand-edit only via tenants/customer-a/fields.yaml + `klaxon masking generate`. CI enforces this.
 anonymization:
   mask_aggregation_keys: true
   mask_free_text_users: true

@@ -27,33 +27,80 @@ flowchart LR
     SYNC -->|"_reindex through<br/>klaxon-mask-<tenant>"| MASKED[klaxon-masked-&lt;tenant&gt;-v5-*]
     MASKED -->|queries only| R[reports / LLM]
     MASKED -->|ISM 30d| DEL[delete]
-    CFG[tenants/&lt;tenant&gt;/fields.yaml] -->|generate_masking| GEN[generated config fragment + pipeline]
+    CFG[tenants/&lt;tenant&gt;/fields.yaml] -->|klaxon masking generate| GEN[generated config + pipeline + ISM + index template]
     GEN -.deploy.-> PIP[klaxon-mask-&lt;tenant&gt;]
 ```
 
 ## Single source of truth: `fields.yaml`
 
 `tenants/<tenant>/fields.yaml` is where the masking field list lives **exactly
-once**. Two artifacts are generated from it:
+once**. `klaxon masking generate` (the **single** generator) builds four
+artifacts from it:
 
 * `tenants/<tenant>/generated/klaxon-config.yaml` — the Klaxon config fragment
   (`anonymization.mask_fields`, `masked_streams`, `mask_free_text_users`,
   `mask_free_text_fields`, `gdpr_checker.custom_patterns`). Merge it into the
   server config.
 * `tenants/<tenant>/generated/pipeline-klaxon-mask-<tenant>.json` — the ingest
-  pipeline **template**, with a `__SALT__` placeholder (the secret never enters
-  version control).
+  pipeline **template** (`PUT /_ingest/pipeline/klaxon-mask-<tenant>`). The
+  salt lives in the script processor's `params.salt`; the committed file
+  carries a `__SALT__` placeholder so the secret never enters version control.
+* `tenants/<tenant>/generated/ism-klaxon-masked-retention-<tenant>.json` — the
+  ISM retention policy (`PUT /_plugins/_ism/policies/klaxon-masked-retention-
+  <tenant>`): hot (rollover) -> delete after `--retention-days` (default 30).
+* `tenants/<tenant>/generated/index-template-klaxon-masked-<tenant>.json` — the
+  index template (`PUT /_index_template/klaxon-masked-<tenant>`):
+  `index_patterns: [klaxon-masked-<tenant>-v5-*]`, priority 200,
+  `data_stream: {}`, `index.default_pipeline` + `index.lifecycle.name`. The
+  offline generator omits `mappings`; `apply-masked-infra` fetches them from
+  the Wazuh stream at deploy time.
 
 Regenerate after editing `fields.yaml`:
 
 ```console
-python -m klaxon_mcp.generate_masking --tenant customer-a
+klaxon masking generate --tenant customer-a
 ```
 
+### The generator (`klaxon masking generate`)
+
+* Default (no `--out`/`--stdout`) writes the **committed** artifact set above
+  (pipeline template with `params.salt = "__SALT__"`) into
+  `tenants/<tenant>/generated/`. This is the form CI drift-checks.
+* `--out DIR` (or `--stdout` / `--out -`) writes the **deployable** artifact
+  set with the **real salt** in `params.salt` — the form an operator PUTs to
+  the indexer. The generator never writes to the indexer itself; deploying is
+  the operator's/CI's job.
+* `--check` writes nothing: it compares the committed artifacts against
+  `fields.yaml` and exits non-zero on drift.
+* `--retention-days N` sets the ISM delete-after (default 30).
+* `--salt` / `--salt-env` override the salt and its environment variable.
+
+**Mandatory self-test.** Every `generate` run first proves the generated
+Painless token scheme is **byte-identical** to `derive_token(value, family,
+salt)` for a fixed set of representative values per family. On ANY mismatch the
+command aborts and emits NO artifacts — changing the token scheme in
+`derive_token` breaks generation, not the deployed pipeline. Run it standalone
+for CI:
+
+```console
+klaxon masking selftest                 # token scheme only
+klaxon masking selftest --tenant X     # also validates X's rendered script
+```
+
+**Deploy-time salt check.** The salt is read from the SAME environment variable
+as the response layer (`KLAXON_ANONYMIZATION_SALT`, or `salt_env` from
+`fields.yaml`). If it is unset, `generate` uses a random salt and emits a
+WARNING: tokens change if the salt is not stable, so previously written masked
+documents stop correlating. `klaxon masking salt-check --tenant X` compares the
+salt baked into the DEPLOYED pipeline (`params.salt`, via
+`GET /_ingest/pipeline/klaxon-mask-<tenant>`) with the current env salt and
+fails on a mismatch (tokens would no longer be deterministic across deploys).
+
 Drift between the committed artifacts and `fields.yaml` is caught by CI
-(`.github/workflows/verify-masking-config.yml`), the pre-commit hook
-(`.pre-commit-config.yaml`), and the `klaxon-mcp verify-config --tenant X`
-command. All three run the same `--check` comparison.
+(`.github/workflows/verify-masking-config.yml`, which also runs
+`klaxon masking selftest`), the pre-commit hook (`.pre-commit-config.yaml`),
+and the `klaxon-mcp verify-config --tenant X` command. All run the same
+`--check` comparison.
 
 ## The pipeline
 
@@ -88,11 +135,12 @@ hex>]` is never re-masked) leaves them byte-identical. What matters is that
 ## Deploying and running
 
 ```console
-# 1. generate the artifacts (or use the committed ones)
-python -m klaxon_mcp.generate_masking --tenant customer-a
+# 1. generate the artifacts (or use the committed ones); selftest runs first
+klaxon masking generate --tenant customer-a
 
-# 2. deploy pipeline (real salt), ISM policy, index template, data stream
+# 2. deploy pipeline (real salt in params.salt), ISM, index template, data stream
 klaxon-mcp apply-masked-infra --tenant customer-a --retention-days 30
+#    (or PUT the deployable set from `klaxon masking generate --out DIR`)
 
 # 3. merge generated/klaxon-config.yaml into the Klaxon config so the response
 #    layer passes masked-stream tokens through
@@ -165,7 +213,8 @@ queries; it does not police them.
 ```console
 mkdir -p tenants/<tenant>
 # write tenants/<tenant>/fields.yaml (copy customer-a's as a template)
-python -m klaxon_mcp.generate_masking --tenant <tenant>
+klaxon masking generate --tenant <tenant>   # runs the mandatory self-test
+klaxon masking salt-check --tenant <tenant> # verify the deployed salt matches the env
 klaxon-mcp apply-masked-infra --tenant <tenant>
 klaxon-mcp sync-masked --tenant <tenant>
 ```
@@ -174,13 +223,19 @@ klaxon-mcp sync-masked --tenant <tenant>
 
 * **The salt lives in the cluster.** Ingest pipelines cannot read process
   environment at index time, so the salt from `KLAXON_ANONYMIZATION_SALT` is
-  baked into the **deployed** pipeline when you run `apply-masked-infra`. It is
-  visible to anyone allowed `GET /_ingest/pipeline`. Restrict that permission
-  to administrators; report/LLM consumers must not have it. The committed
-  pipeline *template* carries `__SALT__`, so the secret never enters git.
+  baked into the **deployed** pipeline as the script processor's `params.salt`
+  when you deploy the `--out`/`--stdout` artifacts or run `apply-masked-infra`.
+  It is visible to anyone allowed `GET /_ingest/pipeline`. Restrict that
+  permission to administrators; report/LLM consumers must not have it. The
+  committed pipeline *template* carries `params.salt = "__SALT__"`, so the
+  secret never enters git. `klaxon masking salt-check` compares the deployed
+  salt with the current env salt at deploy time.
 * **`verify-config` needs the indexer.** The drift audit compares the deployed
-  pipeline too, so it cannot run without cluster access; the `--generate-masking
-  --check` artifact comparison can.
+  pipeline too, so it cannot run without cluster access; the
+  `klaxon masking generate --check` artifact comparison can.
+* **Version bumps force regeneration.** The pipeline `_meta.generator_version`
+  is part of the committed artifacts, so bumping the package version without
+  re-running `klaxon masking generate` shows up as drift in CI/pre-commit.
 * **Painless whitelist.** The script uses `MessageDigest`/`Pattern`/`Matcher`
   and `StringBuilder`. Verify the cluster's `painless.whitelist` allows them on
   your OpenSearch version before first deploy.
@@ -188,8 +243,11 @@ klaxon-mcp sync-masked --tenant <tenant>
 ## What the tests pin
 
 * `tests/test_generate_masking.py` — generator determinism (same YAML → same
-  output), provenance fingerprints, pipeline structure (on_failure present, no
-  `related.hash`), config fragment ↔ fields.yaml agreement, CI drift check.
+  output), provenance fingerprints, pipeline structure (`params.salt`,
+  on_failure present, no `related.hash`), config fragment ↔ fields.yaml
+  agreement, the MANDATORY self-test (Painless reference == `derive_token`
+  byte-for-byte; a deliberately changed scheme fails generation and emits no
+  artifacts), drift check, and the deploy-time salt helpers.
 * `tests/test_sync_masked.py` — the Python twin of the Painless logic on
   representative log lines (LDAP DN, PAM, SSH publickey, arrays, missing
   fields, already-tokenised input, `mask_free_text_users: false`), plus the

@@ -30,6 +30,7 @@ from klaxon_mcp import sync_masked
 from klaxon_mcp.clients import Response
 from klaxon_mcp.config import AnonymizationConfig, Config
 from klaxon_mcp.masked_stream import (
+    build_pipeline,
     build_pipeline_template,
     load_tenant_config,
     pipeline_mask_doc,
@@ -53,6 +54,8 @@ fields:
     family: USER
   - field: host.hostname
     family: HOST
+  - field: event.original
+    family: USER
   - field: related.ip
     family: IP
     array: true
@@ -165,6 +168,19 @@ class TestPipelineMaskDoc:
         doc = {"message": "no structured fields here"}
         out = pipeline_mask_doc(doc, cfg, SALT)
         assert out == {"message": "no structured fields here"}
+
+    def test_event_original_masked_to_single_token(self, cfg: Any) -> None:
+        """event.original (a structured scalar USER field) becomes ONE token —
+        the whole raw line is replaced, not per-value free-text masked."""
+        raw = (
+            "Aug 11 06:00:00 web01 sshd[123]: Failed password for jsmith "
+            "from 10.0.0.9 port 22"
+        )
+        out = pipeline_mask_doc({"event.original": raw}, cfg, SALT)
+        expected = token("USER", raw, SALT)
+        assert out["event.original"] == expected
+        assert out["event.original"].startswith("[USER_")
+        assert len(out["event.original"]) == len("[USER_") + 16 + 1
 
     def test_already_tokenised_input_is_idempotent(self, cfg: Any) -> None:
         t = token("USER", "jdoe", SALT)
@@ -438,3 +454,45 @@ class TestReportMaskingErrors:
         fake.masking_error_hits = 0
         asyncio.run(sync_masked._report_masking_errors(fake, cfg))
         assert capsys.readouterr().err == ""
+
+
+class TestSaltCheck:
+    """`salt_check_command`: compare the salt baked into the DEPLOYED pipeline
+    (params.salt) with the current env salt."""
+
+    @staticmethod
+    def _patch_indexer(monkeypatch: pytest.MonkeyPatch, fake: FakeIndexer) -> None:
+        from klaxon_mcp import server
+
+        monkeypatch.setattr(server, "get_indexer", lambda: fake)
+
+    def test_ok_when_env_matches_deployed(self, monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline(load_tenant_config("customer-a"), "deployed-salt")
+        self._patch_indexer(monkeypatch, fake)
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_SALT", "deployed-salt")
+        assert sync_masked.salt_check_command("customer-a") == 0
+        assert "matches" in capsys.readouterr().out
+
+    def test_error_on_salt_mismatch(self, monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline(load_tenant_config("customer-a"), "deployed-salt")
+        self._patch_indexer(monkeypatch, fake)
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_SALT", "current-salt")
+        assert sync_masked.salt_check_command("customer-a") == 1
+        assert "SALT MISMATCH" in capsys.readouterr().out
+
+    def test_error_when_env_unset(self, monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline(load_tenant_config("customer-a"), "deployed-salt")
+        self._patch_indexer(monkeypatch, fake)
+        monkeypatch.delenv("KLAXON_ANONYMIZATION_SALT", raising=False)
+        assert sync_masked.salt_check_command("customer-a") == 2
+        assert "is not set" in capsys.readouterr().err
+
+    def test_error_when_pipeline_not_deployed(self, monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+        fake = FakeIndexer()  # deployed_pipeline stays None
+        self._patch_indexer(monkeypatch, fake)
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_SALT", "deployed-salt")
+        assert sync_masked.salt_check_command("customer-a") == 1
+        assert "not deployed" in capsys.readouterr().err
