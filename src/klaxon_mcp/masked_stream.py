@@ -70,6 +70,12 @@ DEFAULT_INITIAL_LOOKBACK_HOURS = 24
 # A value already in this shape is a token: never re-mask it (idempotent).
 TOKEN_RE = re.compile(r"^\[(?:IP|USER|HOST|AGENT)_[0-9a-f]{16}\]$")
 
+# Field names from fields.yaml flow verbatim into the generated Klaxon config
+# fragment (unquoted YAML) and the Painless field table. The charset is what a
+# WCS/ECS dotted field name needs — the absence of ':', '#', quotes, whitespace
+# and control characters is what keeps the generated YAML well-formed.
+_FIELD_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
+
 _FAMILIES = frozenset({"IP", "USER", "HOST", "AGENT"})
 
 # Painless regex source strings. These are ALSO compiled by the Python reference
@@ -224,6 +230,16 @@ def find_tenant_dir(tenant: str, root: str | Path | None = None) -> Path:
     return base / "tenants" / validate_tenant(tenant)
 
 
+def _validate_field_name(field: str, path: str) -> None:
+    """Reject a field name that could break the generated YAML/Painless output."""
+    if not _FIELD_NAME_RE.match(field):
+        raise ValueError(
+            f"invalid field name {field!r} in {path}: permitted charset is "
+            "[A-Za-z0-9_.@-] (dotted ECS-style names, e.g. 'source.ip', "
+            "'@timestamp')."
+        )
+
+
 def load_tenant_config(
     tenant: str, root: str | Path | None = None
 ) -> TenantConfig:
@@ -251,6 +267,7 @@ def load_tenant_config(
         if not isinstance(entry, dict) or not isinstance(entry.get("field"), str):
             raise ValueError(f"invalid field entry in {path}: {entry!r}")
         field = entry["field"]
+        _validate_field_name(field, path)
         if field in seen:
             raise ValueError(f"duplicate field {field!r} in {path}")
         seen.add(field)
@@ -272,6 +289,7 @@ def load_tenant_config(
         if not isinstance(entry, dict) or not isinstance(entry.get("field"), str):
             raise ValueError(f"invalid free_text_fields entry in {path}: {entry!r}")
         field = entry["field"]
+        _validate_field_name(field, path)
         if field in seen:
             raise ValueError(f"{field!r} listed as both field and free_text_field")
         free_text_fields.append(field)

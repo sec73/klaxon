@@ -137,6 +137,31 @@ def test_loader_rejects_field_also_in_free_text(tmp_path: Any) -> None:
         load_tenant_config("test-a", root=tmp_path)
 
 
+def test_loader_rejects_malformed_field_name(tmp_path: Any) -> None:
+    """L9: a field name that could inject YAML into the generated config
+    fragment (colon, hash, quote, whitespace) is refused at load."""
+    tenant_dir = tmp_path / "tenants" / "test-a"
+    tenant_dir.mkdir(parents=True)
+    (tenant_dir / "fields.yaml").write_text(
+        MINIMAL_FIELDS + "  - field: 'user.name: evil'\n    family: USER\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid field name"):
+        load_tenant_config("test-a", root=tmp_path)
+
+
+def test_loader_rejects_malformed_free_text_field_name(tmp_path: Any) -> None:
+    tenant_dir = tmp_path / "tenants" / "test-a"
+    tenant_dir.mkdir(parents=True)
+    bad = MINIMAL_FIELDS.replace(
+        "free_text_fields:\n  - field: message",
+        "free_text_fields:\n  - field: 'message# x'",
+    )
+    (tenant_dir / "fields.yaml").write_text(bad, encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid field name"):
+        load_tenant_config("test-a", root=tmp_path)
+
+
 # --------------------------------------------------------------------------- #
 # Token derivation
 # --------------------------------------------------------------------------- #
