@@ -196,6 +196,53 @@ def _cap_size(body: Any, limit: int) -> str | None:
     return diagnostics.size_capped_notice(requested, limit)
 
 
+# Aggregation types whose `size` bounds the response size (bucket counts,
+# composite pages, embedded top_hits documents). Scripted/metric aggs carry no
+# size and are irrelevant here.
+_AGG_SIZE_TYPES = (
+    "terms",
+    "significant_terms",
+    "significant_text",
+    "multi_terms",
+    "composite",
+    "top_hits",
+)
+
+
+def _cap_agg_sizes(node: Any, limit: int, capped: list[str], scope: str = "") -> None:
+    """Lower oversized `size` inside aggregations in place, recursively.
+
+    `capped` collects a human-readable name for every aggregation whose size was
+    lowered (e.g. "hosts.terms"), so the caller can surface it in a notice. The
+    walk mirrors `parse_agg_fields`: the top-level `aggs` map and nested
+    sub-aggregations are covered; an opaque shape is left untouched (the
+    indexer still rejects it or answers with its own default).
+    """
+    if limit <= 0 or not isinstance(node, dict):
+        return
+    for kind in _AGG_SIZE_TYPES:
+        inner = node.get(kind)
+        if isinstance(inner, dict):
+            requested = inner.get("size")
+            # bool is an int subclass; leave malformed values to the indexer.
+            if (
+                isinstance(requested, int)
+                and not isinstance(requested, bool)
+                and requested > limit
+            ):
+                inner["size"] = limit
+                capped.append(f"{scope}{kind}")
+    for key, value in node.items():
+        if key == "aggs" and isinstance(value, dict):
+            for name, sub in value.items():
+                _cap_agg_sizes(sub, limit, capped, scope=f"{scope}{name}.")
+        elif isinstance(value, dict):
+            _cap_agg_sizes(value, limit, capped, scope=scope)
+        elif isinstance(value, list):
+            for item in value:
+                _cap_agg_sizes(item, limit, capped, scope=scope)
+
+
 # --------------------------------------------------------------------------- #
 # The anonymization guard
 # --------------------------------------------------------------------------- #
@@ -290,6 +337,12 @@ async def search(index: str, body: str) -> str:
     capped = _cap_size(parsed_body, get_config().search_max_size)
     if capped:
         notices.append(capped)
+    agg_capped: list[str] = []
+    _cap_agg_sizes(parsed_body, get_config().search_max_size, agg_capped)
+    if agg_capped:
+        notices.append(
+            diagnostics.agg_size_capped_notice(agg_capped, get_config().search_max_size)
+        )
 
     try:
         response = await get_indexer().post(f"/{safe_index}/_search", body=parsed_body)

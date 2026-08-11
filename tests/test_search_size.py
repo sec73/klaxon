@@ -198,7 +198,68 @@ class TestBodyHandling:
         """bool is an int subclass; "size": true is malformed, not oversized."""
         body: dict[str, Any] = {"size": True}
         assert _cap_size(body, 100) is None
-        assert body["size"] is True
+
+class TestAggSizeCap:
+    """M6: oversized aggregation `size` values are lowered too, so a huge bucket
+    response cannot force an unbounded masking pass, and the caller is told."""
+
+    async def test_oversized_terms_size_is_lowered_and_noticed(
+        self, indexer: RecordingIndexer, limit: Any
+    ) -> None:
+        out = await run(
+            {"size": 0, "aggs": {"hosts": {"terms": {"field": "related.hosts", "size": 50_000}}}}
+        )
+        assert indexer.sent["aggs"]["hosts"]["terms"]["size"] == 100
+        assert "[AGG SIZE CAPPED]" in out
+        assert "hosts.terms" in out
+
+    async def test_nested_aggs_capped_recursively(
+        self, indexer: RecordingIndexer, limit: Any
+    ) -> None:
+        body = {
+            "size": 0,
+            "aggs": {
+                "agents": {
+                    "terms": {"field": "wazuh.agent.name"},
+                    "aggs": {
+                        "users": {"terms": {"field": "user.name", "size": 500}}
+                    },
+                }
+            },
+        }
+        await run(body)
+        assert indexer.sent["aggs"]["agents"]["aggs"]["users"]["terms"]["size"] == 100
+        # An aggregation with no size is never given one (like the top-level cap).
+        assert "size" not in indexer.sent["aggs"]["agents"]["terms"]
+
+    async def test_composite_and_top_hits_capped(
+        self, indexer: RecordingIndexer, limit: Any
+    ) -> None:
+        body = {
+            "size": 0,
+            "aggs": {
+                "c": {"composite": {"size": 1000, "sources": []}},
+                "docs": {"top_hits": {"size": 500}},
+            },
+        }
+        await run(body)
+        assert indexer.sent["aggs"]["c"]["composite"]["size"] == 100
+        assert indexer.sent["aggs"]["docs"]["top_hits"]["size"] == 100
+
+    async def test_below_limit_agg_size_untouched(
+        self, indexer: RecordingIndexer, limit: Any
+    ) -> None:
+        out = await run({"size": 0, "aggs": {"a": {"terms": {"field": "event.action", "size": 25}}}})
+        assert indexer.sent["aggs"]["a"]["terms"]["size"] == 25
+        assert "[AGG SIZE CAPPED]" not in out
+
+    async def test_zero_limit_disables_agg_cap(
+        self, indexer: RecordingIndexer, limit: Any
+    ) -> None:
+        limit(0)
+        out = await run({"size": 0, "aggs": {"a": {"terms": {"field": "event.action", "size": 10_000}}}})
+        assert indexer.sent["aggs"]["a"]["terms"]["size"] == 10_000
+        assert "[AGG SIZE CAPPED]" not in out
 
 
 class TestConfiguration:

@@ -55,6 +55,23 @@ def size_capped_notice(requested: int, effective: int) -> str:
     )
 
 
+def agg_size_capped_notice(capped: list[str], effective: int) -> str:
+    """State that aggregation `size` values were lowered before the query went out.
+
+    The top-level `size` cap bounds the number of documents, but not the number
+    of buckets an aggregation returns — a `terms`/`composite`/`top_hits` with
+    `"size": 100000` could otherwise force a huge response that is then walked
+    (and masked) in full. The same cap as the document size keeps the response
+    bounded and therefore the masking pass bounded.
+    """
+    return (
+        f"[AGG SIZE CAPPED] The following aggregation(s) requested more than "
+        f"\"size\": {effective}: {', '.join(capped)}. Their size was lowered to "
+        f"{effective} before the query was sent. Raise the cap with the "
+        f"{SEARCH_SIZE_ENV} environment variable."
+    )
+
+
 def _total(hits: Any) -> tuple[int | None, str | None]:
     """Extract (value, relation) from hits.total across both response shapes."""
     if not isinstance(hits, dict):
