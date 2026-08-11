@@ -237,6 +237,15 @@ class TestDeterminism:
         out = anon().mask_text("10.0.0.1")
         assert out == ip_ph("10.0.0.1")
 
+    def test_whitespace_padded_value_maps_to_stripped_token(self) -> None:
+        """L4: a whole value with surrounding whitespace must yield the same
+        token as the stripped value — same logical value, same token."""
+        a = anon()
+        assert a.mask_json({"custom.peer": " 10.0.0.1 "})["custom.peer"] == ip_ph("10.0.0.1")
+        assert a.mask_json({"custom.peer": "10.0.0.1"})["custom.peer"] == a.mask_json(
+            {"custom.peer": " 10.0.0.1 "}
+        )["custom.peer"]
+
 
 class TestHmacTokens:
     def test_token_is_hmac_with_64_bits_of_output(self) -> None:

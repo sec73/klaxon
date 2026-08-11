@@ -442,11 +442,11 @@ class Anonymizer:
         # username pass (known identities + context patterns) when enabled.
         stripped = value.strip()
         if _EMAIL_RE.fullmatch(stripped):
-            return self._register(_EMAIL, value)
+            return self._register(_EMAIL, stripped)
         if _IPV4_RE.fullmatch(stripped) or _IPV6_RE.fullmatch(stripped):
-            return self._register(_IP, value)
+            return self._register(_IP, stripped)
         if _FQDN_RE.fullmatch(stripped) and "://" not in stripped:
-            return self._register(HOST, value)
+            return self._register(HOST, stripped)
         if self._is_free_text_field(path):
             return self.mask_text(value, identities)
         return self.mask_text(value)
