@@ -43,3 +43,31 @@ jobs:
           tests/test_idempotent_masking.py \
           tests/test_config.py \
           -q
+
+  # The full regression gate: the anonymizer is the single most important
+  # guarantee, so its whole suite (test_anonymization, test_aggregation_masking,
+  # test_idempotent_masking, test_gdpr, ...) and strict type-checking must run in
+  # CI, not just locally.
+  unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55 # v5.5.0
+        with:
+          python-version: "3.13"
+
+      - name: Install klaxon-mcp with dev extras
+        run: pip install -e ".[dev]"
+
+      - name: Full test suite
+        run: python -m pytest -q
+
+      - name: Strict type checking
+        run: python -m mypy src/klaxon_mcp
