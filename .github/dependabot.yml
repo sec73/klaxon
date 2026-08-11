@@ -1,0 +1,25 @@
+# Dependency updates: keep the supply chain current and gate every bump behind
+# CI. The unit-tests job (verify-masking-config.yml) runs the full suite and
+# mypy strict on every pull_request, so a dependabot PR that breaks the
+# anonymizer or the type-check fails before it can merge.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Upper bounds in pyproject.toml stay; dependabot opens PRs to raise them
+    # deliberately, never silently.
+    allow:
+      - dependency-type: "direct"
+    labels:
+      - "dependencies"
+      - "security"
+    open-pull-requests-limit: 10
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    labels:
+      - "dependencies"
+      - "ci"
