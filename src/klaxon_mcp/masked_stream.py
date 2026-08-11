@@ -560,6 +560,11 @@ def FREE_TEXT = [
     {free_text_rows}
 ];
 
+// Free-text regexes, compiled once. The free-text pass references these Pattern
+// symbols by name, so the declarations MUST be emitted or the script fails to
+// compile at ingest time (and every document is flagged klaxon.masking_error).
+{patterns}
+
 Map masked = new HashMap();
 for (key in ctx['_source'].keySet()) {{ masked.put(key, ctx['_source'].get(key)); }}
 

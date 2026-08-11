@@ -361,6 +361,23 @@ def test_pipeline_has_no_hardcoded_field_logic(cfg: Any) -> None:
         assert field not in logic
 
 
+def test_pipeline_declares_every_free_text_pattern(cfg: Any) -> None:
+    """Every Pattern symbol referenced by maskPattern() must be declared in the
+    script, or the deployed pipeline fails to compile and flags every document
+    with klaxon.masking_error (regression for a dropped {patterns} block)."""
+    source = build_pipeline_template(cfg)["processors"][0]["script"]["source"]
+    used = {
+        line.split("maskPattern(")[1].split(",")[0].strip()
+        for line in source.splitlines()
+        if "maskPattern(" in line and "String maskPattern" not in line
+    }
+    assert used, "expected the free-text pass to reference at least one Pattern"
+    for symbol in used:
+        assert any(
+            f"Pattern {symbol} = Pattern.compile(" in line for line in source.splitlines()
+        ), f"script uses {symbol} but never declares it"
+
+
 # --------------------------------------------------------------------------- #
 # Config fragment
 # --------------------------------------------------------------------------- #
