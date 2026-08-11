@@ -255,6 +255,46 @@ class TestAnonymizationEnv:
         )
 
 
+class TestBooleanFailClosed:
+    """M3: a typo in a security-critical switch must refuse to start, never
+    silently disable masking (fail-closed, not fail-open)."""
+
+    @pytest.mark.parametrize("var", [
+        "KLAXON_ANONYMIZE_EXTERNAL_LLM",
+        "KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS",
+        "KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS",
+        "KLAXON_ANONYMIZATION_WHITELIST_ENABLED",
+        "KLAXON_ANONYMIZATION_LOG_RAW",
+    ])
+    def test_invalid_value_raises(self, monkeypatch: pytest.MonkeyPatch, var: str) -> None:
+        monkeypatch.setenv(var, "treu")  # typo
+        with pytest.raises(ConfigError, match="must be a boolean"):
+            AnonymizationConfig.from_env()
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("true", True),
+        ("1", True),
+        ("yes", True),
+        ("on", True),
+        ("false", False),
+        ("0", False),
+        ("no", False),
+        ("off", False),
+    ])
+    def test_recognized_values_parse(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, expected: bool
+    ) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS", raw)
+        assert AnonymizationConfig.from_env().mask_aggregation_keys is expected
+
+    def test_lenient_bool_still_used_elsewhere(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Non-security flags keep the lenient parser (e.g. verify_ssl typo -> False).
+        monkeypatch.setenv("WAZUH_VERIFY_SSL", "treu")
+        assert Config.from_env().verify_ssl is False
+
+
 class TestAnonymizationYaml:
     def test_yaml_enables_when_env_unset(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory

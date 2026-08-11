@@ -40,6 +40,32 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off"}
+
+
+def _env_bool_strict(name: str, default: bool) -> bool:
+    """Boolean env var that FAILS CLOSED on an unrecognised value.
+
+    Used for the security-critical anonymization switches. `_env_bool` treats
+    anything that is not a truthy word as False, so a typo like
+    `KLAXON_ANONYMIZE_EXTERNAL_LLM=treu` would silently disable masking. For
+    these flags an explicit but invalid value is a configuration error, not a
+    preference: refuse to start rather than serve unmasked.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE:
+        return True
+    if value in _FALSE:
+        return False
+    raise ConfigError(
+        f"{name} must be a boolean (true/false/1/0/yes/no/on/off), got {raw!r}"
+    )
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -278,7 +304,7 @@ class AnonymizationConfig:
         config_file = _env_str("KLAXON_CONFIG", "config.yaml") or "config.yaml"
         anon_yaml = _anonymization_yaml(config_file)
 
-        enabled = _env_bool(
+        enabled = _env_bool_strict(
             "KLAXON_ANONYMIZE_EXTERNAL_LLM", _yaml_get(anon_yaml, "enabled", False)
         )
         llm_base_url = _env_str(
@@ -368,22 +394,22 @@ class AnonymizationConfig:
             ),
             salt=salt,
             mask_fields=mask_fields,
-            mask_aggregation_keys=_env_bool(
+            mask_aggregation_keys=_env_bool_strict(
                 "KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS",
                 _yaml_get(anon_yaml, "mask_aggregation_keys", True),
             ),
-            mask_free_text_users=_env_bool(
+            mask_free_text_users=_env_bool_strict(
                 "KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS",
                 _yaml_get(anon_yaml, "mask_free_text_users", True),
             ),
             mask_free_text_fields=mask_free_text_fields,
             masked_streams=masked_streams,
-            whitelist_enabled=_env_bool(
+            whitelist_enabled=_env_bool_strict(
                 "KLAXON_ANONYMIZATION_WHITELIST_ENABLED",
                 _yaml_get(anon_yaml, "whitelist_enabled", True),
             ),
             log_path=log_path,
-            log_raw=_env_bool(
+            log_raw=_env_bool_strict(
                 "KLAXON_ANONYMIZATION_LOG_RAW",
                 _yaml_get(anon_yaml, "log_raw", False),
             ),
