@@ -15,7 +15,12 @@ import json
 from typing import Any
 
 from klaxon_mcp.clients import Response
-from klaxon_mcp.diagnostics import render, search_notices
+from klaxon_mcp.diagnostics import (
+    agg_size_capped_notice,
+    render,
+    search_notices,
+    size_capped_notice,
+)
 
 
 def resp(payload: Any, status: int = 200) -> Response:
@@ -24,6 +29,32 @@ def resp(payload: Any, status: int = 200) -> Response:
 
 def notice_tags(notices: list[str]) -> set[str]:
     return {n.split("]")[0].lstrip("[") for n in notices if n.startswith("[")}
+
+
+class TestSizeCappedNotice:
+    def test_document_size_cap_states_requested_and_effective(self) -> None:
+        text = size_capped_notice(500, 100)
+        assert "[SIZE CAPPED]" in text
+        assert "500" in text
+        assert "100" in text
+
+    def test_agg_size_cap_states_requested_and_effective_per_aggregation(self) -> None:
+        text = agg_size_capped_notice([("hosts.terms", 50_000)], 100)
+        assert "[AGG SIZE CAPPED]" in text
+        assert "hosts.terms" in text
+        assert "50000" in text
+        assert "100" in text
+
+    def test_agg_size_cap_names_every_lowered_aggregation(self) -> None:
+        text = agg_size_capped_notice(
+            [("hosts.terms", 50_000), ("agents.users.terms", 500)], 100
+        )
+        assert "hosts.terms requested 50000" in text
+        assert "agents.users.terms requested 500" in text
+
+    def test_agg_size_cap_empty_list_still_formats(self) -> None:
+        text = agg_size_capped_notice([], 100)
+        assert "[AGG SIZE CAPPED]" in text
 
 
 class TestZeroHits:

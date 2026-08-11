@@ -25,8 +25,15 @@ both the requested and effective value. `"size": 0` is never touched; a body
 without `size` is left to the OpenSearch default of 10. Set the variable to `0`
 to disable the cap — the server logs a warning at startup when you do.
 
+The same cap applies to the `size` of bucketed aggregations (`terms`,
+`significant_terms`, `significant_text`, `multi_terms`, `composite`,
+`top_hits`): an oversized aggregation `size` is lowered to
+`WAZUH_SEARCH_MAX_SIZE` before the query is sent and reported as
+`[AGG SIZE CAPPED]`, naming each affected aggregation and its requested size —
+so a lowered bucket count is never read as the real one.
+
 Diagnostics emitted: zero hits, total-hits cap, partial aggregation coverage,
-empty aggregations, legacy 4.x index patterns, size cap.
+empty aggregations, legacy 4.x index patterns, size cap, aggregation size cap.
 
 ---
 

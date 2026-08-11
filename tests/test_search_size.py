@@ -211,7 +211,8 @@ class TestAggSizeCap:
         )
         assert indexer.sent["aggs"]["hosts"]["terms"]["size"] == 100
         assert "[AGG SIZE CAPPED]" in out
-        assert "hosts.terms" in out
+        assert "hosts.terms requested 50000" in out
+        assert 'sent with "size": 100' in out
 
     async def test_nested_aggs_capped_recursively(
         self, indexer: RecordingIndexer, limit: Any

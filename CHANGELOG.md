@@ -6,6 +6,65 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 0.1.6 – 2026-08-11
+
+### Security (feature-freeze review)
+
+- **Aggregation-key masking is now ON by default (fail-closed).** A
+  `terms`/`composite` on a masked field (`related.user`, `related.hosts`, ...)
+  returned raw bucket keys and composite `after_key` while `_source` was
+  tokenised. Set `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS=false` to restore
+  the pre-feature behaviour. **This changes tokens for ad-hoc `search`
+  aggregations that were previously returned raw.**
+- **Non-string values under configured mask fields are masked too.** A numeric
+  `user.id` / `agent.id` (and a numeric terms key / composite `after_key`) is
+  now tokenised like its string twin; `None` and non-configured scalars are
+  untouched.
+- **`gdpr_check` `as_json=true` now runs through the masking guard** (text pass
+  + residual gate), like every other tool return.
+- **Invalid values for the security-critical boolean switches are refused.**
+  `KLAXON_ANONYMIZE_EXTERNAL_LLM`, `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS`,
+  `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS`,
+  `KLAXON_ANONYMIZATION_WHITELIST_ENABLED` and `KLAXON_ANONYMIZATION_LOG_RAW`
+  raise a configuration error on an unrecognised value instead of silently
+  disabling masking (a typo can no longer fail open).
+- **Tenant and field names are validated** (`klaxon masking ...` and
+  `fields.yaml`): tenant names are restricted to `[a-z0-9._-]` and field names
+  to `[A-Za-z0-9_.@-]`, so no tenant/field can inject a resource name, an index
+  pattern, a path or the generated YAML fragment.
+- **Oversized aggregation `size` values are capped.** `terms`/`composite`/
+  `top_hits` sizes above `WAZUH_SEARCH_MAX_SIZE` are lowered before the query is
+  sent and reported as `[AGG SIZE CAPPED]` (naming each aggregation and its
+  requested size), so a huge bucket response cannot force an unbounded masking
+  pass.
+- **Option B pipeline fix:** the generated Painless script now emits the
+  free-text `Pattern` declarations it references — previously the deployed
+  pipeline would fail to compile at ingest and flag every document with
+  `klaxon.masking_error` while leaving `_source` raw. The committed pipeline
+  template was regenerated; the token scheme is unchanged.
+- **Dependency hygiene:** Dependabot (pip + github-actions) and upper bounds on
+  `mcp`/`httpx`/`pyyaml`; every bump is gated by the full-suite + mypy CI job
+  (which now runs the complete test suite and strict type-checking on every
+  push/PR).
+
+### Added
+
+- `field_kinds.py` — the single home for the field-classification tables
+  (placeholder families, GDPR name patterns, default mask list) shared by the
+  anonymizer, the GDPR checker and the config loader (pure refactor, behaviour
+  unchanged).
+- README "Known limitations": masking is deterministic **pseudonymization**
+  (reversible with the salt), the residual gate covers IPs/e-mails only, and
+  aggregation-key masking is on by default.
+
+### Fixed
+
+- Whitespace-padded whole values now map to the stripped value's token.
+- The prompt-log export drops only real `RAW` lines (a MASKED body containing
+  the substring ` RAW:` is kept).
+- Full fix log: `docs/REVIEW_FIX_LOG.md`.
+
+
 ## 0.1.5 – 2026-08-10
 
 ### Added

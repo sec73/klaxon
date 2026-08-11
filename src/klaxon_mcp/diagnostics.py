@@ -55,20 +55,25 @@ def size_capped_notice(requested: int, effective: int) -> str:
     )
 
 
-def agg_size_capped_notice(capped: list[str], effective: int) -> str:
+def agg_size_capped_notice(capped: list[tuple[str, int]], effective: int) -> str:
     """State that aggregation `size` values were lowered before the query went out.
 
-    The top-level `size` cap bounds the number of documents, but not the number
-    of buckets an aggregation returns — a `terms`/`composite`/`top_hits` with
-    `"size": 100000` could otherwise force a huge response that is then walked
-    (and masked) in full. The same cap as the document size keeps the response
-    bounded and therefore the masking pass bounded.
+    `capped` is `(aggregation_name, requested_size)` for every aggregation that
+    was lowered. The top-level `size` cap bounds the number of documents, but
+    not the number of buckets an aggregation returns — a
+    `terms`/`composite`/`top_hits` with `"size": 100000` could otherwise force a
+    huge response that is then walked (and masked) in full. The same cap as the
+    document size keeps the response bounded and therefore the masking pass
+    bounded. Like `size_capped_notice`, both the requested and the effective
+    numbers are stated, so a lowered bucket count is never read as the real one.
     """
+    lowered = "; ".join(
+        f"{name} requested {requested}" for name, requested in capped
+    )
     return (
-        f"[AGG SIZE CAPPED] The following aggregation(s) requested more than "
-        f"\"size\": {effective}: {', '.join(capped)}. Their size was lowered to "
-        f"{effective} before the query was sent. Raise the cap with the "
-        f"{SEARCH_SIZE_ENV} environment variable."
+        f"[AGG SIZE CAPPED] The following aggregation sizes were lowered before "
+        f"the query was sent: {lowered} — each was sent with \"size\": {effective}. "
+        f"Raise the cap with the {SEARCH_SIZE_ENV} environment variable."
     )
 
 

@@ -209,14 +209,16 @@ _AGG_SIZE_TYPES = (
 )
 
 
-def _cap_agg_sizes(node: Any, limit: int, capped: list[str], scope: str = "") -> None:
+def _cap_agg_sizes(
+    node: Any, limit: int, capped: list[tuple[str, int]], scope: str = ""
+) -> None:
     """Lower oversized `size` inside aggregations in place, recursively.
 
-    `capped` collects a human-readable name for every aggregation whose size was
-    lowered (e.g. "hosts.terms"), so the caller can surface it in a notice. The
-    walk mirrors `parse_agg_fields`: the top-level `aggs` map and nested
-    sub-aggregations are covered; an opaque shape is left untouched (the
-    indexer still rejects it or answers with its own default).
+    `capped` collects `(name, requested)` for every aggregation whose size was
+    lowered (e.g. ("hosts.terms", 50000)), so the caller can surface both
+    numbers in a notice. The walk mirrors `parse_agg_fields`: the top-level
+    `aggs` map and nested sub-aggregations are covered; an opaque shape is left
+    untouched (the indexer still rejects it or answers with its own default).
     """
     if limit <= 0 or not isinstance(node, dict):
         return
@@ -231,7 +233,7 @@ def _cap_agg_sizes(node: Any, limit: int, capped: list[str], scope: str = "") ->
                 and requested > limit
             ):
                 inner["size"] = limit
-                capped.append(f"{scope}{kind}")
+                capped.append((f"{scope}{kind}", requested))
     for key, value in node.items():
         if key == "aggs" and isinstance(value, dict):
             for name, sub in value.items():
@@ -317,6 +319,13 @@ async def search(index: str, body: str) -> str:
     limit before the query is sent, and the diagnostics block says so. Use
     "size": 0 with aggregations to count without pulling documents.
 
+    The same cap applies to the `size` of bucketed aggregations (terms,
+    significant_terms, significant_text, multi_terms, composite, top_hits):
+    an oversized aggregation `size` is lowered to WAZUH_SEARCH_MAX_SIZE before
+    the query is sent and an "[AGG SIZE CAPPED]" diagnostics line names the
+    affected aggregation and its requested size, so a lowered bucket count is
+    never read as the real one.
+
     When anonymization is enabled and KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS
     is on, aggregation bucket keys for masked fields (terms, multi_terms,
     composite) are replaced with the same deterministic tokens as the `_source`
@@ -337,7 +346,7 @@ async def search(index: str, body: str) -> str:
     capped = _cap_size(parsed_body, get_config().search_max_size)
     if capped:
         notices.append(capped)
-    agg_capped: list[str] = []
+    agg_capped: list[tuple[str, int]] = []
     _cap_agg_sizes(parsed_body, get_config().search_max_size, agg_capped)
     if agg_capped:
         notices.append(
