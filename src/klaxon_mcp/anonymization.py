@@ -1117,10 +1117,14 @@ class Anonymizer:
         also written there.
         """
         kept: list[str] = []
+        # A RAW line is identified by its header, not by the substring: a MASKED
+        # line whose JSON body happens to contain " RAW:" is not a raw log line
+        # and must be kept.
+        raw_header = re.compile(r"\[EXTERNAL_LLM\] - \S+ RAW: ")
         try:
             with open(log_path, "r", encoding="utf-8") as fh:
                 for line in fh:
-                    if " RAW:" in line:
+                    if raw_header.search(line):
                         continue
                     kept.append(line.rstrip("\n"))
         except OSError as exc:

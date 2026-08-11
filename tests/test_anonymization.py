@@ -644,6 +644,17 @@ class TestAuditLog:
         assert "[IP_abc123]" in exported
         assert "RAW" not in exported
 
+    def test_export_keeps_masked_line_whose_body_contains_raw_marker(
+        self, tmp_path: Any
+    ) -> None:
+        """L7: the RAW marker inside a MASKED body is not a raw line."""
+        log = str(tmp_path / "llm_prompts.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write('ts - [EXTERNAL_LLM] - search MASKED: {"msg": "RAW: not really"}\n')
+        exported = Anonymizer.export_masked_log(log)
+        assert '{"msg": "RAW: not really"}' in exported
+        assert "RAW:" in exported
+
 
 class TestReport:
     def test_report_contains_no_raw_pii(self) -> None:
