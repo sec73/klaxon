@@ -58,6 +58,8 @@ from . import gdpr as _gdpr
 from . import overview as _overview
 from .clients import Response
 from .config import AnonymizationConfig
+from .field_kinds import FIELD_KIND as _FIELD_KIND
+from .field_kinds import field_kind as _field_kind
 
 logger = logging.getLogger("klaxon_mcp.anonymization")
 
@@ -93,45 +95,8 @@ def _process_salt() -> str:
         _PROCESS_SALT = secrets.token_hex(32)
     return _PROCESS_SALT
 
-# Dotted field-name suffix -> placeholder family. The suffix match runs against
-# the full dotted path, so "user.name" also covers "source.user.name". A
-# configured mask field not listed here falls back to USER — masking it as a
-# generic identifier is the safe reading.
-_FIELD_KIND: dict[str, str] = {
-    ".ip": IP,
-    "user.name": USER,
-    "user.id": USER,
-    "source.user.name": USER,
-    "destination.user.name": USER,
-    "host.hostname": HOST,
-    "host.name": HOST,
-    "agent.name": HOST,
-    "wazuh.agent.name": HOST,
-    "related.hosts": HOST,
-    "agent.id": AGENT,
-    "wazuh.agent.id": AGENT,
-    "source.domain": HOST,
-    "destination.domain": HOST,
-    "url.domain": HOST,
-}
-
 # A counter per family is enough to keep the compliance report bounded.
 _MAX_TRACKED_VALUES = 50_000
-
-
-def _field_kind(field: str) -> str:
-    """The placeholder family for a configured mask field.
-
-    Exact keys first (user.name), then the shortest matching dotted suffix
-    (".ip" catches source.ip, destination.ip, related.ip, ...). Anything unknown
-    falls back to USER — masking it as a generic identifier is the safe reading.
-    """
-    if field in _FIELD_KIND:
-        return _FIELD_KIND[field]
-    for suffix, kind in _FIELD_KIND.items():
-        if field.endswith(suffix):
-            return kind
-    return USER
 
 
 # --------------------------------------------------------------------------- #

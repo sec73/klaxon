@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
 from .constants import DEFAULT_TRACE_LEVEL
+from .field_kinds import DEFAULT_ANONYMIZATION_MASK_FIELDS
 
 logger = logging.getLogger("klaxon_mcp.config")
 
@@ -199,30 +200,8 @@ def _resolve_salt(config_file: str) -> str:
     return generated
 
 
-# Fields treated as personal data by default. The value under each is replaced
-# wholesale; the placeholder family is derived from the field name (see
-# anonymization._FIELD_KIND). Every entry is dotted, so a suffix match also
-# covers the nested position, e.g. "user.name" -> "source.user.name".
-DEFAULT_ANONYMIZATION_MASK_FIELDS: tuple[str, ...] = (
-    "source.ip",
-    "destination.ip",
-    "client.ip",
-    "server.ip",
-    "related.ip",
-    "source.domain",
-    "destination.domain",
-    "host.hostname",
-    "host.name",
-    "user.name",
-    "user.id",
-    "user.effective.name",
-    "source.user.name",
-    "destination.user.name",
-    "wazuh.agent.name",
-    "wazuh.agent.id",
-    "agent.name",
-    "agent.id",
-)
+# The default anonymization mask list lives in field_kinds — the single home
+# for field classification shared with the anonymizer and the GDPR checker.
 
 
 @dataclass(frozen=True)

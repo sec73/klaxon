@@ -44,6 +44,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .clients import IndexerClient, Response, TransportError
+from .field_kinds import NAME_PATTERN_RES as _NAME_PATTERN_RES
+from .field_kinds import NAME_PATTERNS as _NAME_PATTERNS
+from .field_kinds import name_match as _name_match
 from .fields import FieldInfo, fetch_field_caps
 from .tables import table
 
@@ -139,27 +142,10 @@ def _embeds_personal_data(value: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Field-name patterns. Ordered: the first match wins, so the specific entries
-# (user.name vs user.id) come before the generic ones that would swallow them.
+# Field-name patterns live in field_kinds (shared with the anonymizer). The
+# `_field_matches` helper below is the glob/exact/suffix matcher for CUSTOM
+# rules (gdpr_checker.custom_patterns) and is unrelated to those name patterns.
 # --------------------------------------------------------------------------- #
-
-_NAME_PATTERNS: tuple[tuple[str, str, str], ...] = (
-    (r"(^|\.)user\.name$", USERNAME, "high"),
-    (r"(^|\.)username$", USERNAME, "high"),
-    (r"(^|\.)user\.id$", USER_ID, "high"),
-    (r"email", EMAIL, "high"),
-    (r"(^|\.)ip$", IP_ADDRESS, "high"),
-    (r"hostname", HOSTNAME, "medium"),
-    (r"(^|\.)host\.name$", HOSTNAME, "medium"),
-    (r"(^|\.)agent\.name$", HOSTNAME, "medium"),
-    (r"(^|\.)agent\.id$", AGENT_ID, "medium"),
-    (r"\.domain$", DOMAIN, "medium"),
-)
-
-_NAME_PATTERN_RES = tuple(
-    (re.compile(pattern), kind, priority)
-    for pattern, kind, priority in _NAME_PATTERNS
-)
 
 
 def _field_matches(field: str, pattern: str) -> bool:
@@ -169,13 +155,6 @@ def _field_matches(field: str, pattern: str) -> bool:
 
         return fnmatch.fnmatchcase(field, pattern)
     return field == pattern or field.endswith("." + pattern)
-
-
-def _name_match(field: str) -> tuple[str, str] | None:
-    for regex, kind, priority in _NAME_PATTERN_RES:
-        if regex.search(field):
-            return kind, priority
-    return None
 
 
 # --------------------------------------------------------------------------- #
