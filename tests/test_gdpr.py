@@ -560,6 +560,37 @@ class TestGdprCheckTool:
             "source.ip", "user.name", "host.hostname", "custom.peer",
         }
 
+    async def test_json_output_runs_through_masking_guard(
+        self, gdpr_env: tuple[StubIndexer, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M2: the as_json report must pass through the masking guard. A raw IP
+        that ever lands in the JSON is masked, never returned to the client."""
+        from dataclasses import replace
+
+        from klaxon_mcp import gdpr as gdpr_module
+        from klaxon_mcp.server import gdpr_check
+
+        _, tmp = gdpr_env
+        active = AnonymizationConfig(
+            enabled=True,
+            salt="test-salt",
+            mask_fields=("source.ip",),
+            log_path=str(tmp / "llm.log"),
+        )
+        server._anonymizer = Anonymizer(active)  # type: ignore[assignment]
+        server._config = replace(server._config, anonymization=active)  # type: ignore[arg-type]
+        monkeypatch.setattr(
+            gdpr_module,
+            "render_json",
+            lambda result: (
+                '{"sensitive_fields": [{"field": "source.ip", "evidence": '
+                '"sampled value is an IP address at 10.0.0.1"}]}'
+            ),
+        )
+        out = await gdpr_check(index="wazuh-events-v5-*", as_json=True)
+        assert "10.0.0.1" not in out
+        assert "[IP_" in out
+
     async def test_exclude_skips_fields(
         self, gdpr_env: tuple[StubIndexer, Any]
     ) -> None:

@@ -1602,7 +1602,11 @@ async def gdpr_check(
         return _render("gdpr_check", notices, result.caps_failed)
 
     if as_json:
-        return gdpr.render_json(result)
+        # The JSON report is machine output, but it is still tool output that
+        # goes to the LLM client — run it through the same text pass + residual
+        # gate as every other rendered string, so a sampled value that ever
+        # reaches an evidence field can never escape unmasked.
+        return _guarded_text("gdpr_check", gdpr.render_json(result))
 
     head = (
         "=== DSGVO PLAUSIBILITY CHECK ===\n"
