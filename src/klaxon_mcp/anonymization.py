@@ -504,6 +504,18 @@ class Anonymizer:
             ]
         if isinstance(obj, str):
             return self._mask_string_value(path, obj, identities)
+        # Non-string scalar leaf (int/float/bool) under a configured mask field
+        # must not pass through raw just because it is not a string — a numeric
+        # user.id / agent.id is personal data like its string twin. None stays
+        # None (a missing value, not a value); non-configured scalars
+        # (doc_count, totals, metric values) are never touched.
+        if obj is not None:
+            matched = self._field_for_path(path)
+            if matched is not None:
+                kind, field = matched
+                with self._lock:
+                    self._field_hits[field] += 1
+                return self._register(kind, str(obj))
         return obj
 
     def mask_response(
@@ -713,20 +725,24 @@ class Anonymizer:
         Fires only when `field` is a configured mask field. Anything else —
         including a value that is already a token (masked at ingest elsewhere) —
         is either left alone or re-tokenised deterministically; the walker never
-        guesses at a value by its type here.
+        guesses at a value by its type here. Non-string keys (numeric terms
+        keys / composite after_key) on a configured field are tokenised too, so
+        they stay identical to their `_source` twins.
         """
-        if not isinstance(value, str) or not value:
-            return value
-        if _TOKEN_RE.fullmatch(value):
-            # Already a token (masked stream aggregation key / after_key): leave
-            # it, never re-tokenise (idempotent).
-            return value
-        matched = self._field_for_path(field)
+        matched = self._field_for_path(field) if value is not None else None
         if matched is None:
             return value
         kind, matched_field = matched
         with self._lock:
             self._field_hits[matched_field] += 1
+        if not isinstance(value, str):
+            return self._register(kind, str(value))
+        if not value:
+            return value
+        if _TOKEN_RE.fullmatch(value):
+            # Already a token (masked stream aggregation key / after_key): leave
+            # it, never re-tokenise (idempotent).
+            return value
         return self._register(kind, value)
 
     # ------------------------------------------------------------------ #

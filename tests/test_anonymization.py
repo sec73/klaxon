@@ -146,6 +146,77 @@ class TestValueMasking:
             out = anon().mask_text(line)
             assert "[USER_" in out, f"expected a username mask in {line!r}"
 
+
+# --------------------------------------------------------------------------- #
+# Non-string scalars under configured fields (M1): a numeric user.id / agent.id
+# must be masked like its string twin; None and non-configured numbers pass.
+# --------------------------------------------------------------------------- #
+
+
+class TestNonStringScalarMasking:
+    def test_numeric_configured_source_field_masked(self) -> None:
+        masked = anon().mask_json(
+            {"hits": {"_source": {"user.id": 1001, "agent.id": 7}}}
+        )
+        source = masked["hits"]["_source"]
+        assert source["user.id"] == token(USER, "1001")
+        assert source["agent.id"] == token(AGENT, "7")
+
+    def test_float_and_bool_configured_field_masked(self) -> None:
+        masked = anon().mask_json({"source.ip": 1.5})
+        assert masked["source.ip"] == token(IP, "1.5")
+
+    def test_non_configured_numeric_values_untouched(self) -> None:
+        doc = {"user.id": 1001, "bytes": 2048, "ok": True, "score": 0.5}
+        masked = anon().mask_json(doc)
+        assert masked["user.id"] == token(USER, "1001")
+        assert masked["bytes"] == 2048
+        assert masked["ok"] is True
+        assert masked["score"] == 0.5
+
+    def test_none_under_configured_field_stays_none(self) -> None:
+        masked = anon().mask_json({"user.id": None})
+        assert masked["user.id"] is None
+
+    def test_numeric_aggregation_key_on_configured_field_masked(self) -> None:
+        """Numeric terms keys / composite after_key stay identical to _source."""
+        body = {"aggs": {"ids": {"terms": {"field": "user.id"}}}}
+        response = Response(
+            200,
+            json.dumps(
+                {"aggregations": {"ids": {"buckets": [{"key": 1001, "doc_count": 5}]}}}
+            ),
+            "https://indexer.example/_search",
+        )
+        a = anon(mask_aggregation_keys=True)
+        masked = a.mask_response(response, agg_map=parse_agg_fields(body)).json()
+        assert masked["aggregations"]["ids"]["buckets"][0]["key"] == token(USER, "1001")
+
+    def test_numeric_composite_after_key_on_configured_field_masked(self) -> None:
+        body = {
+            "aggs": {
+                "c": {"composite": {"sources": [{"uid": {"terms": {"field": "user.id"}}}]}}
+            }
+        }
+        response = Response(
+            200,
+            json.dumps(
+                {
+                    "aggregations": {
+                        "c": {
+                            "after_key": {"uid": 1001},
+                            "buckets": [{"key": {"uid": 1001}, "doc_count": 5}],
+                        }
+                    }
+                }
+            ),
+            "https://indexer.example/_search",
+        )
+        a = anon(mask_aggregation_keys=True)
+        masked = a.mask_response(response, agg_map=parse_agg_fields(body)).json()
+        assert masked["aggregations"]["c"]["after_key"]["uid"] == token(USER, "1001")
+        assert masked["aggregations"]["c"]["buckets"][0]["key"]["uid"] == token(USER, "1001")
+
 # --------------------------------------------------------------------------- #
 # Deterministic placeholders
 # --------------------------------------------------------------------------- #
