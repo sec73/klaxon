@@ -19,6 +19,7 @@ from klaxon_mcp.validation import (
     validate_index,
     validate_manager_path,
     validate_prefix,
+    validate_tenant,
 )
 
 
@@ -95,6 +96,40 @@ class TestValidateIndex:
         not by the validator, because rejecting it here would be a lie about
         why it returns nothing."""
         assert validate_index("wazuh-alerts-*") == "wazuh-alerts-*"
+
+
+class TestValidateTenant:
+    """M4: tenant names must be safe as path components, resource names and
+    index-pattern components."""
+
+    @pytest.mark.parametrize("value", [
+        "customer-a",
+        "test_a",
+        "a",
+        "a.1",
+        "x" * 64,
+    ])
+    def test_accepted_tenants(self, value: str) -> None:
+        assert validate_tenant(value) == value
+
+    @pytest.mark.parametrize("value", [
+        "",
+        "customer/a",
+        "..",
+        "a..b",
+        "a b",
+        "Customer-A",
+        "customer,a",
+        "customer-a*",
+        "a" * 65,
+        "../etc/passwd",
+    ])
+    def test_rejected_tenants(self, value: str) -> None:
+        with pytest.raises(ValidationError):
+            validate_tenant(value)
+
+    def test_tenant_is_stripped(self) -> None:
+        assert validate_tenant("  customer-a  ") == "customer-a"
 
 
 class TestValidateManagerPath:

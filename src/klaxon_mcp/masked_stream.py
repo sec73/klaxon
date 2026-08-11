@@ -51,6 +51,7 @@ from typing import Any
 import yaml
 
 from . import __version__ as _package_version
+from .validation import validate_tenant
 
 logger = logging.getLogger("klaxon_mcp.masked_stream")
 
@@ -212,9 +213,15 @@ def find_repo_root(start: str | Path | None = None) -> Path:
 
 
 def find_tenant_dir(tenant: str, root: str | Path | None = None) -> Path:
-    """The `tenants/<tenant>` directory (repo root by default)."""
+    """The `tenants/<tenant>` directory (repo root by default).
+
+    The tenant name is validated here — the single choke point before it is
+    used as a path component, a resource name and an index-pattern component
+    everywhere downstream (`klaxon-mask-<tenant>`, `klaxon-masked-<tenant>-v5-*`,
+    sync-state doc id, ...).
+    """
     base = Path(root) if root is not None else find_repo_root()
-    return base / "tenants" / tenant
+    return base / "tenants" / validate_tenant(tenant)
 
 
 def load_tenant_config(

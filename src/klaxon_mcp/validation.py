@@ -31,6 +31,10 @@ MAX_PREFIX_LENGTH: Final[int] = 255
 # absence of uppercase, which OpenSearch rejects for index names anyway.
 _INDEX_ALLOWED: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9._*,\-]+$")
 
+# Tenant names flow into resource names, index patterns and filesystem paths;
+# see validate_tenant(). Note the absence of '/', '*', ',', whitespace and '..'.
+_TENANT_ALLOWED: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9._-]+$")
+
 # Manager paths carry agent IDs, group names and node names.
 _MANAGER_ALLOWED: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9._/\-]+$")
 
@@ -104,6 +108,43 @@ MANAGER_RESTRICTED_ROOTS: Final[dict[str, frozenset[str]]] = {
 
 class ValidationError(ValueError):
     """Raised when caller-supplied input fails a guard."""
+
+
+def validate_tenant(tenant: str) -> str:
+    """Validate a tenant name before it reaches resource names or paths.
+
+    Tenants are interpolated into `klaxon-mask-<tenant>`,
+    `klaxon-masked-<tenant>-v5-*`, `klaxon-masked-retention-<tenant>`, the
+    sync-state doc id and the `tenants/<tenant>/` directory. An unguarded tenant
+    (containing '/', '..', '*', ',', whitespace, ...) could escape a resource
+    name, an index pattern or the tenants directory. The permitted set is what
+    OpenSearch accepts in an index component: lowercase letters, digits, '.',
+    '-' and '_'.
+
+    Returns the tenant unchanged when valid; raises ValidationError otherwise.
+    """
+    if not isinstance(tenant, str):  # defensive: schema should prevent this
+        raise ValidationError("tenant must be a string")
+
+    stripped = tenant.strip()
+    if not stripped:
+        raise ValidationError("tenant must not be empty")
+
+    if len(stripped) > 64:
+        raise ValidationError(
+            f"tenant exceeds 64 characters (got {len(stripped)})"
+        )
+
+    if not _TENANT_ALLOWED.match(stripped):
+        raise ValidationError(
+            "tenant contains disallowed characters; permitted set is "
+            "[a-z0-9._-] (lowercase, no '/', no '*', no ',', no whitespace)"
+        )
+
+    if ".." in stripped:
+        raise ValidationError("tenant must not contain '..'")
+
+    return stripped
 
 
 def validate_index(index: str) -> str:
