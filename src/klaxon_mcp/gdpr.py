@@ -44,8 +44,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .clients import IndexerClient, Response, TransportError
-from .field_kinds import NAME_PATTERN_RES as _NAME_PATTERN_RES
-from .field_kinds import NAME_PATTERNS as _NAME_PATTERNS
 from .field_kinds import name_match as _name_match
 from .fields import FieldInfo, fetch_field_caps
 from .tables import table

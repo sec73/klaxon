@@ -58,7 +58,6 @@ from . import gdpr as _gdpr
 from . import overview as _overview
 from .clients import Response
 from .config import AnonymizationConfig
-from .field_kinds import FIELD_KIND as _FIELD_KIND
 from .field_kinds import field_kind as _field_kind
 
 logger = logging.getLogger("klaxon_mcp.anonymization")
