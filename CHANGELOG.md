@@ -10,6 +10,23 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`klaxon masking` — the single Option B generator (Option A).**
+  `klaxon masking generate --tenant X` builds all four deployable artifacts
+  from `tenants/<tenant>/fields.yaml` without writing to the indexer: the config
+  fragment, the ingest pipeline, the ISM retention policy and the index
+  template (priority 200, `data_stream: {}`, `index.default_pipeline` +
+  `index.lifecycle.name`). The salt moves into the script processor's
+  `params.salt` (the committed pipeline template keeps a `__SALT__` placeholder
+  so the secret never enters git), and the pipeline carries `generator_version`
+  in `_meta`. A MANDATORY self-test proves the generated Painless token scheme
+  is byte-identical to `derive_token(value, family, salt)` and aborts with no
+  artifacts on any mismatch — also available as `klaxon masking selftest`.
+  `klaxon masking salt-check --tenant X` compares the salt baked into the
+  deployed pipeline with the current env salt and fails on a mismatch. The
+  legacy `generate_masking.py` was removed; the old `--generate-masking*` flags
+  remain as deprecated aliases. `klaxon` is now a console-script alias for
+  `klaxon-mcp`.
+
 - **Free-text username masking (Gap 1).** When anonymization is enabled and
   `mask_free_text_users` is on (the default), usernames inside free-text fields
   (`message`, `*.log`, `raw`, ...) are masked with the same deterministic tokens

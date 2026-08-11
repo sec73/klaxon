@@ -44,10 +44,13 @@ import os
 import re
 import secrets
 from dataclasses import dataclass
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from . import __version__ as _package_version
 
 logger = logging.getLogger("klaxon_mcp.masked_stream")
 
@@ -312,6 +315,31 @@ def token(family: str, value: str, salt: str) -> str:
     return f"[{family}_{token_hex(family, value, salt)}]"
 
 
+def derive_token(value: str, family: str, salt: str) -> str:
+    """The single token-derivation entry point: `derive_token(value, family, salt)`.
+
+    `token()` is the implementation (SHA-256 over `family:value:salt`, first 16
+    hex chars, displayed as `[FAMILY_<16 hex>]`, idempotent on existing tokens).
+    `derive_token` is the name the token-schema self-test and the docs use for
+    the pipeline scheme, so the Painless script and the Python side are compared
+    against one canonical function.
+    """
+    return token(family, value, salt)
+
+
+def generator_version() -> str:
+    """The Klaxon package version stamped into generated artifacts' provenance.
+
+    Uses the installed distribution version (authoritative after `pip install .`),
+    falling back to the module `__version__` when the package is not installed
+    (e.g. bare test collection).
+    """
+    try:
+        return metadata.version("klaxon-mcp")
+    except metadata.PackageNotFoundError:
+        return _package_version
+
+
 def resolve_salt(salt_env: str = "KLAXON_ANONYMIZATION_SALT") -> str:
     """The per-tenant salt from the environment, or a generated one (warned).
 
@@ -369,7 +397,7 @@ def build_config_fragment(cfg: TenantConfig) -> str:
     return (
         f"# generated from {cfg.source_rel} (sha256: {sha})\n"
         f"# Hand-edit only via {cfg.source_rel} + "
-        "`python -m klaxon_mcp.generate_masking`. CI enforces this.\n"
+        "`klaxon masking generate`. CI enforces this.\n"
         "anonymization:\n"
         "  mask_aggregation_keys: true\n"
         f"  mask_free_text_users: {str(cfg.mask_free_text_users).lower()}\n"
@@ -389,8 +417,15 @@ def build_config_fragment(cfg: TenantConfig) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _painless_script(cfg: TenantConfig, salt: str) -> str:
-    """The Painless source for the masking pipeline, built from fields.yaml."""
+def _painless_script(cfg: TenantConfig) -> str:
+    """The Painless source for the masking pipeline, built from fields.yaml.
+
+    The salt is NOT embedded in the source: the script reads `params.salt`, set
+    on the script processor (the template carries `__SALT__` so the secret never
+    enters git; the deployable pipeline carries the real salt). The script
+    contains no hardcoded field names either — the field table is injected as
+    the `FIELDS`/`FREE_TEXT` lists below.
+    """
     field_rows = ",\n    ".join(
         json.dumps(f.to_painless_row()) for f in cfg.fields
     )
@@ -413,7 +448,7 @@ def _painless_script(cfg: TenantConfig, salt: str) -> str:
     return f"""// Generated from {cfg.source_rel} — do not edit by hand.
 // klaxon-mask-{cfg.tenant}: deterministic masking for {cfg.masked_stream_pattern}.
 def HEX = "0123456789abcdef";
-def SALT = {json.dumps(salt)};
+def SALT = params.salt;  // injected as the script processor's params.salt
 def TOKEN_RE = Pattern.compile("^\\\\[(?:IP|USER|HOST|AGENT)_[0-9a-f]{{16}}\\\\]$");
 
 String hex16(byte[] bytes) {{
@@ -433,6 +468,7 @@ String sha256hex(String input) {{
 
 String token(String family, String value) {{
     if (value == null) return value;
+    if (value.isEmpty()) return value;  // empty stays empty, mirrors derive_token
     if (TOKEN_RE.matcher(value).matches()) return value;  // idempotent
     return "[" + family + "_" + sha256hex(family + ":" + value + ":" + SALT) + "]";
 }}
@@ -555,9 +591,12 @@ _MASK_FAMILY = {
 def build_pipeline(cfg: TenantConfig, salt: str) -> dict[str, Any]:
     """The `PUT /_ingest/pipeline/klaxon-mask-<tenant>` body.
 
-    `salt` is baked into the script at generation time (ingest pipelines cannot
-    read process env). `_meta` carries the provenance fingerprint plus the field
-    table, which is what drift checks (`verify-config`, sync preflight) compare.
+    The salt is carried as the script processor's `params.salt` (ingest
+    pipelines cannot read process env, so the deployable pipeline embeds the
+    real salt there; the committed template uses `__SALT__` so the secret never
+    enters git). `_meta` carries the provenance fingerprint (source path, sha256
+    of fields.yaml, tenant, generator version) plus the field table, which is
+    what drift checks (`verify-config`, sync preflight, salt-check) compare.
     """
     sha = fields_yaml_sha256(cfg)
     return {
@@ -570,7 +609,8 @@ def build_pipeline(cfg: TenantConfig, salt: str) -> dict[str, Any]:
             {
                 "script": {
                     "lang": "painless",
-                    "source": _painless_script(cfg, salt),
+                    "source": _painless_script(cfg),
+                    "params": {"salt": salt},
                     "on_failure": [
                         {
                             "set": {
@@ -586,9 +626,10 @@ def build_pipeline(cfg: TenantConfig, salt: str) -> dict[str, Any]:
             "source": cfg.source_rel,
             "sha256": sha,
             "tenant": cfg.tenant,
+            "generator_version": generator_version(),
+            "generated_by": "klaxon masking generate",
             "fields": list(cfg.all_masked_fields),
             "free_text_fields": list(cfg.free_text_fields),
-            "generated_by": "klaxon-mcp.generate_masking",
         },
     }
 
@@ -644,25 +685,31 @@ def build_ism_policy(cfg: TenantConfig, retention_days: int = DEFAULT_RETENTION_
     }
 
 
-def build_index_template(cfg: TenantConfig, mappings: dict[str, Any]) -> dict[str, Any]:
+def build_index_template(
+    cfg: TenantConfig, mappings: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """The composable index template for the masked data stream.
 
-    `mappings` must be the `mappings` object copied from the Wazuh events stream
-    so queries behave identically. Only `klaxon-masked-<tenant>-v5-*` matches —
-    Wazuh streams are never touched.
+    `mappings` is the `mappings` object copied from the Wazuh events stream (so
+    queries behave identically); when omitted (None — the offline generator
+    path), the `mappings` key is not emitted and the operator merges them at
+    deploy time (see `apply-masked-infra`, which fetches them from the indexer).
+    Only `klaxon-masked-<tenant>-v5-*` matches — Wazuh streams are never touched.
     """
+    template: dict[str, Any] = {
+        "settings": {
+            "index.default_pipeline": cfg.pipeline_name,
+            "index.lifecycle.name": cfg.ism_policy_name,
+            "number_of_shards": 1,
+            "number_of_replicas": 1,
+        }
+    }
+    if mappings is not None:
+        template["mappings"] = mappings
     return {
         "index_patterns": [cfg.masked_stream_pattern],
         "priority": TEMPLATE_PRIORITY,
-        "template": {
-            "settings": {
-                "index.default_pipeline": cfg.pipeline_name,
-                "index.lifecycle.name": cfg.ism_policy_name,
-                "number_of_shards": 1,
-                "number_of_replicas": 1,
-            },
-            "mappings": mappings,
-        },
+        "template": template,
         "data_stream": {},
     }
 

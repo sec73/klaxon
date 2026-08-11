@@ -19,6 +19,7 @@ import os
 import sys
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .config import ConfigError, TransportConfig
 from .transport import serve
@@ -98,14 +99,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     masked_stream.add_argument(
         "--generate-masking",
         action="store_true",
-        help="Regenerate the Klaxon config fragment + pipeline template from "
-        "tenants/<tenant>/fields.yaml (writes files; no Wazuh needed).",
+        help="DEPRECATED — use `masking generate`. Regenerate the config "
+        "fragment + pipeline template from tenants/<tenant>/fields.yaml "
+        "(writes files; no Wazuh needed).",
     )
     masked_stream.add_argument(
         "--generate-masking-check",
         action="store_true",
-        help="Verify committed generated artifacts match fields.yaml (no writes); "
-        "exit non-zero on drift. Used by CI and pre-commit.",
+        help="DEPRECATED — use `masking generate --check`. Verify committed "
+        "generated artifacts match fields.yaml (no writes); exit non-zero on "
+        "drift. Used by CI and pre-commit.",
     )
     masked_stream.add_argument(
         "--sync-masked",
@@ -209,6 +212,115 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Run a non-interactive DSGVO check before serving. Applies the "
         "suggestions only when --gdpr-auto-add is set, else dry-runs.",
+    )
+
+    # `klaxon masking` — the single Option B generator + self-test + salt check.
+    subparsers = parser.add_subparsers(
+        dest="command", metavar="COMMAND", description="Subcommands."
+    )
+    masking_parser = subparsers.add_parser(
+        "masking",
+        help="Generate / verify the Option B masking artifacts (offline) and "
+        "check the deployed salt. Supersedes the old --generate-masking flags.",
+    )
+    masking_sub = masking_parser.add_subparsers(
+        dest="masking_command", metavar="SUBCOMMAND"
+    )
+
+    gen_parser = masking_sub.add_parser(
+        "generate",
+        help="Build the deployable artifacts from tenants/<tenant>/fields.yaml "
+        "(no writes to the indexer).",
+    )
+    gen_parser.add_argument(
+        "--tenant",
+        metavar="TENANT",
+        help="Tenant (directory under tenants/) whose fields.yaml is the source "
+        "of truth, e.g. customer-a.",
+    )
+    gen_parser.add_argument(
+        "--out",
+        metavar="DIR",
+        help="Write the DEPLOYABLE artifact set (real salt in params.salt) into "
+        "DIR. '-' prints them to stdout (same as --stdout).",
+    )
+    gen_parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Print the deployable artifact set to stdout instead of writing files.",
+    )
+    gen_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="No writes: compare the committed tenants/<tenant>/generated/* "
+        "artifacts against fields.yaml and exit non-zero on drift. Used by CI "
+        "and the pre-commit hook.",
+    )
+    gen_parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="ISM delete-after retention for the masked stream (default 30).",
+    )
+    gen_parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Repo root (default: nearest ancestor of the working directory that "
+        "contains tenants/).",
+    )
+    gen_parser.add_argument(
+        "--salt",
+        metavar="SALT",
+        help="Explicit salt for the deployable pipeline (default: the "
+        "KLAXON_ANONYMIZATION_SALT env var, or salt_env from fields.yaml).",
+    )
+    gen_parser.add_argument(
+        "--salt-env",
+        metavar="VAR",
+        help="Override the env var name (default: salt_env from fields.yaml, "
+        "else KLAXON_ANONYMIZATION_SALT).",
+    )
+
+    selftest_parser = masking_sub.add_parser(
+        "selftest",
+        help="Prove the Painless token scheme is byte-identical to "
+        "derive_token(value, family, salt). Runs inside `generate` too.",
+    )
+    selftest_parser.add_argument(
+        "--tenant",
+        metavar="TENANT",
+        help="Also render and validate that tenant's pipeline script.",
+    )
+    selftest_parser.add_argument(
+        "--root", type=Path, default=None, help="Repo root (default: auto)."
+    )
+    selftest_parser.add_argument("--salt", metavar="SALT", help="Explicit salt.")
+    selftest_parser.add_argument(
+        "--salt-env", metavar="VAR", help="Env var name (default: "
+        "KLAXON_ANONYMIZATION_SALT)."
+    )
+
+    saltcheck_parser = masking_sub.add_parser(
+        "salt-check",
+        help="Compare the salt baked into the DEPLOYED pipeline with the current "
+        "env salt. Needs the indexer.",
+    )
+    saltcheck_parser.add_argument(
+        "--tenant",
+        metavar="TENANT",
+        required=True,
+        help="Tenant whose deployed pipeline salt is compared.",
+    )
+    saltcheck_parser.add_argument(
+        "--root", type=Path, default=None, help="Repo root (default: auto)."
+    )
+    saltcheck_parser.add_argument(
+        "--salt-env",
+        metavar="VAR",
+        help="Env var name (default: salt_env from fields.yaml, else "
+        "KLAXON_ANONYMIZATION_SALT).",
     )
     return parser.parse_args(argv)
 
@@ -542,16 +654,67 @@ def main(argv: list[str] | None = None) -> int:
     ):
         return _run_anonymization_command(args)
 
-    # Option B generator: needs no Wazuh environment, just files.
+    # Option B generator / self-test / salt check: `klaxon masking ...`.
+    # Needs no Wazuh environment for generate/selftest (just files); salt-check
+    # needs the indexer and is dispatched to sync_masked below.
+    if args.command == "masking":
+        from . import masking
+
+        if args.masking_command == "generate":
+            argv = ["--tenant", args.tenant] if args.tenant else []
+            if args.out:
+                argv += ["--out", args.out]
+            if args.stdout:
+                argv.append("--stdout")
+            if args.check:
+                argv.append("--check")
+            if args.retention_days is not None:
+                argv += ["--retention-days", str(args.retention_days)]
+            if args.root is not None:
+                argv += ["--root", str(args.root)]
+            if args.salt:
+                argv += ["--salt", args.salt]
+            if args.salt_env:
+                argv += ["--salt-env", args.salt_env]
+            return masking.generate_main(argv)
+        if args.masking_command == "selftest":
+            argv = []
+            if args.tenant:
+                argv += ["--tenant", args.tenant]
+            if args.root is not None:
+                argv += ["--root", str(args.root)]
+            if args.salt:
+                argv += ["--salt", args.salt]
+            if args.salt_env:
+                argv += ["--salt-env", args.salt_env]
+            return masking.selftest_main(argv)
+        if args.masking_command == "salt-check":
+            if not args.tenant:
+                print(
+                    "--tenant is required for `masking salt-check`",
+                    file=sys.stderr,
+                )
+                return 2
+            from . import sync_masked
+
+            return sync_masked.salt_check_command(args.tenant)
+        print(
+            "masking: missing subcommand (generate|selftest|salt-check)",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Deprecated legacy aliases for the generator — superseded by
+    # `masking generate` / `masking generate --check` (same code path).
     if args.generate_masking or args.generate_masking_check:
-        from .generate_masking import main as generate_main
+        from . import masking
 
         argv = []
         if args.tenant:
             argv += ["--tenant", args.tenant]
         if args.generate_masking_check:
             argv.append("--check")
-        return generate_main(argv)
+        return masking.generate_main(argv)
 
     # The DSGVO plausibility check needs the Wazuh indexer but not the MCP
     # listener; it runs and exits.

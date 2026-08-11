@@ -12,8 +12,8 @@ repos:
         name: klaxon masking config drift check
         description: >-
           tenants/<tenant>/generated/* must match fields.yaml. Regenerate with
-          `python -m klaxon_mcp.generate_masking` after editing fields.yaml.
-        entry: python -m klaxon_mcp.generate_masking --check
+          `klaxon masking generate` after editing fields.yaml.
+        entry: python -m klaxon_mcp masking generate --check
         language: system
         pass_filenames: false
         always_run: true

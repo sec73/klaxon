@@ -404,6 +404,30 @@ naming sensitive fields present in the hits.
 
 ---
 
+## `klaxon masking` (Option B generator)
+
+Builds the deployable artifacts for the separate masked stream from
+`tenants/<tenant>/fields.yaml` — **without writing to the indexer** (deploying
+is the operator's/CI's job). `klaxon` and `klaxon-mcp` are the same binary.
+
+| Command | Purpose |
+|---|---|
+| `masking generate --tenant X` | write the committed artifact set (config fragment + pipeline template + ISM + index template) into `tenants/X/generated/` |
+| `masking generate --tenant X --out DIR` | write the DEPLOYABLE set (real salt in `params.salt`) into `DIR` |
+| `masking generate --tenant X --stdout` | print the deployable set to stdout |
+| `masking generate --check` | no writes — compare committed artifacts vs `fields.yaml` (CI/pre-commit drift gate) |
+| `masking generate --tenant X --retention-days N` | ISM delete-after (default 30) |
+| `masking selftest [--tenant X]` | prove the generated Painless token scheme == `derive_token` byte-for-byte (runs inside every `generate`; a mismatch aborts and emits nothing) |
+| `masking salt-check --tenant X` | compare the DEPLOYED pipeline's `params.salt` with the current env salt (needs the indexer) |
+
+Flags: `--tenant`, `--out`, `--stdout`, `--check`, `--retention-days`, `--root`,
+`--salt`, `--salt-env`. The salt is read from `KLAXON_ANONYMIZATION_SALT` (or
+`salt_env` in `fields.yaml`); unset → random salt + warning (tokens rotate
+unless the salt is stable). `related.hash` is never masked. See
+`docs/option-b-masked-stream.md` for the full design.
+
+---
+
 ## Transport options
 
 | Variable | Flag | Default |

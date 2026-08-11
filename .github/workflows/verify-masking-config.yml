@@ -1,0 +1,45 @@
+name: Masking config drift
+
+# Option B invariant: the committed generated artifacts
+# (tenants/<tenant>/generated/*) must always be regenerable from the committed
+# fields.yaml. Any hand-edit that is not reflected in fields.yaml is drift and
+# fails here. This is the same check the pre-commit hook runs locally, plus the
+# mandatory token-schema self-test (`klaxon masking selftest`): the generated
+# Painless scheme must be byte-identical to `derive_token`.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55 # v5.5.0
+        with:
+          python-version: "3.13"
+
+      - name: Install klaxon-mcp (pyyaml runtime dependency)
+        run: pip install .
+
+      - name: Token-schema self-test (Painless == derive_token byte-for-byte)
+        run: python -m klaxon_mcp masking selftest --tenant customer-a
+
+      - name: Generated artifacts must match fields.yaml (all tenants)
+        run: python -m klaxon_mcp masking generate --check
+
+      - name: Masked-stream unit tests
+        run: python -m pytest \
+          tests/test_generate_masking.py \
+          tests/test_sync_masked.py \
+          tests/test_idempotent_masking.py \
+          tests/test_config.py \
+          -q

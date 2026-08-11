@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
@@ -326,7 +327,7 @@ def sync_command(
 def verify_command(tenant: str) -> int:
     """Compare fields.yaml vs committed config fragment vs config vs deployed pipeline."""
     from . import server
-    from .generate_masking import check_artifacts
+    from .masking import check_artifacts
 
     problems: list[str] = []
     try:
@@ -358,6 +359,59 @@ def verify_command(tenant: str) -> int:
         return 1
     print("ok: fields.yaml, config and deployed pipeline are in sync.")
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# salt-check (deploy-time salt comparison)
+# --------------------------------------------------------------------------- #
+
+
+def salt_check_command(tenant: str) -> int:
+    """Compare the salt baked into the DEPLOYED pipeline with the current env salt.
+
+    The deployed pipeline carries its salt in `params.salt` (ingest pipelines
+    cannot read process env). If the current `KLAXON_ANONYMIZATION_SALT` (or
+    `salt_env` from fields.yaml) differs from what was deployed, tokens from the
+    deployed pipeline will not match a fresh generate/apply — determinism is
+    lost — so a mismatch is an error.
+    """
+    from . import server
+    from .masking import check_deployed_salt
+
+    try:
+        cfg = load_tenant_config(tenant)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"salt-check[{tenant}] error: {exc}", file=sys.stderr)
+        return 2
+
+    current = os.environ.get(cfg.salt_env, "").strip() or None
+    if current is None:
+        print(
+            f"salt-check[{tenant}] {cfg.salt_env} is not set — cannot compare "
+            "against the deployed pipeline. Set it to the salt the pipeline was "
+            "deployed with.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        client = server.get_indexer()
+    except Exception as exc:  # noqa: BLE001 - a broken indexer is a reportable error
+        print(f"salt-check[{tenant}] indexer unreachable: {exc}", file=sys.stderr)
+        return 1
+
+    deployed = asyncio.run(_fetch_pipeline(client, cfg))
+    if deployed is None:
+        print(
+            f"salt-check[{tenant}] pipeline {cfg.pipeline_name} is not deployed. "
+            f"Deploy it first (`klaxon-mcp apply-masked-infra --tenant {tenant}`).",
+            file=sys.stderr,
+        )
+        return 1
+
+    ok, message = check_deployed_salt(deployed, current)
+    print(f"salt-check[{tenant}] {message}")
+    return 0 if ok else 1
 
 
 # --------------------------------------------------------------------------- #

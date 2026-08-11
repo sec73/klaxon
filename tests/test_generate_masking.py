@@ -3,10 +3,18 @@
 #
 # Author: Marco Moenig <marco.moenig@sec73.io>
 
-"""Tests for the Option B generator: fields.yaml -> config fragment + pipeline."""
+"""Tests for `klaxon masking generate` / `selftest` / `salt-check` (Option A).
+
+Covers the generator (fields.yaml -> config fragment + pipeline + ISM + index
+template), the MANDATORY token-schema self-test (generated Painless must be
+byte-identical to `derive_token`; a changed scheme breaks generation), the
+`params.salt` pipeline structure, provenance fingerprints, drift detection, and
+the deploy-time salt comparison helpers.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -14,24 +22,39 @@ from typing import Any
 import pytest
 import yaml
 
-from klaxon_mcp.generate_masking import (
-    CONFIG_FRAGMENT_NAME,
-    PIPELINE_TEMPLATE_NAME,
-    check_artifacts,
-    generated_paths,
-    render_artifacts,
-    tenants_in_repo,
-)
+from klaxon_mcp import masking
 from klaxon_mcp.masked_stream import (
     TEMPLATE_PRIORITY,
     build_config_fragment,
     build_index_template,
     build_ism_policy,
+    build_pipeline,
     build_pipeline_template,
     deploy_pipeline,
+    derive_token,
     fields_yaml_sha256,
     load_tenant_config,
     token,
+)
+from klaxon_mcp.masking import (
+    CONFIG_FRAGMENT_NAME,
+    INDEX_TEMPLATE_FILE,
+    ISM_POLICY_FILE,
+    PIPELINE_TEMPLATE_NAME,
+    SELF_TEST_VALUES,
+    check_artifacts,
+    check_deployed_salt,
+    deployed_pipeline_salt,
+    generate_main,
+    generated_paths,
+    painless_token_reference,
+    render_artifacts,
+    render_deployable,
+    run_generator_selftest,
+    run_token_selftest,
+    selftest_main,
+    tenants_in_repo,
+    verify_script_scheme,
 )
 
 SALT = "test-salt"
@@ -107,8 +130,7 @@ def test_loader_rejects_field_also_in_free_text(tmp_path: Any) -> None:
     tenant_dir = tmp_path / "tenants" / "test-a"
     tenant_dir.mkdir(parents=True)
     (tenant_dir / "fields.yaml").write_text(
-        MINIMAL_FIELDS
-        + "  - field: message\n    family: USER\n",
+        MINIMAL_FIELDS + "  - field: message\n    family: USER\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="both field and free_text_field"):
@@ -118,6 +140,13 @@ def test_loader_rejects_field_also_in_free_text(tmp_path: Any) -> None:
 # --------------------------------------------------------------------------- #
 # Token derivation
 # --------------------------------------------------------------------------- #
+
+
+def test_derive_token_is_the_token_function(cfg: Any) -> None:
+    assert derive_token("jdoe", "USER", SALT) == token("USER", "jdoe", SALT)
+    assert derive_token("192.168.50.42", "IP", SALT) == token(
+        "IP", "192.168.50.42", SALT
+    )
 
 
 def test_token_is_deterministic_and_prefixed(cfg: Any) -> None:
@@ -141,6 +170,74 @@ def test_token_is_idempotent_on_existing_tokens(cfg: Any) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Token-schema self-test (mandatory): Painless reference vs derive_token
+# --------------------------------------------------------------------------- #
+
+
+def test_painless_reference_matches_derive_token_byte_for_byte(cfg: Any) -> None:
+    """The reference transcription of the Painless token() must equal derive_token
+    for every representative value/family."""
+    for value, family in SELF_TEST_VALUES:
+        expected = derive_token(value, family, SALT)
+        actual = painless_token_reference(family, value, SALT)
+        assert actual == expected, (
+            f"family={family} value={value!r}: Painless reference {actual!r} != "
+            f"derive_token {expected!r}"
+        )
+        assert actual == token(family, value, SALT)
+
+
+def test_run_token_selftest_passes(cfg: Any) -> None:
+    assert run_token_selftest(SALT) == []
+
+
+def test_run_token_selftest_fails_when_scheme_changed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Changing the scheme in derive_token (e.g. a different hash/truncation)
+    MUST make the self-test fail — generation breaks, not the deployed pipeline."""
+
+    def bad_derive_token(value: str, family: str, salt: str) -> str:
+        if not value:
+            return value
+        if masking.TOKEN_RE.fullmatch(value):  # keep idempotency, like the real scheme
+            return value
+        digest = hashlib.sha512(f"{family}:{value}:{salt}".encode()).hexdigest()
+        return f"[{family}_{digest[:24]}]"
+
+    monkeypatch.setattr(masking, "derive_token", bad_derive_token)
+    problems = run_token_selftest(SALT)
+    assert problems
+    # Every non-special value diverges (only empty + already-token pass through).
+    assert len(problems) == len(SELF_TEST_VALUES) - 2
+
+
+def test_generator_selftest_fails_on_tampered_script(cfg: Any) -> None:
+    """A hand-edited (or wrongly generated) script that no longer encodes the
+    derive_token scheme must be caught by the script-scheme verification."""
+    source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
+    assert verify_script_scheme(source) == []
+    tampered = source.replace("SHA-256", "SHA-1")
+    assert verify_script_scheme(tampered)
+    assert run_generator_selftest(cfg, SALT) == []
+
+
+def test_generator_selftest_reports_params_salt_mismatch(
+    cfg: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the rendered pipeline's params.salt does not match the salt the selftest
+    ran with, that is a problem (the deployable artifact would carry the wrong salt)."""
+    real_build = masking.build_pipeline
+
+    def broken(tenant_cfg: Any, salt: str) -> dict[str, Any]:
+        pipeline = real_build(tenant_cfg, salt)
+        pipeline["processors"][0]["script"]["params"] = {"salt": "wrong"}
+        return pipeline
+
+    monkeypatch.setattr(masking, "build_pipeline", broken)
+    problems = run_generator_selftest(cfg, SALT)
+    assert any("params.salt mismatch" in p for p in problems)
+
+
+# --------------------------------------------------------------------------- #
 # Pipeline construction
 # --------------------------------------------------------------------------- #
 
@@ -151,6 +248,8 @@ def test_pipeline_meta_carries_provenance(cfg: Any) -> None:
     assert meta["tenant"] == "test-a"
     assert meta["source"] == "tenants/test-a/fields.yaml"
     assert meta["sha256"] == fields_yaml_sha256(cfg)
+    assert meta["generator_version"]
+    assert meta["generated_by"] == "klaxon masking generate"
     assert meta["fields"] == [
         "destination.ip",
         "user.name",
@@ -164,24 +263,29 @@ def test_pipeline_meta_carries_provenance(cfg: Any) -> None:
 def test_pipeline_has_on_failure_flag(cfg: Any) -> None:
     pipeline = build_pipeline_template(cfg)
     script = pipeline["processors"][0]["script"]
+    assert script["lang"] == "painless"
     assert script["on_failure"] == [
         {"set": {"field": "klaxon.masking_error", "value": "{{ _ingest.on_failure_message }}"}}
     ]
 
 
-def test_pipeline_template_uses_salt_placeholder(cfg: Any) -> None:
-    source = build_pipeline_template(cfg)["processors"][0]["script"]["source"]
-    assert "__SALT__" in source
-    assert SALT not in source
+def test_pipeline_template_uses_salt_placeholder_in_params(cfg: Any) -> None:
+    """The committed template keeps the salt out of the source: it lives in the
+    script processor's `params.salt`, placeholder `__SALT__`."""
+    script = build_pipeline_template(cfg)["processors"][0]["script"]
+    assert script["params"] == {"salt": "__SALT__"}
+    assert "__SALT__" not in script["source"]
+    assert SALT not in script["source"]
+    assert "def SALT = params.salt;" in script["source"]
 
 
-def test_deployed_pipeline_bakes_real_salt(
+def test_deployed_pipeline_bakes_real_salt_in_params(
     cfg: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("KLAXON_ANONYMIZATION_SALT", "real-secret")
-    source = deploy_pipeline(cfg)["processors"][0]["script"]["source"]
-    assert "__SALT__" not in source
-    assert "real-secret" in source
+    script = deploy_pipeline(cfg)["processors"][0]["script"]
+    assert script["params"] == {"salt": "real-secret"}
+    assert "real-secret" not in script["source"]
 
 
 def test_pipeline_never_masks_related_hash(cfg: Any) -> None:
@@ -213,6 +317,25 @@ def test_index_template_targets_only_masked_stream(cfg: Any) -> None:
     assert template["template"]["mappings"] == {"properties": {}}
 
 
+def test_index_template_omits_mappings_when_none(cfg: Any) -> None:
+    """The offline generator emits an index template WITHOUT mappings (the
+    operator merges them at deploy time, e.g. via apply-masked-infra)."""
+    template = build_index_template(cfg)
+    assert "mappings" not in template["template"]
+    assert template["priority"] == TEMPLATE_PRIORITY
+    assert template["data_stream"] == {}
+
+
+def test_pipeline_has_no_hardcoded_field_logic(cfg: Any) -> None:
+    """Field names must come from the injected FIELDS/FREE_TEXT tables only."""
+    source = build_pipeline_template(cfg)["processors"][0]["script"]["source"]
+    table_start = source.index("def FIELDS = ")
+    table_end = source.index("def FREE_TEXT = ")
+    logic = source[:table_start] + source[table_end:]
+    for field in ("destination.ip", "user.name", "host.hostname"):
+        assert field not in logic
+
+
 # --------------------------------------------------------------------------- #
 # Config fragment
 # --------------------------------------------------------------------------- #
@@ -235,7 +358,15 @@ def test_config_fragment_matches_fields_yaml(cfg: Any) -> None:
     kinds = {p["field"]: p["type"] for p in data["gdpr_checker"]["custom_patterns"]}
     assert kinds["destination.ip"] == "IP_ADDRESS"
     assert kinds["user.name"] == "USERNAME"
+    assert kinds["user.effective.name"] == "USERNAME"
     assert kinds["host.hostname"] == "HOSTNAME"
+
+
+def test_config_fragment_custom_patterns_use_field_key_not_pattern(cfg: Any) -> None:
+    data = yaml.safe_load(build_config_fragment(cfg))
+    for pattern in data["gdpr_checker"]["custom_patterns"]:
+        assert "field" in pattern
+        assert "pattern" not in pattern
 
 
 def test_config_fragment_has_provenance_comment(cfg: Any) -> None:
@@ -245,8 +376,17 @@ def test_config_fragment_has_provenance_comment(cfg: Any) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Artifacts: determinism + drift check
+# Artifact set: determinism, drift, deployable form
 # --------------------------------------------------------------------------- #
+
+
+def test_generated_paths_are_four_artifacts(cfg: Any) -> None:
+    paths = generated_paths(cfg)
+    assert len(paths) == 4
+    assert paths[0].name == CONFIG_FRAGMENT_NAME
+    assert paths[1].name == PIPELINE_TEMPLATE_NAME.format(pipeline=cfg.pipeline_name)
+    assert paths[2].name == ISM_POLICY_FILE.format(policy=cfg.ism_policy_name)
+    assert paths[3].name == INDEX_TEMPLATE_FILE.format(template=cfg.index_template_name)
 
 
 def test_render_is_deterministic() -> None:
@@ -254,8 +394,38 @@ def test_render_is_deterministic() -> None:
     first = render_artifacts(cfg)
     second = render_artifacts(cfg)
     assert first == second
-    paths = generated_paths(cfg)
-    assert set(first) == {str(paths[0]), str(paths[1])}
+    assert set(first) == {str(p) for p in generated_paths(cfg)}
+
+
+def test_render_artifacts_are_template_form(cfg: Any) -> None:
+    """The committed artifact set is secret-free: pipeline params.salt == __SALT__,
+    ISM/template included, config fragment carries the provenance comment."""
+    contents = render_artifacts(cfg)
+    assert set(contents) == {str(p) for p in generated_paths(cfg)}
+    pipeline = json.loads(
+        contents[str(generated_paths(cfg)[1])]
+    )
+    assert pipeline["processors"][0]["script"]["params"] == {"salt": "__SALT__"}
+    ism = json.loads(contents[str(generated_paths(cfg)[2])])
+    assert ism["policy"]["states"][0]["name"] == "hot"
+    template = json.loads(contents[str(generated_paths(cfg)[3])])
+    assert template["data_stream"] == {}
+    assert "generated from tenants/test-a/fields.yaml" in contents[str(generated_paths(cfg)[0])]
+
+
+def test_render_deployable_has_real_salt(cfg: Any) -> None:
+    deployable = render_deployable(cfg, "real-secret")
+    pipeline = json.loads(deployable[PIPELINE_TEMPLATE_NAME.format(pipeline=cfg.pipeline_name)])
+    assert pipeline["processors"][0]["script"]["params"] == {"salt": "real-secret"}
+    assert pipeline["_meta"]["generator_version"]
+    # The committed form must differ only in the salt slot.
+    committed = render_artifacts(cfg)
+    committed_pipeline = json.loads(
+        committed[str(generated_paths(cfg)[1])]
+    )
+    assert committed_pipeline["processors"][0]["script"]["params"] != {
+        "salt": "real-secret"
+    }
 
 
 def test_committed_artifacts_match_regeneration() -> None:
@@ -264,33 +434,72 @@ def test_committed_artifacts_match_regeneration() -> None:
     assert check_artifacts(cfg) == []
 
 
-def test_check_artifacts_detects_drift(cfg: Any, tmp_path: Any) -> None:
-    (tmp_path / "tenants" / "test-a" / "generated").mkdir()
-    cfg_path, pipeline_path = generated_paths(cfg)
-    # Regenerated path is repo-root based; force drift by checking the path
-    # that render_artifacts will write (repo root), so simulate with the real
-    # repo tenant instead. Here we only prove the drift is reported when the
-    # committed file differs from regeneration.
+def test_check_artifacts_detects_drift(cfg: Any) -> None:
+    # Nothing committed for the temp tenant -> every artifact is reported MISSING.
     drift = check_artifacts(cfg)
-    assert drift  # nothing committed for the temp tenant -> MISSING reported
+    assert len(drift) == 4
+    assert all("MISSING" in line for line in drift)
+
+
+def test_check_artifacts_detects_content_drift(cfg: Any, tmp_path: Any) -> None:
+    from klaxon_mcp.masking import write_artifacts
+
+    write_artifacts(cfg)
+    assert check_artifacts(cfg) == []
+    (tmp_path / "tenants" / "test-a" / "generated" / CONFIG_FRAGMENT_NAME).write_text(
+        "tampered\n", encoding="utf-8"
+    )
+    drift = check_artifacts(cfg)
+    assert any("DRIFT" in line for line in drift)
 
 
 def test_tenants_in_repo_finds_customer_a() -> None:
-    from klaxon_mcp.generate_masking import main as generate_main
-
-    # The example tenant is committed in the repo.
     assert "customer-a" in tenants_in_repo(Path(__file__).resolve().parents[1])
 
 
-def test_pipeline_has_no_hardcoded_field_logic(cfg: Any) -> None:
-    """Field names must come from the injected FIELDS/FREE_TEXT tables only."""
-    source = build_pipeline_template(cfg)["processors"][0]["script"]["source"]
-    # The literal field names may only appear inside the table declarations.
-    table_start = source.index("def FIELDS = ")
-    table_end = source.index("def FREE_TEXT = ")
-    logic = source[:table_start] + source[table_end:]
-    for field in ("destination.ip", "user.name", "host.hostname"):
-        assert field not in logic
+# --------------------------------------------------------------------------- #
+# Deploy-time salt comparison helpers
+# --------------------------------------------------------------------------- #
+
+
+def test_deployed_pipeline_salt_reads_params(cfg: Any) -> None:
+    assert deployed_pipeline_salt(build_pipeline(cfg, "baked-secret")) == "baked-secret"
+
+
+def test_deployed_pipeline_salt_falls_back_to_legacy_source(cfg: Any) -> None:
+    legacy = {
+        "processors": [
+            {"script": {"lang": "painless", "source": 'def SALT = "old-secret";\n...'}}
+        ]
+    }
+    assert deployed_pipeline_salt(legacy) == "old-secret"
+
+
+def test_deployed_pipeline_salt_none_when_unreadable(cfg: Any) -> None:
+    assert deployed_pipeline_salt({}) is None
+    assert deployed_pipeline_salt({"processors": [{"set": {}}]}) is None
+
+
+def test_check_deployed_salt_match(cfg: Any) -> None:
+    deployed = build_pipeline(cfg, "same-salt")
+    ok, message = check_deployed_salt(deployed, "same-salt")
+    assert ok
+    assert "matches" in message
+    assert "same-salt" not in message  # only a 4-char prefix is shown
+
+
+def test_check_deployed_salt_mismatch(cfg: Any) -> None:
+    deployed = build_pipeline(cfg, "deployed-salt")
+    ok, message = check_deployed_salt(deployed, "current-salt")
+    assert not ok
+    assert "SALT MISMATCH" in message
+    assert "deployed-salt" not in message and "current-salt" not in message
+
+
+def test_check_deployed_salt_unreadable(cfg: Any) -> None:
+    ok, message = check_deployed_salt({}, "anything")
+    assert not ok
+    assert "no readable salt" in message
 
 
 # --------------------------------------------------------------------------- #
@@ -298,13 +507,67 @@ def test_pipeline_has_no_hardcoded_field_logic(cfg: Any) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_generate_masking_check_passes_for_repo() -> None:
-    from klaxon_mcp.generate_masking import main as generate_main
-
+def test_generate_check_passes_for_repo() -> None:
     assert generate_main(["--tenant", "customer-a", "--check"]) == 0
 
 
-def test_generate_masking_check_fails_for_missing_tenant() -> None:
-    from klaxon_mcp.generate_masking import main as generate_main
-
+def test_generate_check_fails_for_missing_tenant() -> None:
     assert generate_main(["--tenant", "does-not-exist", "--check"]) != 0
+
+
+def test_generate_writes_deployable_to_out(cfg: Any, tmp_path: Any) -> None:
+    out_dir = tmp_path / "out"
+    rc = generate_main(
+        ["--tenant", "test-a", "--root", str(tmp_path), "--out", str(out_dir), "--salt", "x"]
+    )
+    assert rc == 0
+    files = sorted(p.name for p in out_dir.iterdir())
+    assert len(files) == 4
+    pipeline = json.loads(
+        (out_dir / PIPELINE_TEMPLATE_NAME.format(pipeline=cfg.pipeline_name)).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert pipeline["processors"][0]["script"]["params"] == {"salt": "x"}
+
+
+def test_generate_stdout_prints_deployable_artifacts(cfg: Any, tmp_path: Any, capsys: Any) -> None:
+    rc = generate_main(
+        ["--tenant", "test-a", "--root", str(tmp_path), "--stdout", "--salt", "x"]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "# ====== klaxon-config.yaml ======" in captured.out
+    assert "# ====== pipeline-klaxon-mask-test-a.json ======" in captured.out
+    assert '"salt": "x"' in captured.out
+    # No files should be written in stdout mode.
+    assert not (tmp_path / "tenants" / "test-a" / "generated").exists()
+
+
+def test_generate_aborts_on_selftest_failure_no_artifacts(
+    cfg: Any, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing the token scheme in derive_token MUST make `generate` abort and
+    emit NO artifacts (the acceptance criterion for the mandatory self-test)."""
+
+    def bad_derive_token(value: str, family: str, salt: str) -> str:
+        digest = hashlib.sha512(f"{family}:{value}:{salt}".encode()).hexdigest()
+        return f"[{family}_{digest[:24]}]"
+
+    monkeypatch.setattr(masking, "derive_token", bad_derive_token)
+    rc = generate_main(["--tenant", "test-a", "--root", str(tmp_path)])
+    assert rc != 0
+    generated = tmp_path / "tenants" / "test-a" / "generated"
+    assert not generated.exists() or not list(generated.iterdir())
+
+
+def test_selftest_main_passes() -> None:
+    assert selftest_main([]) == 0
+
+
+def test_selftest_main_with_tenant_passes() -> None:
+    assert selftest_main(["--tenant", "customer-a"]) == 0
+
+
+def test_selftest_main_fails_on_missing_tenant() -> None:
+    assert selftest_main(["--tenant", "does-not-exist"]) != 0
