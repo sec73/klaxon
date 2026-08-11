@@ -346,6 +346,27 @@ path (e.g. `/tmp/llm_prompts.log`) when you enable anonymization there. If the
 log cannot be written the masking still applies — only the audit trail is lost,
 and the server logs that as an error.
 
+### Known limitations (read before relying on the guarantee)
+
+* **This is pseudonymization, not anonymization.** Tokens are deterministic:
+  the same value always maps to the same token, so an entity is correlatable
+  across responses, and anyone who holds `KLAXON_ANONYMIZATION_SALT` can
+  reverse a token back to the value. Treat masked output as pseudonymous data,
+  not as destroyed data.
+* **The residual gate covers IPs and e-mails only.** `verify()` withholds a
+  response when an IP or e-mail survives masking. A bare username in
+  unrecognised free text (outside the known username formulations and outside a
+  configured field) cannot be detected mechanically and is not a blocking
+  residual — it is the acknowledged blind spot of the text pass.
+* **Masking is per response, with no cross-request state.** Each response is
+  masked independently; there is no session or document-level context carried
+  between calls.
+* **Aggregation keys must be masked too.** Bucket keys of terms/composite
+  aggregations on a configured field are tokenised with the same tokens as
+  `_source` — this is ON by default (fail-closed) and can be turned off with
+  `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS=false`. If you turn it off,
+  aggregation output can carry the raw values the `_source` pass masks.
+
 ---
 
 ## DSGVO plausibility checker
