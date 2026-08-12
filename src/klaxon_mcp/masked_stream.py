@@ -37,20 +37,24 @@ Security notes (read before deploying):
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
 import re
 import secrets
-from dataclasses import dataclass
 from importlib import metadata
-from pathlib import Path
 from typing import Any
 
-import yaml
-
 from . import __version__ as _package_version
+from .tenants import (
+    FieldSpec,
+    TenantConfig,
+    build_config_fragment,
+    fields_yaml_sha256,
+    find_repo_root,
+    find_tenant_dir,
+    load_tenant_config,
+)
 from .tokens import (
     TOKEN_RE as TOKEN_RE,  # noqa: PLC0414 — masked_stream facade re-export
 )
@@ -60,9 +64,39 @@ from .tokens import (
 from .tokens import (
     token as token,  # noqa: PLC0414 — used here and re-exported
 )
-from .validation import validate_tenant
 
 logger = logging.getLogger("klaxon_mcp.masked_stream")
+
+# Explicit re-export for mypy strict: names other modules and tests import from
+# klaxon_mcp.masked_stream.
+__all__ = [
+    "DEFAULT_INITIAL_LOOKBACK_HOURS",
+    "DEFAULT_OVERLAP_HOURS",
+    "DEFAULT_RETENTION_DAYS",
+    "TEMPLATE_PRIORITY",
+    "TOKEN_RE",
+    "_FREETEXT_PATTERN_ORDER",
+    "FieldSpec",
+    "TenantConfig",
+    "build_config_fragment",
+    "build_index_template",
+    "build_ism_policy",
+    "build_pipeline",
+    "build_pipeline_template",
+    "deploy_pipeline",
+    "derive_token",
+    "effective_mask_fields_from_config",
+    "fields_yaml_sha256",
+    "find_repo_root",
+    "find_tenant_dir",
+    "fingerprint_matches",
+    "generator_version",
+    "load_tenant_config",
+    "pipeline_field_names",
+    "pipeline_mask_doc",
+    "resolve_salt",
+    "token",
+]
 
 # --------------------------------------------------------------------------- #
 # Constants (retention/rollover are easy to change here)
@@ -75,14 +109,6 @@ TEMPLATE_PRIORITY = 200
 ISM_PRIORITY = 100
 DEFAULT_OVERLAP_HOURS = 1
 DEFAULT_INITIAL_LOOKBACK_HOURS = 24
-
-# Field names from fields.yaml flow verbatim into the generated Klaxon config
-# fragment (unquoted YAML) and the Painless field table. The charset is what a
-# WCS/ECS dotted field name needs — the absence of ':', '#', quotes, whitespace
-# and control characters is what keeps the generated YAML well-formed.
-_FIELD_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
-
-_FAMILIES = frozenset({"IP", "USER", "HOST", "AGENT"})
 
 # Painless regex source strings. These are ALSO compiled by the Python reference
 # implementation (`pipeline_mask_doc`) so the pipeline logic is unit-testable
@@ -138,190 +164,6 @@ _COMMON_WORDS = frozenset(
 )
 
 
-# --------------------------------------------------------------------------- #
-# Field model
-# --------------------------------------------------------------------------- #
-
-
-@dataclass(frozen=True)
-class FieldSpec:
-    """One masking field from fields.yaml."""
-
-    field: str
-    family: str
-    array: bool = False
-
-    def to_painless_row(self) -> list[Any]:
-        return [self.field, self.family, self.array]
-
-
-@dataclass(frozen=True)
-class TenantConfig:
-    """The single source of truth for one tenant's masking."""
-
-    tenant: str
-    salt_env: str
-    mask_free_text_users: bool
-    fields: tuple[FieldSpec, ...]
-    free_text_fields: tuple[str, ...]
-    source_path: str
-
-    @property
-    def pipeline_name(self) -> str:
-        return f"klaxon-mask-{self.tenant}"
-
-    @property
-    def ism_policy_name(self) -> str:
-        return f"klaxon-masked-retention-{self.tenant}"
-
-    @property
-    def index_template_name(self) -> str:
-        return f"klaxon-masked-{self.tenant}"
-
-    @property
-    def masked_stream(self) -> str:
-        return f"klaxon-masked-{self.tenant}-v5"
-
-    @property
-    def masked_stream_pattern(self) -> str:
-        return f"{self.masked_stream}-*"
-
-    @property
-    def raw_stream(self) -> str:
-        return "wazuh-events-v5-*"
-
-    @property
-    def sync_state_index(self) -> str:
-        return "klaxon-sync-state"
-
-    @property
-    def sync_state_doc_id(self) -> str:
-        return f"klaxon-sync-{self.tenant}"
-
-    @property
-    def all_masked_fields(self) -> tuple[str, ...]:
-        return tuple(f.field for f in self.fields)
-
-    @property
-    def source_rel(self) -> str:
-        """Repo-root-relative source path, for committed/portable artifacts."""
-        return f"tenants/{self.tenant}/fields.yaml"
-
-
-def find_repo_root(start: str | Path | None = None) -> Path:
-    """Locate the repo root by walking up from `start` (default: cwd) to the
-    nearest ancestor that contains a `tenants/` directory (the Option B marker).
-
-    Falls back to `start`/cwd if no ancestor qualifies. The lookup is
-    independent of where the package is installed, so it works both from the
-    `src/` layout and from a site-packages install (e.g. `pip install .` in
-    CI, where `__file__` lives outside the checkout).
-    """
-    current = Path(start or Path.cwd()).resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / "tenants").is_dir():
-            return candidate
-    return current
-
-
-def find_tenant_dir(tenant: str, root: str | Path | None = None) -> Path:
-    """The `tenants/<tenant>` directory (repo root by default).
-
-    The tenant name is validated here — the single choke point before it is
-    used as a path component, a resource name and an index-pattern component
-    everywhere downstream (`klaxon-mask-<tenant>`, `klaxon-masked-<tenant>-v5-*`,
-    sync-state doc id, ...).
-    """
-    base = Path(root) if root is not None else find_repo_root()
-    return base / "tenants" / validate_tenant(tenant)
-
-
-def _validate_field_name(field: str, path: str) -> None:
-    """Reject a field name that could break the generated YAML/Painless output."""
-    if not _FIELD_NAME_RE.match(field):
-        raise ValueError(
-            f"invalid field name {field!r} in {path}: permitted charset is "
-            "[A-Za-z0-9_.@-] (dotted ECS-style names, e.g. 'source.ip', "
-            "'@timestamp')."
-        )
-
-
-def load_tenant_config(
-    tenant: str, root: str | Path | None = None
-) -> TenantConfig:
-    """Parse and validate `tenants/<tenant>/fields.yaml`."""
-    tenant_dir = find_tenant_dir(tenant, root)
-    path = tenant_dir / "fields.yaml"
-    if not path.exists():
-        raise FileNotFoundError(
-            f"missing masking source of truth: {path}. Create it first."
-        )
-    with open(path, "r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
-
-    if data.get("tenant") != tenant:
-        raise ValueError(
-            f"tenants/{tenant}/fields.yaml must declare tenant: {tenant!r}, "
-            f"got {data.get('tenant')!r}"
-        )
-    salt_env = str(data.get("salt_env", "KLAXON_ANONYMIZATION_SALT"))
-    mask_free_text_users = bool(data.get("mask_free_text_users", True))
-
-    fields: list[FieldSpec] = []
-    seen: set[str] = set()
-    for entry in data.get("fields", []):
-        if not isinstance(entry, dict) or not isinstance(entry.get("field"), str):
-            raise ValueError(f"invalid field entry in {path}: {entry!r}")
-        field = entry["field"]
-        _validate_field_name(field, str(path))
-        if field in seen:
-            raise ValueError(f"duplicate field {field!r} in {path}")
-        seen.add(field)
-        family = str(entry.get("family", "USER")).upper()
-        if family not in _FAMILIES:
-            raise ValueError(f"field {field!r}: unknown family {family!r}")
-        if field == "related.hash":
-            # File hashes are security IOCs, not personal data. Hard-refuse.
-            raise ValueError(
-                f"field {field!r} is intentionally not maskable (IOC); remove it "
-                "from fields.yaml."
-            )
-        fields.append(
-            FieldSpec(field=field, family=family, array=bool(entry.get("array", False)))
-        )
-
-    free_text_fields: list[str] = []
-    for entry in data.get("free_text_fields", []):
-        if not isinstance(entry, dict) or not isinstance(entry.get("field"), str):
-            raise ValueError(f"invalid free_text_fields entry in {path}: {entry!r}")
-        field = entry["field"]
-        _validate_field_name(field, str(path))
-        if field in seen:
-            raise ValueError(f"{field!r} listed as both field and free_text_field")
-        free_text_fields.append(field)
-
-    if not fields:
-        raise ValueError(f"{path} declares no fields")
-
-    return TenantConfig(
-        tenant=tenant,
-        salt_env=salt_env,
-        mask_free_text_users=mask_free_text_users,
-        fields=tuple(fields),
-        free_text_fields=tuple(free_text_fields),
-        source_path=str(path),
-    )
-
-
-def fields_yaml_sha256(cfg: TenantConfig) -> str:
-    """sha256 of the fields.yaml source file (the provenance fingerprint)."""
-    digest = hashlib.sha256()
-    with open(cfg.source_path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def generator_version() -> str:
     """The Klaxon package version stamped into generated artifacts' provenance.
 
@@ -356,55 +198,6 @@ def resolve_salt(salt_env: str = "KLAXON_ANONYMIZATION_SALT") -> str:
         salt_env,
     )
     return generated
-
-
-# --------------------------------------------------------------------------- #
-# Klaxon config fragment
-# --------------------------------------------------------------------------- #
-
-
-def _gdpr_kind(family: str) -> str:
-    return {
-        "IP": "IP_ADDRESS",
-        "USER": "USERNAME",
-        "HOST": "HOSTNAME",
-        "AGENT": "AGENT_ID",
-    }[family]
-
-
-def _gdpr_priority(family: str) -> str:
-    return "high" if family in {"IP", "USER"} else "medium"
-
-
-def build_config_fragment(cfg: TenantConfig) -> str:
-    """The Klaxon `anonymization:` + `gdpr_checker:` YAML fragment for a tenant.
-
-    Deterministic: same fields.yaml -> same fragment.
-    """
-    mask_fields = "\n".join(f"    - {f.field}" for f in cfg.fields)
-    custom = "\n".join(
-        f"    - field: {f.field}\n      type: {_gdpr_kind(f.family)}\n"
-        f"      priority: {_gdpr_priority(f.family)}"
-        for f in cfg.fields
-    )
-    free_text = "\n".join(f"    - {f}" for f in cfg.free_text_fields)
-    sha = fields_yaml_sha256(cfg)
-    return (
-        f"# generated from {cfg.source_rel} (sha256: {sha})\n"
-        f"# Hand-edit only via {cfg.source_rel} + "
-        "`klaxon masking generate`. CI enforces this.\n"
-        "anonymization:\n"
-        "  mask_aggregation_keys: true\n"
-        f"  mask_free_text_users: {str(cfg.mask_free_text_users).lower()}\n"
-        "  mask_fields:\n"
-        f"{mask_fields}\n"
-        "  masked_streams:\n"
-        f"    - {cfg.masked_stream_pattern}\n"
-        + (f"  mask_free_text_fields:\n{free_text}\n" if free_text else "")
-        + "gdpr_checker:\n"
-        "  custom_patterns:\n"
-        f"{custom}\n"
-    )
 
 
 # --------------------------------------------------------------------------- #
