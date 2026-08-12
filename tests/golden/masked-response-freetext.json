@@ -1,0 +1,127 @@
+{
+  "took": 12,
+  "hits": {
+    "total": {
+      "value": 2,
+      "relation": "eq"
+    },
+    "hits": [
+      {
+        "_index": "wazuh-events-v5-*",
+        "_id": "doc1",
+        "_source": {
+          "@timestamp": "2026-08-12T10:00:00Z",
+          "user": {
+            "name": "[USER_48b2ae95c14b03db]",
+            "id": "[USER_d49fc81aa4a7fc4d]",
+            "effective": {
+              "name": "[USER_6eef36d61eb9ccd2]"
+            }
+          },
+          "source": {
+            "ip": "[IP_35fb288370686e3c]",
+            "address": "[IP_35fb288370686e3c]",
+            "domain": "[HOST_5c1738acd2ebf303]"
+          },
+          "destination": {
+            "ip": "[IP_3ceb0fa852b7f5e4]"
+          },
+          "related": {
+            "user": [
+              "alice",
+              "bob"
+            ],
+            "hosts": [
+              "host-a",
+              "host-b"
+            ],
+            "hash": [
+              "abc123def456"
+            ]
+          },
+          "host": {
+            "hostname": "[HOST_aaa52efeb8357afb]"
+          },
+          "agent": {
+            "id": "[AGENT_d6cdf4e036f376be]"
+          },
+          "client": {
+            "user": {
+              "name": "[USER_1c74a31f210e350a]"
+            }
+          },
+          "event": {
+            "original": "Aug 12 [IP_95cca1a8535acb47] web-01 sshd[1234]: Accepted publickey for [USER_48b2ae95c14b03db] from [IP_35fb288370686e3c] port 22 ssh2"
+          },
+          "message": "user [USER_48b2ae95c14b03db] logged in as [USER_48b2ae95c14b03db](uid=1001) from [IP_35fb288370686e3c]; contact [EMAIL_001f07de3c40b09f]",
+          "log": {
+            "logger": "sshd"
+          }
+        }
+      },
+      {
+        "_index": "wazuh-events-v5-*",
+        "_id": "doc2",
+        "_source": {
+          "@timestamp": "2026-08-12T10:05:00Z",
+          "user": {
+            "name": "[USER_fc0491da16d40b68]"
+          },
+          "source": {
+            "ip": "[IP_ad5550625c41e939]"
+          },
+          "related": {
+            "user": [
+              "bob"
+            ],
+            "hosts": [
+              "host-c"
+            ]
+          },
+          "event": {
+            "original": "[EMAIL_cacfff768879a259] ran command ls -la"
+          }
+        }
+      }
+    ]
+  },
+  "aggregations": {
+    "top_users": {
+      "doc_count_error_upper_bound": 0,
+      "sum_other_doc_count": 5,
+      "buckets": [
+        {
+          "key": "alice",
+          "doc_count": 10
+        },
+        {
+          "key": "bob",
+          "doc_count": 4
+        }
+      ]
+    },
+    "by_host": {
+      "buckets": {
+        "host-a": {
+          "doc_count": 3
+        },
+        "host-b": {
+          "doc_count": 2
+        }
+      }
+    },
+    "user_sessions": {
+      "after_key": {
+        "related.user": "carol"
+      },
+      "buckets": [
+        {
+          "key": {
+            "related.user": "alice"
+          },
+          "doc_count": 6
+        }
+      ]
+    }
+  }
+}
