@@ -40,164 +40,61 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 
+from .live_config import (
+    DEFAULT_TEST_SALT,
+    ENV_FILE_CANDIDATES,
+    LIVE_ENV_NAMES,
+    LIVE_ENV_PASSWORD,
+    LIVE_ENV_URL,
+    LIVE_ENV_USER,
+    LIVE_ENV_VERIFY_SSL,
+    LiveIndexerConfig,
+    LiveTestError,
+    _env_bool,
+    _url_has_embedded_credentials,
+    find_env_file,
+    live_salt,
+    load_dotenv_file,
+    resolve_live_config,
+    safe_url,
+)
 from .masked_stream import build_pipeline, load_tenant_config, token
 from .masking import verify_script_structure
 
-# The credential env vars — the ONLY source of live-test credentials.
-LIVE_ENV_URL = "KLAXON_INDEXER_URL"
-LIVE_ENV_USER = "KLAXON_INDEXER_USER"
-LIVE_ENV_PASSWORD = "KLAXON_INDEXER_PASSWORD"
-LIVE_ENV_NAMES: tuple[str, ...] = (LIVE_ENV_URL, LIVE_ENV_USER, LIVE_ENV_PASSWORD)
-
-# Optional, NON-credential TLS knob (default true = verify, the secure default;
-# mirror of the WAZUH_VERIFY_SSL used by the main clients). Set false only for
-# a self-signed lab cluster — the test warns. The skip gate depends ONLY on the
-# three credential vars above.
-LIVE_ENV_VERIFY_SSL = "KLAXON_INDEXER_VERIFY_SSL"
-
-# Local dotenv candidates (both gitignored; never committed).
-ENV_FILE_CANDIDATES: tuple[str, ...] = (".env.live", "tests/live/.env")
-
-# Salt for the live run when neither `--salt` nor the env salt is set. Expected
-# tokens are derived in-process with the SAME salt, so any value is deterministic;
-# the env salt is preferred so the test mirrors what the operator deploys.
-DEFAULT_TEST_SALT = "klaxon-masking-live-test-fixed"
+# Explicit re-export for mypy strict: names tests access via `live_test.X`.
+__all__ = [
+    "DEFAULT_TEST_SALT",
+    "ENV_FILE_CANDIDATES",
+    "LIVE_ENV_NAMES",
+    "LIVE_ENV_PASSWORD",
+    "LIVE_ENV_URL",
+    "LIVE_ENV_USER",
+    "LIVE_ENV_VERIFY_SSL",
+    "LiveIndexerConfig",
+    "LiveTestError",
+    "_env_bool",
+    "_url_has_embedded_credentials",
+    "check_simulated",
+    "find_env_file",
+    "live_salt",
+    "live_test_docs",
+    "load_dotenv_file",
+    "missing_ingest_members",
+    "resolve_live_config",
+    "safe_url",
+    "stage_a_ingest_allowlist",
+    "stage_b_simulate",
+    "test_main",
+]
 
 _TIMEOUT = 60.0
 
-
-@dataclass(frozen=True)
-class LiveIndexerConfig:
-    """Resolved indexer credentials (never serialised, never logged)."""
-
-    url: str
-    user: str
-    password: str
-    # TLS verification for the test connection; False only for self-signed labs.
-    verify_ssl: bool = True
-
-
-class LiveTestError(RuntimeError):
-    """A hard failure while talking to the live indexer (never carries secrets)."""
-
-
-# --------------------------------------------------------------------------- #
-# Credential resolution (env / local .env) — no secrets are ever printed
-# --------------------------------------------------------------------------- #
-
-
-def load_dotenv_file(path: str | Path) -> None:
-    """Parse a `KEY=VALUE` file into the environment WITHOUT overriding existing
-    vars (env wins). Blank lines and `#` comments are ignored; an optional
-    `export ` prefix and surrounding quotes are stripped. Values are never
-    printed here or anywhere in this module."""
-    for raw in Path(path).read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :].strip()
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
-def find_env_file(override: str | Path | None = None) -> Path | None:
-    """The local credentials file to load, or None. Explicit `--env FILE` wins;
-    otherwise the first existing gitignored candidate."""
-    if override:
-        p = Path(override)
-        return p if p.is_file() else None
-    for candidate in ENV_FILE_CANDIDATES:
-        p = Path(candidate)
-        if p.is_file():
-            return p
-    return None
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    """Parse a boolean env var; unrecognised values fall back to `default`."""
-    raw = os.environ.get(name, "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def _url_has_embedded_credentials(url: str) -> bool:
-    parts = urlsplit(url)
-    return parts.username is not None or parts.password is not None
-
-
-def safe_url(url: str) -> str:
-    """Strip any userinfo so a URL with embedded credentials is never logged."""
-    parts = urlsplit(url)
-    if parts.username is None and parts.password is None:
-        return url
-    host = parts.hostname or ""
-    if parts.port is not None:
-        host = f"{host}:{parts.port}"
-    return f"{parts.scheme}://{host}{parts.path or ''}"
-
-
-def resolve_live_config(
-    env_file: str | Path | None = None,
-) -> tuple[LiveIndexerConfig | None, tuple[str, ...]]:
-    """Resolve the live-test credentials.
-
-    Loads the local dotenv (if present), then reads the three `KLAXON_INDEXER_*`
-    vars. Returns `(None, missing_names)` — never the password — when any of the
-    three is unset, so callers can skip cleanly instead of failing the suite.
-    """
-    dotenv_path = find_env_file(env_file)
-    if dotenv_path is not None:
-        load_dotenv_file(dotenv_path)
-    missing = tuple(
-        name for name in LIVE_ENV_NAMES if not os.environ.get(name, "").strip()
-    )
-    if missing:
-        return None, missing
-    return (
-        LiveIndexerConfig(
-            url=os.environ[LIVE_ENV_URL].strip(),
-            user=os.environ[LIVE_ENV_USER].strip(),
-            password=os.environ[LIVE_ENV_PASSWORD],
-            verify_ssl=_env_bool(LIVE_ENV_VERIFY_SSL, default=True),
-        ),
-        (),
-    )
-
-
-def live_salt(
-    cfg: Any, explicit: str | None = None, salt_env_override: str | None = None
-) -> str:
-    """The salt the live run derives expected tokens with: `--salt`, else the
-    env salt (`salt_env` from fields.yaml), else a fixed test salt. Never warns
-    (a random salt warning only matters when one is baked into a deployable)."""
-    if explicit:
-        return explicit
-    name = salt_env_override or cfg.salt_env
-    env = os.environ.get(name, "").strip()
-    return env or DEFAULT_TEST_SALT
-
-
-# --------------------------------------------------------------------------- #
-# Stage A — ingest Painless allowlist preflight
-# --------------------------------------------------------------------------- #
 #
 # `_scripts/painless/_execute` only supports the painless_test/filter/score
 # contexts, which do NOT carry the ingest-context allowlist (e.g. the
