@@ -1,0 +1,54 @@
+{
+  "description": "Mask personal data into klaxon-masked-customer-a-v5-* (generated from tenants/customer-a/fields.yaml).",
+  "version": 1,
+  "processors": [
+    {
+      "script": {
+        "lang": "painless",
+        "source": "// Generated from tenants/customer-a/fields.yaml \u2014 do not edit by hand.\n// klaxon-mask-customer-a: deterministic masking for klaxon-masked-customer-a-v5-*.\n\n// ---- Functions first. Painless requires EVERY function declaration to precede\n// any top-level statement, and functions can only read their parameters, local\n// variables and other functions (NOT `params`, NOT top-level defs) \u2014 so all\n// shared data (salt, field table) is threaded in from the main logic. ----\n\nString sha256hex(String input) {\n    // SHA-256 via the ingest String augmentation; first 16 hex chars of the\n    // digest (byte-identical to MessageDigest \"SHA-256\").\n    return input.sha256().substring(0, 16);\n}\n\nString token(String family, String value, String SALT) {\n    if (value == null) return value;\n    if (value.isEmpty()) return value;  // empty stays empty, mirrors derive_token\n    if (TOKEN_RE().matcher(value).matches()) return value;  // idempotent\n    return \"[\" + family + \"_\" + sha256hex(family + \":\" + value + \":\" + SALT) + \"]\";\n}\n\nPattern TOKEN_RE() {\n    // Already-tokenised values are passed through unchanged (idempotency).\n    return /^\\[(?:IP|USER|HOST|AGENT)_[0-9a-f]{16}\\]$/;\n}\n\nString maskPattern(Pattern p, String text, String family, String SALT) {\n    if (text == null) return text;\n    Matcher m = p.matcher(text);\n    int last = 0;\n    StringBuilder out = new StringBuilder();\n    while (m.find()) {\n        out.append(text.substring(last, m.start()));\n        // Value-type patterns (EMAIL/IPV6/IPV4) have no capturing group; ask for\n        // the whole match then. Calling group(1) on a group-less pattern THROWS\n        // \"No group 1\" in Java, so guard with groupCount() (mirrors the Python\n        // twin's `m.lastindex` check).\n        String matched = (m.groupCount() >= 1 && m.group(1) != null) ? m.group(1) : m.group(0);\n        out.append(token(family, matched, SALT));\n        last = m.end();\n    }\n    out.append(text.substring(last));\n    return out.toString();\n}\n\nboolean isWordChar(int c) {\n    // Mirrors Java/Painless `\\w` for word-boundary decisions (ASCII codes:\n    // a-z, A-Z, 0-9, _). `text.charAt(...)` (a char) widens to int implicitly.\n    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90)\n        || (c >= 48 && c <= 57) || c == 95;\n}\n\nString replaceWordBoundary(String text, String needle, String replacement) {\n    // Manual word-boundary find+replace: no Pattern.compile / replaceAll needed\n    // (neither is whitelisted on restricted clusters). Equivalent to replacing\n    // every `(?<!\\w)needle(?!\\w)` occurrence, left to right.\n    if (needle.isEmpty()) return text;\n    StringBuilder sb = new StringBuilder();\n    int i = 0;\n    while (true) {\n        int idx = text.indexOf(needle, i);\n        if (idx < 0) { sb.append(text.substring(i)); break; }\n        int end = idx + needle.length();\n        boolean leftOk = idx == 0 || !isWordChar(text.charAt(idx - 1));\n        boolean rightOk = end >= text.length() || !isWordChar(text.charAt(end));\n        if (leftOk && rightOk) {\n            sb.append(text.substring(i, idx));\n            sb.append(replacement);\n        } else {\n            sb.append(text.substring(i, end));\n        }\n        i = end;\n    }\n    return sb.toString();\n}\n\nString maskRegistry(String text, Map source, List FIELDS, String SALT) {\n    if (text == null) return text;\n    String out = text;\n    for (def entry : FIELDS) {\n        if (entry[1] != \"USER\") continue;\n        String f = entry[0];\n        if (!source.containsKey(f)) continue;\n        def v = source.get(f);\n        List vals = new ArrayList();\n        if (v instanceof List) { for (item in v) { if (item instanceof String) vals.add(item); } }\n        else if (v instanceof String) vals.add(v);\n        for (raw in vals) {\n            String rawStr = (String) raw;\n            if (rawStr.length() < 2) continue;\n            String tok = token(\"USER\", rawStr, SALT);\n            if (tok == rawStr) continue; // already a token, nothing to do\n            out = replaceWordBoundary(out, rawStr, tok);\n        }\n    }\n    return out;\n}\n\nString maskFreeText(String text, Map source, List FIELDS, String SALT) {\n    if (text == null) return text;\n    String out = text;\n    // Known identities first, so free text reuses the exact structured token.\n    out = maskRegistry(out, source, FIELDS, SALT);\n        out = maskPattern(EMAIL(), out, \"EMAIL\", SALT);\n        out = maskPattern(IPV6(), out, \"IP\", SALT);\n        out = maskPattern(IPV4(), out, \"IP\", SALT);\n        out = maskPattern(USER_NOUN(), out, \"USER\", SALT);\n        out = maskPattern(USER_AUTH(), out, \"USER\", SALT);\n        out = maskPattern(UID_EQ(), out, \"USER\", SALT);\n        out = maskPattern(FOR_USER(), out, \"USER\", SALT);\n        out = maskPattern(SSH_PUBKEY(), out, \"USER\", SALT);\n        out = maskPattern(UID_PAREN(), out, \"USER\", SALT);\n    return out;\n}\n\n// Free-text regexes as Pattern functions (regex literals). The free-text pass\n// references them by name; functions may call functions regardless of order, so\n// these live with the other functions.\nPattern EMAIL() { return /(?i)\\b[A-Za-z0-9._%+-]++@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b/; }\nPattern IPV6() { return /(?i)\\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{0,4}\\b/; }\nPattern IPV4() { return /(?i)\\b(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(?:\\.(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}\\b/; }\nPattern USER_NOUN() { return /(?i)\\b(?:user|username|user[-_ ]?name|account)\\b\\s*(?:name)?\\s*[:=]\\s*(?:\\\"|'|`)?([\\w.@%+=-]{2,64})/; }\nPattern USER_AUTH() { return /(?i)\\b(?:login|logon|sign[- ]?in|authenticat(?:e|ed|ion))\\b\\s+(?:as|for|by)\\s+(?:\\buser\\b\\s+)?([\\w.@%+=-]{2,64})\\b/; }\nPattern UID_EQ() { return /(?i)\\buid\\s*=\\s*([^\\W\\d_][\\w.@%+=-]{1,63})\\b/; }\nPattern FOR_USER() { return /(?i)\\b(?:for|by)\\s+user\\s+([\\w.@%+=-]{2,64})\\b/; }\nPattern SSH_PUBKEY() { return /(?i)\\bAccepted\\s+publickey\\s+for\\s+([\\w.@%+=-]{2,64})\\b/; }\nPattern UID_PAREN() { return /(?i)\\b(?:by|as|for)\\s+([\\w.@%+=-]{2,64})\\s*\\(\\s*uid\\s*=\\s*\\d+\\s*\\)/; }\n\n// ---- Top-level definitions (functions first, then statements). The salt is\n// read from params.salt so it is never embedded in the source. ----\n\ndef SALT = params.salt;  // injected as the script processor's params.salt\ndef FIELDS = [\n    [\"destination.ip\", \"IP\", false],\n    [\"source.ip\", \"IP\", false],\n    [\"source.address\", \"IP\", false],\n    [\"user.name\", \"USER\", false],\n    [\"user.id\", \"USER\", false],\n    [\"user.effective.name\", \"USER\", false],\n    [\"client.user.name\", \"USER\", false],\n    [\"host.hostname\", \"HOST\", false],\n    [\"source.domain\", \"HOST\", false],\n    [\"url.domain\", \"HOST\", false],\n    [\"event.dataset\", \"HOST\", false],\n    [\"log.logger\", \"HOST\", false],\n    [\"wazuh.agent.id\", \"AGENT\", false],\n    [\"wazuh.agent.name\", \"HOST\", false],\n    [\"wazuh.agent.host.hostname\", \"HOST\", false],\n    [\"event.original\", \"USER\", false],\n    [\"related.ip\", \"IP\", true],\n    [\"related.user\", \"USER\", true],\n    [\"related.hosts\", \"HOST\", true]\n];\ndef FREE_TEXT = [\n    \"message\"\n];\n\n// ---- Main logic. In an ingest script processor `ctx` IS the document (the\n// root map) \u2014 there is no nested `_source` object. ----\n\nMap masked = new HashMap();\nfor (key in ctx.keySet()) { masked.put(key, ctx.get(key)); }\n\nfor (def entry : FIELDS) {\n    String f = entry[0];\n    String family = entry[1];\n    boolean array = entry[2];\n    if (!masked.containsKey(f)) continue;            // missing field: no-op\n    def v = masked.get(f);\n    if (array) {\n        if (v instanceof List) {\n            List out = new ArrayList();\n            for (item in v) {\n                if (item instanceof String) out.add(token(family, item, SALT));\n                else out.add(item);\n            }\n            masked.put(f, out);\n        }\n    } else {\n        if (v instanceof String) masked.put(f, token(family, v, SALT));\n    }\n}\n\nfor (f in FREE_TEXT) {\n    if (masked.containsKey(f) && masked.get(f) instanceof String) {\n        // Registry reads the RAW original source: free text must re-tokenise the\n        // same raw username to the exact structured token.\n        masked.put(f, maskFreeText(masked.get(f), ctx, FIELDS, SALT));\n    }\n}\n\n// Commit atomically: only on full success does the document change. A failure is\n// caught by the on_failure processor, which flags klaxon.masking_error and keeps\n// the (original) document so it can be filtered and fixed.\nctx.clear();\nctx.putAll(masked);\n",
+        "params": {
+          "salt": "golden-master-salt-0123456789abcdef"
+        },
+        "on_failure": [
+          {
+            "set": {
+              "field": "klaxon.masking_error",
+              "value": "{{ _ingest.on_failure_message }}"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "_meta": {
+    "source": "tenants/customer-a/fields.yaml",
+    "sha256": "00111554153d094cb7f5f004040b3c2f9f5a8251e44593a7400420dfd1c078f4",
+    "tenant": "customer-a",
+    "generator_version": "0.1.7",
+    "generated_by": "klaxon masking generate",
+    "fields": [
+      "destination.ip",
+      "source.ip",
+      "source.address",
+      "user.name",
+      "user.id",
+      "user.effective.name",
+      "client.user.name",
+      "host.hostname",
+      "source.domain",
+      "url.domain",
+      "event.dataset",
+      "log.logger",
+      "wazuh.agent.id",
+      "wazuh.agent.name",
+      "wazuh.agent.host.hostname",
+      "event.original",
+      "related.ip",
+      "related.user",
+      "related.hosts"
+    ],
+    "free_text_fields": [
+      "message"
+    ]
+  }
+}

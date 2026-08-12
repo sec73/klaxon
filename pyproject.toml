@@ -22,6 +22,10 @@ dependencies = [
     # Optional YAML config file for the anonymization block (KLAXON_CONFIG).
     # The import is guarded, so the feature degrades gracefully without it.
     "pyyaml>=6.0,<7",
+    # Direct API import in transport.py (CORSMiddleware for the HTTP transport).
+    # mcp pulls starlette in transitively, but the direct import must not rely
+    # on that graph — declared here with the same deliberate upper-bound policy.
+    "starlette>=1.3.1,<2",
 ]
 
 [project.urls]

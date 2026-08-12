@@ -1,0 +1,49 @@
+{
+  "@timestamp": "2026-08-12T10:00:00Z",
+  "agent": {
+    "id": "agent-7"
+  },
+  "client": {
+    "user": {
+      "name": "carol"
+    }
+  },
+  "destination": {
+    "ip": "10.20.30.4"
+  },
+  "event": {
+    "original": "Aug 12 10:00:01 web-01 sshd[1234]: Accepted publickey for alice from 192.168.1.50 port 22 ssh2"
+  },
+  "host": {
+    "hostname": "web-01"
+  },
+  "log": {
+    "logger": "sshd"
+  },
+  "message": "user alice logged in [USER_c181a03989488ea5] from [IP_a11346ee93024d5c]; contact [EMAIL_ff6d33ebe4c8578c]",
+  "related": {
+    "hash": [
+      "abc123def456"
+    ],
+    "hosts": [
+      "host-a",
+      "host-b"
+    ],
+    "user": [
+      "alice",
+      "bob"
+    ]
+  },
+  "source": {
+    "address": "192.168.1.50",
+    "domain": "internal.example",
+    "ip": "192.168.1.50"
+  },
+  "user": {
+    "effective": {
+      "name": "alice(uid=1001)"
+    },
+    "id": 1001,
+    "name": "alice"
+  }
+}

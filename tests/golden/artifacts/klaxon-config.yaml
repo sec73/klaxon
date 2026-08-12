@@ -1,0 +1,88 @@
+# generated from tenants/customer-a/fields.yaml (sha256: 00111554153d094cb7f5f004040b3c2f9f5a8251e44593a7400420dfd1c078f4)
+# Hand-edit only via tenants/customer-a/fields.yaml + `klaxon masking generate`. CI enforces this.
+anonymization:
+  mask_aggregation_keys: true
+  mask_free_text_users: true
+  mask_fields:
+    - destination.ip
+    - source.ip
+    - source.address
+    - user.name
+    - user.id
+    - user.effective.name
+    - client.user.name
+    - host.hostname
+    - source.domain
+    - url.domain
+    - event.dataset
+    - log.logger
+    - wazuh.agent.id
+    - wazuh.agent.name
+    - wazuh.agent.host.hostname
+    - event.original
+    - related.ip
+    - related.user
+    - related.hosts
+  masked_streams:
+    - klaxon-masked-customer-a-v5-*
+  mask_free_text_fields:
+    - message
+gdpr_checker:
+  custom_patterns:
+    - field: destination.ip
+      type: IP_ADDRESS
+      priority: high
+    - field: source.ip
+      type: IP_ADDRESS
+      priority: high
+    - field: source.address
+      type: IP_ADDRESS
+      priority: high
+    - field: user.name
+      type: USERNAME
+      priority: high
+    - field: user.id
+      type: USERNAME
+      priority: high
+    - field: user.effective.name
+      type: USERNAME
+      priority: high
+    - field: client.user.name
+      type: USERNAME
+      priority: high
+    - field: host.hostname
+      type: HOSTNAME
+      priority: medium
+    - field: source.domain
+      type: HOSTNAME
+      priority: medium
+    - field: url.domain
+      type: HOSTNAME
+      priority: medium
+    - field: event.dataset
+      type: HOSTNAME
+      priority: medium
+    - field: log.logger
+      type: HOSTNAME
+      priority: medium
+    - field: wazuh.agent.id
+      type: AGENT_ID
+      priority: medium
+    - field: wazuh.agent.name
+      type: HOSTNAME
+      priority: medium
+    - field: wazuh.agent.host.hostname
+      type: HOSTNAME
+      priority: medium
+    - field: event.original
+      type: USERNAME
+      priority: high
+    - field: related.ip
+      type: IP_ADDRESS
+      priority: high
+    - field: related.user
+      type: USERNAME
+      priority: high
+    - field: related.hosts
+      type: HOSTNAME
+      priority: medium

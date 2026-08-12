@@ -1,0 +1,113 @@
+# Drift prevention & CI
+
+Option B's safety property depends on the generated artifacts matching
+`fields.yaml` — and on the response layer and the deployed pipeline agreeing on
+the token scheme and the field list. Klaxon enforces this in several places so
+a hand-edit that is not reflected in the source of truth fails loudly instead
+of silently weakening masking.
+
+---
+
+## Contents
+
+- [Where the single source of truth lives](#where-the-single-source-of-truth-lives)
+- [The provenance fingerprint](#the-provenance-fingerprint)
+- [`klaxon masking generate --check`](#klaxon-masking-generate---check)
+- [CI: `verify-masking-config`](#ci-verify-masking-config)
+- [Pre-commit hook](#pre-commit-hook)
+- [Fail-closed startup](#fail-closed-startup)
+- [Sync-job preflight](#sync-job-preflight)
+- [`klaxon verify-config`](#klaxon-verify-config)
+- [The `generator_version` stamping gotcha](#the-generator_version-stamping-gotcha)
+
+---
+
+## Where the single source of truth lives
+
+`tenants/<tenant>/fields.yaml` is the single source of truth (see
+[multi-tenant.md](multi-tenant.md)). Everything else is generated from it: the
+Klaxon config fragment, the ingest pipeline (Painless script), the ISM policy,
+the index template. Source paths in generated artifacts are
+repo-root-relative (`tenants/<tenant>/fields.yaml`), so regeneration is
+byte-identical across machines.
+
+## The provenance fingerprint
+
+Every generated artifact carries `_meta` with:
+
+- the source path (repo-root-relative),
+- `sha256` of the source `fields.yaml`,
+- the tenant name,
+- `generator_version` (the installed package version) and `generated_by`.
+
+This is what the drift checks compare. The `fingerprint_matches` helper
+compares a deployed pipeline's `_meta` against the current `fields.yaml` + the
+effective Klaxon config.
+
+## `klaxon masking generate --check`
+
+The no-write drift check: regenerates the committed artifact set and compares
+it byte-for-byte against `tenants/<tenant>/generated/*`, exiting non-zero on
+any difference. Used by CI, the pre-commit hook and `verify-config`.
+
+```bash
+klaxon masking generate --check
+```
+
+A mismatch is reported as:
+
+```
+<path>: DRIFT — regenerated output differs from the committed file. Edit tenants/<tenant>/fields.yaml and re-run the generator.
+```
+
+## Pre-commit hook
+
+`.pre-commit-config.yaml` registers a local hook (`language: system`, id
+`klaxon-masking-drift`) that runs `python -m klaxon_mcp masking generate --check`
+before every commit, so a regenerated-artifact drift never lands in a commit.
+
+There is no dedicated CI workflow for the masking check in this tree: the drift
+gate is the pre-commit hook plus the `generate --check` command (and
+`verify-config` / the sync preflight for the deployed side). To gate a CI job
+on it, run the same `python -m klaxon_mcp masking generate --check` plus
+`masking selftest --tenant customer-a` and the masking unit tests.
+
+## Fail-closed startup
+
+The response layer refuses to start when it would silently bypass the
+generated config: if both `KLAXON_ANONYMIZATION_MASK_FIELDS` (env) and the YAML
+`mask_fields` are set and differ, `Config.from_env()` raises `ConfigError`
+instead of letting the environment override the file. The environment is the
+known silent-bypass vector against the Option B config. (Precedence is still
+env > YAML when they agree; the guard only fires on a *conflict*.)
+
+Security-critical boolean switches (`KLAXON_ANONYMIZE_EXTERNAL_LLM`,
+`KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS`,
+`KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS`,
+`KLAXON_ANONYMIZATION_WHITELIST_ENABLED`, `KLAXON_ANONYMIZATION_LOG_RAW`) are
+parsed strict: an unrecognised value is a `ConfigError`, so a typo can never
+silently disable masking.
+
+## Sync-job preflight
+
+Before every sync, `sync-masked` fetches the deployed pipeline and compares its
+fingerprint (sha256 of `fields.yaml` + field lists in `_meta`) against the
+current `fields.yaml` and the effective Klaxon config. Any drift aborts the
+sync (`PREFLIGHT FAILED — not syncing`) rather than writing masked data with a
+stale pipeline.
+
+## `klaxon --verify-config`
+`klaxon-mcp --verify-config --tenant X` (or `klaxon --verify-config --tenant X`)
+runs the same checks as the sync preflight as a standalone drift audit (needs
+the indexer): the deployed pipeline must match `fields.yaml` and the effective
+Klaxon config, and the deployed salt must match the current environment salt
+(`klaxon masking salt-check`).
+
+## The `generator_version` stamping gotcha
+
+`generator_version` is part of the committed artifacts. Bumping the package
+version in `pyproject.toml` without re-running
+`klaxon masking generate --tenant customer-a` shows up as CI/pre-commit drift —
+not because the masking changed, but because the provenance stamp changed.
+Regenerate the artifacts (and reinstall the editable package) whenever the
+version bumps, so the stamp matches the installed metadata.

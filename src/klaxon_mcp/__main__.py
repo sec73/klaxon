@@ -440,11 +440,10 @@ def _gdpr_check_once(
     from . import server
     from .config import Config, ConfigError
     from .gdpr import (
-        GdprLog,
+        apply_mask_fields,
         env_hint,
         render_json,
         run_check,
-        update_mask_fields,
         write_compliance_report,
     )
 
@@ -534,13 +533,10 @@ def _gdpr_check_once(
 
     changed = False
     if to_add and not dry_run:
-        changed, merged, warning = update_mask_fields(config.gdpr.config_file, to_add)
-        log = GdprLog(config.gdpr.log_path)
+        changed, merged, warning = apply_mask_fields(
+            config.gdpr.config_file, config.gdpr.log_path, index, to_add
+        )
         if changed:
-            log.write(
-                f'Felder "{", ".join(to_add)}" zur Anonymisierungsliste hinzugefügt '
-                f"(index {index})."
-            )
             print(
                 f"config.yaml updated ({config.gdpr.config_file}): "
                 f"{len(merged)} field(s) in mask_fields. Restart the server to "
@@ -549,7 +545,6 @@ def _gdpr_check_once(
         else:
             print("no fields added (all already configured or write failed).")
         if warning:
-            log.write(f"Warnung: {warning}")
             print(f"warning: {warning}", file=sys.stderr)
 
     report_error = write_compliance_report(
