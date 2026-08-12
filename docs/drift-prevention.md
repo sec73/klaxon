@@ -33,16 +33,20 @@ byte-identical across machines.
 
 ## The provenance fingerprint
 
-Every generated artifact carries `_meta` with:
+The committed artifacts carry `_meta` with:
 
 - the source path (repo-root-relative),
 - `sha256` of the source `fields.yaml`,
 - the tenant name,
 - `generator_version` (the installed package version) and `generated_by`.
 
-This is what the drift checks compare. The `fingerprint_matches` helper
-compares a deployed pipeline's `_meta` against the current `fields.yaml` + the
-effective Klaxon config.
+This is what the drift checks compare. **OpenSearch rejects `_meta` in ingest
+pipelines**, so the deployed pipeline carries the same provenance JSON-encoded
+in its `description` (after a `klaxon-provenance: ` marker) instead. The
+`pipeline_provenance` / `fingerprint_matches` helpers read either form, so a
+deployed pipeline (from `description`) and a committed template (from `_meta`)
+compare against the current `fields.yaml` + the effective Klaxon config the
+same way.
 
 ## `klaxon masking generate --check`
 
@@ -90,11 +94,12 @@ silently disable masking.
 
 ## Sync-job preflight
 
-Before every sync, `sync-masked` fetches the deployed pipeline and compares its
-fingerprint (sha256 of `fields.yaml` + field lists in `_meta`) against the
-current `fields.yaml` and the effective Klaxon config. Any drift aborts the
-sync (`PREFLIGHT FAILED — not syncing`) rather than writing masked data with a
-stale pipeline.
+Before every sync, `--sync-masked` fetches the deployed pipeline and compares
+its fingerprint (sha256 of `fields.yaml` + field lists, carried in the deployed
+pipeline's `description` — OpenSearch rejects `_meta`) against the current
+`fields.yaml` and the effective Klaxon config. Any drift aborts the sync
+(`PREFLIGHT FAILED — not syncing`) rather than writing masked data with a stale
+pipeline.
 
 ## `klaxon --verify-config`
 `klaxon-mcp --verify-config --tenant X` (or `klaxon --verify-config --tenant X`)

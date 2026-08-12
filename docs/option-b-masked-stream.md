@@ -23,7 +23,7 @@ Hard constraints, enforced in code:
 
 ```mermaid
 flowchart LR
-    RAW[wazuh-events-v5-*<br/>raw, never written] -->|sync job reads a window| SYNC[klaxon-mcp sync-masked]
+    RAW[wazuh-events-v5-*<br/>raw, never written] -->|sync job reads a window| SYNC[klaxon-mcp --sync-masked]
     SYNC -->|"_reindex through<br/>klaxon-mask-<tenant>"| MASKED[klaxon-masked-&lt;tenant&gt;-v5-*]
     MASKED -->|queries only| R[reports / LLM]
     MASKED -->|ISM 30d| DEL[delete]
@@ -45,15 +45,20 @@ artifacts from it:
   pipeline **template** (`PUT /_ingest/pipeline/klaxon-mask-<tenant>`). The
   salt lives in the script processor's `params.salt`; the committed file
   carries a `__SALT__` placeholder so the secret never enters version control.
+  The committed template carries the provenance fingerprint as `_meta`; at
+  deploy time that moves into the pipeline's `description` (OpenSearch rejects
+  `_meta` in ingest pipelines), so the deployed pipeline is still drift-checked.
 * `tenants/<tenant>/generated/ism-klaxon-masked-retention-<tenant>.json` — the
   ISM retention policy (`PUT /_plugins/_ism/policies/klaxon-masked-retention-
   <tenant>`): hot (rollover) -> delete after `--retention-days` (default 30).
 * `tenants/<tenant>/generated/index-template-klaxon-masked-<tenant>.json` — the
   index template (`PUT /_index_template/klaxon-masked-<tenant>`):
   `index_patterns: [klaxon-masked-<tenant>-v5-*]`, priority 200,
-  `data_stream: {}`, `index.default_pipeline` + `index.lifecycle.name`. The
-  offline generator omits `mappings`; `apply-masked-infra` fetches them from
-  the Wazuh stream at deploy time.
+  `data_stream: {}`, `index.default_pipeline`. Retention is attached the
+  OpenSearch-native way — the ISM policy's `ism_template` (priority 100)
+  matches the same stream pattern (`index.lifecycle.name` is an Elasticsearch
+  ILM setting OpenSearch rejects). The offline generator omits `mappings`;
+  `--apply-masked-infra` fetches them from the Wazuh stream at deploy time.
 
 Regenerate after editing `fields.yaml`:
 
@@ -99,7 +104,7 @@ fails on a mismatch (tokens would no longer be deterministic across deploys).
 Drift between the committed artifacts and `fields.yaml` is caught by CI
 (`.github/workflows/verify-masking-config.yml`, which also runs
 `klaxon masking selftest`), the pre-commit hook (`.pre-commit-config.yaml`),
-and the `klaxon-mcp verify-config --tenant X` command. All run the same
+and the `klaxon-mcp --verify-config --tenant X` command. All run the same
 `--check` comparison.
 
 ## The pipeline
@@ -139,23 +144,23 @@ hex>]` is never re-masked) leaves them byte-identical. What matters is that
 klaxon masking generate --tenant customer-a
 
 # 2. deploy pipeline (real salt in params.salt), ISM, index template, data stream
-klaxon-mcp apply-masked-infra --tenant customer-a --retention-days 30
+klaxon-mcp --apply-masked-infra --tenant customer-a --retention-days 30
 #    (or PUT the deployable set from `klaxon masking generate --out DIR`)
 
 # 3. merge generated/klaxon-config.yaml into the Klaxon config so the response
 #    layer passes masked-stream tokens through
 
 # 4. first sync (no checkpoint -> 24h lookback)
-klaxon-mcp sync-masked --tenant customer-a
+klaxon-mcp --sync-masked --tenant customer-a
 
 # 5. schedule the sync (e.g. cron/kubernetes CronJob every 5-15 minutes)
-klaxon-mcp sync-masked --tenant customer-a --overlap-hours 1
+klaxon-mcp --sync-masked --tenant customer-a --overlap-hours 1
 ```
 
-`sync-masked` **preflights** before every run and refuses to sync when the
+`--sync-masked` **preflights** before every run and refuses to sync when the
 deployed pipeline's fingerprint or field list no longer matches `fields.yaml`,
 or when the effective Klaxon config masks different fields — a stale pipeline
-would silently write unmasked data. Run `klaxon-mcp verify-config --tenant X`
+would silently write unmasked data. Run `klaxon-mcp --verify-config --tenant X`
 to audit all drift sources at once.
 
 ### The live integration test (`klaxon masking test`)
@@ -178,9 +183,11 @@ Two stages, both write-free:
   its `painless_test` context lacks the ingest-only `sha256` augmentation — so
   Stage B's `_simulate` is the authoritative compile check.
 * **Stage B — pipeline simulate:** `POST /_ingest/pipeline/_simulate` with the
-  generated pipeline **inline** (nothing is deployed or persisted; `_meta` is
-  stripped because the endpoint rejects it). This compiles the script in the
-  ingest context AND asserts the masking: no `klaxon.masking_error`; `user.name`
+  generated pipeline **inline** (nothing is deployed or persisted; `_meta` and
+  `version` are stripped because the endpoint rejects them — the deployable
+  pipeline embeds the same provenance in its `description`). This compiles the
+  script in the ingest context AND asserts the masking: no
+  `klaxon.masking_error`; `user.name`
   and `uid=<same-username>` in `message` share one token; `user.effective.name`
   like `root(uid=0)` masked; `related.user`/`related.hosts` arrays element-wise;
   `event.original` → one token; `related.hash` untouched; already-tokenised
@@ -225,7 +232,7 @@ The ISM policy `klaxon-masked-retention-<tenant>` keeps the masked stream in
 Change retention and redeploy:
 
 ```console
-klaxon-mcp apply-masked-infra --tenant customer-a --retention-days 14
+klaxon-mcp --apply-masked-infra --tenant customer-a --retention-days 14
 ```
 
 The index template (`priority` 200) and ISM template (`priority` 100) match only
@@ -251,8 +258,8 @@ mkdir -p tenants/<tenant>
 # write tenants/<tenant>/fields.yaml (copy customer-a's as a template)
 klaxon masking generate --tenant <tenant>   # runs the mandatory self-test
 klaxon masking salt-check --tenant <tenant> # verify the deployed salt matches the env
-klaxon-mcp apply-masked-infra --tenant <tenant>
-klaxon-mcp sync-masked --tenant <tenant>
+klaxon-mcp --apply-masked-infra --tenant <tenant>
+klaxon-mcp --sync-masked --tenant <tenant>
 ```
 
 ## Security notes
@@ -260,18 +267,20 @@ klaxon-mcp sync-masked --tenant <tenant>
 * **The salt lives in the cluster.** Ingest pipelines cannot read process
   environment at index time, so the salt from `KLAXON_ANONYMIZATION_SALT` is
   baked into the **deployed** pipeline as the script processor's `params.salt`
-  when you deploy the `--out`/`--stdout` artifacts or run `apply-masked-infra`.
-  It is visible to anyone allowed `GET /_ingest/pipeline`. Restrict that
-  permission to administrators; report/LLM consumers must not have it. The
-  committed pipeline *template* carries `params.salt = "__SALT__"`, so the
-  secret never enters git. `klaxon masking salt-check` compares the deployed
-  salt with the current env salt at deploy time.
+  when you deploy the `--out`/`--stdout` artifacts or run
+  `--apply-masked-infra`. It is visible to anyone allowed
+  `GET /_ingest/pipeline`. Restrict that permission to administrators;
+  report/LLM consumers must not have it. The committed pipeline *template*
+  carries `params.salt = "__SALT__"`, so the secret never enters git.
+  `klaxon masking salt-check` compares the deployed salt with the current env
+  salt at deploy time.
 * **`verify-config` needs the indexer.** The drift audit compares the deployed
   pipeline too, so it cannot run without cluster access; the
   `klaxon masking generate --check` artifact comparison can.
-* **Version bumps force regeneration.** The pipeline `_meta.generator_version`
-  is part of the committed artifacts, so bumping the package version without
-  re-running `klaxon masking generate` shows up as drift in CI/pre-commit.
+* **Version bumps force regeneration.** `generator_version` is stamped into
+  the committed artifacts' `_meta` (and, for the deployed pipeline, into its
+  `description`), so bumping the package version without re-running
+  `klaxon masking generate` shows up as drift in CI/pre-commit.
 * **Painless whitelist.** The script uses ONLY whitelisted APIs — the
   ingest-context `String.sha256()` augmentation (SHA-256, byte-identical to
   `MessageDigest`), regex literals for `Pattern`s (`Pattern.compile` is not

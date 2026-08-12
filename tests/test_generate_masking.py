@@ -24,6 +24,7 @@ import yaml
 
 from klaxon_mcp import masking
 from klaxon_mcp.masked_stream import (
+    PROVENANCE_DESCRIPTION_MARKER,
     TEMPLATE_PRIORITY,
     build_config_fragment,
     build_index_template,
@@ -32,8 +33,12 @@ from klaxon_mcp.masked_stream import (
     build_pipeline_template,
     deploy_pipeline,
     derive_token,
+    effective_mask_fields_from_config,
     fields_yaml_sha256,
+    fingerprint_matches,
     load_tenant_config,
+    pipeline_field_names,
+    pipeline_provenance,
     token,
 )
 from klaxon_mcp.masking import (
@@ -395,6 +400,26 @@ def test_deployed_pipeline_bakes_real_salt_in_params(
     assert "real-secret" not in script["source"]
 
 
+def test_deploy_pipeline_omits_meta_and_embeds_provenance(
+    cfg: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OpenSearch rejects `_meta` in ingest pipelines (HTTP 400), so the body
+    PUT to the indexer must NOT carry `_meta`; provenance rides in `description`
+    instead, and the drift checks must still fingerprint the deployed form."""
+    monkeypatch.setenv("KLAXON_ANONYMIZATION_SALT", "real-secret")
+    deployed = deploy_pipeline(cfg)
+    assert "_meta" not in deployed
+    assert PROVENANCE_DESCRIPTION_MARKER in deployed["description"]
+    meta = pipeline_provenance(deployed)
+    assert meta["tenant"] == "test-a"
+    assert meta["sha256"] == fields_yaml_sha256(cfg)
+    assert meta["generator_version"]
+    assert fingerprint_matches(deployed, cfg)
+    assert pipeline_field_names(deployed) == effective_mask_fields_from_config(cfg)
+    # The committed template keeps `_meta` for CI drift.
+    assert "_meta" in build_pipeline_template(cfg)
+
+
 def test_pipeline_never_masks_related_hash(cfg: Any) -> None:
     raw = json.dumps(build_pipeline_template(cfg))
     assert "related.hash" not in raw
@@ -420,7 +445,9 @@ def test_index_template_targets_only_masked_stream(cfg: Any) -> None:
     assert template["data_stream"] == {}
     settings = template["template"]["settings"]
     assert settings["index.default_pipeline"] == "klaxon-mask-test-a"
-    assert settings["index.lifecycle.name"] == "klaxon-masked-retention-test-a"
+    # `index.lifecycle.name` is an Elasticsearch ILM setting that OpenSearch
+    # rejects in index templates; the ISM policy attaches via its `ism_template`.
+    assert "index.lifecycle.name" not in settings
     assert template["template"]["mappings"] == {"properties": {}}
 
 
@@ -542,7 +569,10 @@ def test_render_deployable_has_real_salt(cfg: Any) -> None:
     deployable = render_deployable(cfg, "real-secret")
     pipeline = json.loads(deployable[PIPELINE_TEMPLATE_NAME.format(pipeline=cfg.pipeline_name)])
     assert pipeline["processors"][0]["script"]["params"] == {"salt": "real-secret"}
-    assert pipeline["_meta"]["generator_version"]
+    # The deployable form carries NO `_meta` (OpenSearch rejects it); the
+    # provenance rides in `description` so the deployed pipeline stays drift-checked.
+    assert "_meta" not in pipeline
+    assert pipeline_provenance(pipeline)["generator_version"]
     # The committed form must differ only in the salt slot.
     committed = render_artifacts(cfg)
     committed_pipeline = json.loads(

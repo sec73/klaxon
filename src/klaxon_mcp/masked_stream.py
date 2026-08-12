@@ -37,6 +37,7 @@ Security notes (read before deploying):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -87,6 +88,7 @@ __all__ = [
     "FieldSpec",
     "TenantConfig",
     "build_config_fragment",
+    "build_deployable_pipeline",
     "build_index_template",
     "build_ism_policy",
     "build_pipeline",
@@ -102,6 +104,7 @@ __all__ = [
     "load_tenant_config",
     "pipeline_field_names",
     "pipeline_mask_doc",
+    "pipeline_provenance",
     "resolve_salt",
     "token",
 ]
@@ -117,6 +120,13 @@ TEMPLATE_PRIORITY = 200
 ISM_PRIORITY = 100
 DEFAULT_OVERLAP_HOURS = 1
 DEFAULT_INITIAL_LOOKBACK_HOURS = 24
+
+# OpenSearch ingest pipelines REJECT `_meta` in the PUT body (HTTP 400
+# parse_exception: "doesn't support one or more provided configuration
+# parameters [_meta]"). Provenance therefore rides in the DEPLOYABLE pipeline's
+# `description` after this marker; the committed template keeps `_meta` for CI
+# drift. `pipeline_provenance()` reads either form.
+PROVENANCE_DESCRIPTION_MARKER = "\nklaxon-provenance: "
 
 _COMMON_WORDS = frozenset(
     {
@@ -180,6 +190,11 @@ def build_pipeline(cfg: TenantConfig, salt: str) -> dict[str, Any]:
     enters git). `_meta` carries the provenance fingerprint (source path, sha256
     of fields.yaml, tenant, generator version) plus the field table, which is
     what drift checks (`verify-config`, sync preflight, salt-check) compare.
+
+    OpenSearch rejects `_meta` in ingest pipelines, so the body actually PUT to
+    the indexer is `build_deployable_pipeline()` — same logic, provenance moved
+    into `description`. `_meta` here is the committed/template form used for CI
+    drift.
     """
     sha = fields_yaml_sha256(cfg)
     return {
@@ -222,9 +237,28 @@ def build_pipeline_template(cfg: TenantConfig) -> dict[str, Any]:
     return build_pipeline(cfg, "__SALT__")
 
 
+def build_deployable_pipeline(cfg: TenantConfig, salt: str) -> dict[str, Any]:
+    """The pipeline body PUT to OpenSearch: real salt, NO `_meta`.
+
+    OpenSearch rejects `_meta` in ingest pipelines (HTTP 400 parse_exception), so
+    the provenance that `_meta` carries on the committed template is instead
+    embedded (JSON) in the `description` field after
+    `PROVENANCE_DESCRIPTION_MARKER`. The deployed pipeline stays fingerprintable
+    by `fingerprint_matches` / `pipeline_field_names` via `pipeline_provenance()`.
+    """
+    pipeline = build_pipeline(cfg, salt)
+    meta = pipeline.pop("_meta")
+    pipeline["description"] = (
+        pipeline["description"]
+        + PROVENANCE_DESCRIPTION_MARKER
+        + json.dumps(meta, sort_keys=True, separators=(",", ":"))
+    )
+    return pipeline
+
+
 def deploy_pipeline(cfg: TenantConfig) -> dict[str, Any]:
     """The deployable pipeline with the real salt from the environment."""
-    return build_pipeline(cfg, resolve_salt(cfg.salt_env))
+    return build_deployable_pipeline(cfg, resolve_salt(cfg.salt_env))
 
 
 # --------------------------------------------------------------------------- #
@@ -276,13 +310,19 @@ def build_index_template(
     `mappings` is the `mappings` object copied from the Wazuh events stream (so
     queries behave identically); when omitted (None — the offline generator
     path), the `mappings` key is not emitted and the operator merges them at
-    deploy time (see `apply-masked-infra`, which fetches them from the indexer).
-    Only `klaxon-masked-<tenant>-v5-*` matches — Wazuh streams are never touched.
+    deploy time (see `--apply-masked-infra`, which fetches them from the
+    indexer). Only `klaxon-masked-<tenant>-v5-*` matches — Wazuh streams are
+    never touched.
+
+    The ISM policy is attached the OpenSearch-native way: the policy's
+    `ism_template` (see `build_ism_policy`) auto-applies it to newly created
+    backing indices. `index.lifecycle.name` is intentionally NOT set — it is an
+    Elasticsearch ILM setting that OpenSearch rejects (HTTP 400 "expected
+    [index.lifecycle.name] to be private but it was not").
     """
     template: dict[str, Any] = {
         "settings": {
             "index.default_pipeline": cfg.pipeline_name,
-            "index.lifecycle.name": cfg.ism_policy_name,
             "number_of_shards": 1,
             "number_of_replicas": 1,
         }
@@ -374,9 +414,31 @@ def pipeline_mask_doc(source: dict[str, Any], cfg: TenantConfig, salt: str) -> d
     return masked
 
 
+def pipeline_provenance(pipeline: dict[str, Any]) -> dict[str, Any]:
+    """The provenance metadata of a pipeline, from `_meta` or `description`.
+
+    The committed template carries `_meta`; the deployed pipeline (OpenSearch
+    rejects `_meta`) carries the same data JSON-encoded in `description` after
+    `PROVENANCE_DESCRIPTION_MARKER`. Returns `{}` when neither is readable.
+    """
+    meta = pipeline.get("_meta")
+    if isinstance(meta, dict):
+        return meta
+    description = pipeline.get("description")
+    if isinstance(description, str) and PROVENANCE_DESCRIPTION_MARKER in description:
+        _, _, blob = description.partition(PROVENANCE_DESCRIPTION_MARKER)
+        try:
+            parsed = json.loads(blob)
+        except (TypeError, ValueError):
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
 def pipeline_field_names(pipeline: dict[str, Any]) -> tuple[str, ...]:
-    """The effective field list a pipeline masks, from its `_meta`."""
-    meta = pipeline.get("_meta") or {}
+    """The effective field list a pipeline masks, from its provenance."""
+    meta = pipeline_provenance(pipeline)
     fields = meta.get("fields") or []
     free_text = meta.get("free_text_fields") or []
     return tuple(str(f) for f in (*fields, *free_text))
@@ -389,7 +451,7 @@ def effective_mask_fields_from_config(cfg: TenantConfig) -> tuple[str, ...]:
 
 def fingerprint_matches(pipeline: dict[str, Any], cfg: TenantConfig) -> bool:
     """Whether a deployed pipeline was generated from the current fields.yaml."""
-    meta = pipeline.get("_meta") or {}
+    meta = pipeline_provenance(pipeline)
     return (
         meta.get("sha256") == fields_yaml_sha256(cfg)
         and set(pipeline_field_names(pipeline)) == set(effective_mask_fields_from_config(cfg))

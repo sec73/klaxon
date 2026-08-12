@@ -21,6 +21,7 @@ from .masked_stream import (
     DEFAULT_RETENTION_DAYS,
     TenantConfig,
     build_config_fragment,
+    build_deployable_pipeline,
     build_index_template,
     build_ism_policy,
     build_pipeline,
@@ -40,13 +41,20 @@ INDEX_TEMPLATE_FILE = "index-template-{template}.json"
 
 
 def _artifact_contents(
-    cfg: TenantConfig, *, salt: str, retention_days: int
+    cfg: TenantConfig, *, salt: str, retention_days: int, deployable: bool = False
 ) -> dict[str, str]:
-    """relative filename -> serialised artifact content (deterministic)."""
+    """relative filename -> serialised artifact content (deterministic).
+
+    `deployable=True` renders the pipeline body actually PUT to OpenSearch
+    (`build_deployable_pipeline`: real salt, NO `_meta` — OpenSearch rejects it
+    — provenance embedded in `description`). `deployable=False` (default) is the
+    committed template form with `_meta` intact, which CI drift-checks.
+    """
+    pipeline_builder = build_deployable_pipeline if deployable else build_pipeline
     return {
         CONFIG_FRAGMENT_NAME: build_config_fragment(cfg),
         PIPELINE_TEMPLATE_NAME.format(pipeline=cfg.pipeline_name): json.dumps(
-            build_pipeline(cfg, salt), indent=2
+            pipeline_builder(cfg, salt), indent=2
         )
         + "\n",
         ISM_POLICY_FILE.format(policy=cfg.ism_policy_name): json.dumps(
@@ -101,10 +109,11 @@ def render_deployable(
 ) -> dict[str, str]:
     """The deployable artifact set (relative filename -> content).
 
-    The pipeline carries the REAL salt in `params.salt` — this is what an
+    The pipeline carries the REAL salt in `params.salt` and NO `_meta` (OpenSearch
+    rejects it; provenance is embedded in `description`) — this is what an
     operator PUTs to the indexer (`--out DIR` / `--stdout`).
     """
-    return _artifact_contents(cfg, salt=salt, retention_days=retention_days)
+    return _artifact_contents(cfg, salt=salt, retention_days=retention_days, deployable=True)
 
 
 def write_artifacts(

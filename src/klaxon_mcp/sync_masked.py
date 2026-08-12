@@ -10,10 +10,10 @@ the sync job must see raw values to mask them, and that is intentional. The raw
 Wazuh streams are only ever read; nothing is written to them.
 
 Commands (wired into `klaxon-mcp`):
-  * sync-masked  --tenant X      periodic reindex of a time window through the
+  * --sync-masked  --tenant X    periodic reindex of a time window through the
                                  masking pipeline, with a checkpoint + preflight
-  * verify-config --tenant X     drift audit: fields.yaml vs config vs pipeline
-  * apply-masked-infra --tenant X  PUT pipeline (real salt), ISM, template,
+  * --verify-config --tenant X   drift audit: fields.yaml vs config vs pipeline
+  * --apply-masked-infra --tenant X  PUT pipeline (real salt), ISM, template,
                                  data stream
 """
 
@@ -88,7 +88,7 @@ def preflight_report(
     if deployed is None:
         problems.append(
             f"pipeline {cfg.pipeline_name} is not deployed. Run "
-            "`klaxon-mcp apply-masked-infra --tenant <tenant>` first."
+            "`klaxon-mcp --apply-masked-infra --tenant <tenant>` first."
         )
         return problems
 
@@ -404,7 +404,7 @@ def salt_check_command(tenant: str) -> int:
     if deployed is None:
         print(
             f"salt-check[{tenant}] pipeline {cfg.pipeline_name} is not deployed. "
-            f"Deploy it first (`klaxon-mcp apply-masked-infra --tenant {tenant}`).",
+            f"Deploy it first (`klaxon-mcp --apply-masked-infra --tenant {tenant}`).",
             file=sys.stderr,
         )
         return 1
@@ -415,7 +415,7 @@ def salt_check_command(tenant: str) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# apply-masked-infra (deploy pipeline + ISM + template + data stream)
+# --apply-masked-infra (deploy pipeline + ISM + template + data stream)
 # --------------------------------------------------------------------------- #
 
 

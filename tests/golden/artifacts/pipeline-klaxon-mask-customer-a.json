@@ -1,5 +1,5 @@
 {
-  "description": "Mask personal data into klaxon-masked-customer-a-v5-* (generated from tenants/customer-a/fields.yaml).",
+  "description": "Mask personal data into klaxon-masked-customer-a-v5-* (generated from tenants/customer-a/fields.yaml).\nklaxon-provenance: {\"fields\":[\"destination.ip\",\"source.ip\",\"source.address\",\"user.name\",\"user.id\",\"user.effective.name\",\"client.user.name\",\"host.hostname\",\"source.domain\",\"url.domain\",\"event.dataset\",\"log.logger\",\"wazuh.agent.id\",\"wazuh.agent.name\",\"wazuh.agent.host.hostname\",\"event.original\",\"related.ip\",\"related.user\",\"related.hosts\"],\"free_text_fields\":[\"message\"],\"generated_by\":\"klaxon masking generate\",\"generator_version\":\"0.1.7\",\"sha256\":\"3877f16587b8f452f1d5321f0440273cd043a03d012e732ea2ed5363d8e569ae\",\"source\":\"tenants/customer-a/fields.yaml\",\"tenant\":\"customer-a\"}",
   "version": 1,
   "processors": [
     {
@@ -19,36 +19,5 @@
         ]
       }
     }
-  ],
-  "_meta": {
-    "source": "tenants/customer-a/fields.yaml",
-    "sha256": "00111554153d094cb7f5f004040b3c2f9f5a8251e44593a7400420dfd1c078f4",
-    "tenant": "customer-a",
-    "generator_version": "0.1.7",
-    "generated_by": "klaxon masking generate",
-    "fields": [
-      "destination.ip",
-      "source.ip",
-      "source.address",
-      "user.name",
-      "user.id",
-      "user.effective.name",
-      "client.user.name",
-      "host.hostname",
-      "source.domain",
-      "url.domain",
-      "event.dataset",
-      "log.logger",
-      "wazuh.agent.id",
-      "wazuh.agent.name",
-      "wazuh.agent.host.hostname",
-      "event.original",
-      "related.ip",
-      "related.user",
-      "related.hosts"
-    ],
-    "free_text_fields": [
-      "message"
-    ]
-  }
+  ]
 }
