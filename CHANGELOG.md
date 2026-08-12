@@ -6,6 +6,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## Unreleased
+
+### Fixed
+
+- `klaxon_mcp.__version__` again matches the packaged version (`0.1.7`) after
+  it had drifted from `pyproject.toml`. It is the fallback used when the
+  installed-distribution metadata is unavailable (`generator_version()` in
+  `masked_stream.py`), so generated artifacts' `generator_version` could have
+  been stamped wrong in that path.
+
+### Changed
+
+- `starlette` is now a declared direct dependency (upper-bounded `<2`).
+  `transport.py` imports `CORSMiddleware` directly for the HTTP transport and
+  previously relied on starlette arriving transitively via `mcp`.
+
+
 ## 0.1.7 – 2026-08-11
 
 ### Fixed (Option B masked-stream generator — verified against a live indexer)

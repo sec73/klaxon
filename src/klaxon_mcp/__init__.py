@@ -7,6 +7,6 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.7"  # keep in sync with pyproject.toml [project] version
 
 __all__ = ["__version__"]
