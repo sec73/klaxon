@@ -46,6 +46,7 @@ from typing import Any
 from .clients import IndexerClient, Response, TransportError
 from .field_kinds import name_match as _name_match
 from .fields import FieldInfo, fetch_field_caps
+from .patterns import _EMAIL_RE, _FQDN_RE, _IPV4_RE, _IPV6_RE
 from .tables import table
 
 logger = logging.getLogger("klaxon_mcp.gdpr")
@@ -81,22 +82,10 @@ _SUGGESTED_MASK: dict[str, str] = {
     FREETEXT: "[USERNAME]",
 }
 
+# Value patterns (IPv4/IPv6/e-mail/FQDN) live in patterns — the single home
+# shared with the anonymizer; imported at the top of this module.
 # --------------------------------------------------------------------------- #
-# Value patterns (shared by content classification and the cheap hit scan)
-# --------------------------------------------------------------------------- #
 
-
-def _ipv4() -> str:
-    octet = r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
-    return rf"\b(?:{octet}\.){{3}}{octet}\b"
-
-
-_IPV4_RE = re.compile(_ipv4())
-_IPV6_RE = re.compile(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{0,4}\b")
-_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-_FQDN_RE = re.compile(
-    r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}\b"
-)
 _USERNAME_AUTH_RE = re.compile(
     r"(?i)\b(?:login|logon|sign[- ]?in|authenticat(?:e|ed|ion))\b"
     r"\s+(?:as|for|by)\s+(?:\buser\b\s+)?[A-Za-z0-9_.@%+=-]{2,64}\b"

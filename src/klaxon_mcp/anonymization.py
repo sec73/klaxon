@@ -59,6 +59,7 @@ from . import overview as _overview
 from .clients import Response
 from .config import AnonymizationConfig
 from .field_kinds import field_kind as _field_kind
+from .patterns import _EMAIL_RE, _FQDN_RE, _IPV4_RE, _IPV6_RE
 
 logger = logging.getLogger("klaxon_mcp.anonymization")
 
@@ -195,18 +196,6 @@ def _agg_spec(agg: Any) -> AggSpec:
 # already replaced.
 # --------------------------------------------------------------------------- #
 
-
-def _ipv4() -> str:
-    octet = r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
-    return rf"\b(?:{octet}\.){{3}}{octet}\b"
-
-
-_IPV4_RE = re.compile(_ipv4())
-_IPV6_RE = re.compile(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{0,4}\b")
-_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-_FQDN_RE = re.compile(
-    r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}\b"
-)
 
 # Usernames in free text, scoped to formulations that are near-certainly a
 # username in a security log. Two families, applied AFTER the value-type passes
