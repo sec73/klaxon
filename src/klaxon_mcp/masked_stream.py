@@ -51,6 +51,15 @@ from typing import Any
 import yaml
 
 from . import __version__ as _package_version
+from .tokens import (
+    TOKEN_RE as TOKEN_RE,  # noqa: PLC0414 — masked_stream facade re-export
+)
+from .tokens import (
+    derive_token as derive_token,  # noqa: PLC0414 — masked_stream facade re-export
+)
+from .tokens import (
+    token as token,  # noqa: PLC0414 — used here and re-exported
+)
 from .validation import validate_tenant
 
 logger = logging.getLogger("klaxon_mcp.masked_stream")
@@ -66,9 +75,6 @@ TEMPLATE_PRIORITY = 200
 ISM_PRIORITY = 100
 DEFAULT_OVERLAP_HOURS = 1
 DEFAULT_INITIAL_LOOKBACK_HOURS = 24
-
-# A value already in this shape is a token: never re-mask it (idempotent).
-TOKEN_RE = re.compile(r"^\[(?:IP|USER|HOST|AGENT)_[0-9a-f]{16}\]$")
 
 # Field names from fields.yaml flow verbatim into the generated Klaxon config
 # fragment (unquoted YAML) and the Painless field table. The charset is what a
@@ -314,42 +320,6 @@ def fields_yaml_sha256(cfg: TenantConfig) -> str:
         for chunk in iter(lambda: fh.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-# --------------------------------------------------------------------------- #
-# Token derivation (the pipeline construction)
-# --------------------------------------------------------------------------- #
-
-
-def token_hex(family: str, value: str, salt: str) -> str:
-    """16 hex chars of SHA-256 over `family:value:salt` (the pipeline scheme)."""
-    if not value:
-        return value
-    if TOKEN_RE.fullmatch(value):
-        return value  # already a token: idempotent, never re-mask
-    digest = hashlib.sha256(f"{family}:{value}:{salt}".encode("utf-8")).hexdigest()
-    return digest[:16]
-
-
-def token(family: str, value: str, salt: str) -> str:
-    """The display token `[FAMILY_<16 hex>]` used by the masked stream."""
-    if not value:
-        return value
-    if TOKEN_RE.fullmatch(value):
-        return value
-    return f"[{family}_{token_hex(family, value, salt)}]"
-
-
-def derive_token(value: str, family: str, salt: str) -> str:
-    """The single token-derivation entry point: `derive_token(value, family, salt)`.
-
-    `token()` is the implementation (SHA-256 over `family:value:salt`, first 16
-    hex chars, displayed as `[FAMILY_<16 hex>]`, idempotent on existing tokens).
-    `derive_token` is the name the token-schema self-test and the docs use for
-    the pipeline scheme, so the Painless script and the Python side are compared
-    against one canonical function.
-    """
-    return token(family, value, salt)
 
 
 def generator_version() -> str:
