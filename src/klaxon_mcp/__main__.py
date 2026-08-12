@@ -322,6 +322,40 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Env var name (default: salt_env from fields.yaml, else "
         "KLAXON_ANONYMIZATION_SALT).",
     )
+
+    test_parser = masking_sub.add_parser(
+        "test",
+        help="LIVE integration test for the generated pipeline: Stage A "
+        "verifies the ingest Painless allowlist has the APIs the script needs, "
+        "Stage B simulates it via POST /_ingest/pipeline/_simulate (authoritative "
+        "compile + behaviour check). No writes, nothing deployed. Needs the "
+        "indexer (KLAXON_INDEXER_URL/USER/PASSWORD).",
+    )
+    test_parser.add_argument(
+        "--tenant",
+        metavar="TENANT",
+        required=True,
+        help="Tenant whose generated pipeline is tested.",
+    )
+    test_parser.add_argument(
+        "--root", type=Path, default=None, help="Repo root (default: auto)."
+    )
+    test_parser.add_argument(
+        "--env",
+        metavar="FILE",
+        default=None,
+        help="Local dotenv file with KLAXON_INDEXER_* vars (default: first "
+        "existing of .env.live, tests/live/.env).",
+    )
+    test_parser.add_argument(
+        "--salt", metavar="SALT", default=None, help="Explicit test salt."
+    )
+    test_parser.add_argument(
+        "--salt-env",
+        metavar="VAR",
+        default=None,
+        help="Env var name for the salt (default: salt_env from fields.yaml).",
+    )
     return parser.parse_args(argv)
 
 
@@ -698,6 +732,19 @@ def main(argv: list[str] | None = None) -> int:
             from . import sync_masked
 
             return sync_masked.salt_check_command(args.tenant)
+        if args.masking_command == "test":
+            from . import live_test
+
+            argv = ["--tenant", args.tenant]
+            if args.root is not None:
+                argv += ["--root", str(args.root)]
+            if args.env:
+                argv += ["--env", args.env]
+            if args.salt:
+                argv += ["--salt", args.salt]
+            if args.salt_env:
+                argv += ["--salt-env", args.salt_env]
+            return live_test.test_main(argv)
         print(
             "masking: missing subcommand (generate|selftest|salt-check)",
             file=sys.stderr,

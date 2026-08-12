@@ -6,6 +6,80 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 0.1.7 – 2026-08-11
+
+### Fixed (Option B masked-stream generator — verified against a live indexer)
+
+- **Painless compile error: functions now precede every top-level statement.**
+  The script started with `def` statements and only then declared the helper
+  functions; Painless requires all function declarations before any statement,
+  so the indexer rejected the pipeline with `unexpected token ['('] was
+  expecting one of [{<EOF>, ';'}]`. Functions are emitted first.
+- **Latent runtime NPE: `ctx` IS the document.** In an ingest script processor
+  there is no nested `_source` object, so `ctx['_source'].keySet()`/`get`/
+  `clear`/`putAll` were `null` and would NPE on the first document once the
+  compile bug was fixed. Every occurrence is now `ctx` directly.
+- **Only whitelisted APIs, verified live.** The cluster's ingest allowlist does
+  not include `MessageDigest` or `Pattern.compile`. The hash now uses the
+  ingest-context `String.sha256()` augmentation (`"family:value:salt".sha256()
+  .substring(0, 16)` — byte-identical to `MessageDigest "SHA-256"`, so the
+  token scheme is unchanged and `derive_token` still matches); Patterns are
+  regex literals wrapped in `Pattern` functions; the known-identity registry
+  does a manual word-boundary `indexOf` replacement (`String.replaceAll` is
+  unusable there). Painless functions cannot read `params` or top-level defs,
+  so the salt and field table are threaded in as parameters from the main logic.
+- **Two more latent bugs surfaced by the live simulate and fixed:**
+  `m.group(1)` on a group-less pattern (EMAIL/IPV6/IPV4) **throws** "No group 1"
+  in Java — `maskPattern` now guards with `m.groupCount()`; and the greedy
+  `[A-Za-z0-9._%+-]+` EMAIL local part backtracked past the cluster's
+  `script.painless.regex.limit-factor` on dot/digit-heavy lines — the local part
+  is now possessive (`++`, identical matches, linear scan). Hex integer literals
+  (`0xff`/`0x0f`) also hit a Painless codegen bug and were removed with the
+  byte-array hex encoder.
+- **The mandatory self-test now also checks structural compilability**, not
+  just token identity: `verify_script_structure` fails generation when a
+  function appears after a statement, a function/declaration is missing, or any
+  `ctx['_source']` remains.
+
+### Added
+
+- **`klaxon masking test --tenant X` — a LIVE integration test against the
+  real indexer (write-free).** Stage A queries `GET /_scripts/painless/_context`
+  (`context=ingest`) and verifies the ingest allowlist has every API the script
+  needs (`_execute` cannot compile ingest scripts — its `painless_test` context
+  lacks the ingest-only `sha256` augmentation). Stage B posts the pipeline
+  **inline** to `POST /_ingest/pipeline/_simulate` — the authoritative compile
+  + behaviour check — and asserts: no `klaxon.masking_error`; `user.name` and
+  `uid=<same-username>` in `message` share one token; `user.effective.name`
+  like `root(uid=0)` masked; `related.user`/`related.hosts` arrays element-wise;
+  `event.original` → a single token; `related.hash` untouched; already-tokenised
+  values unchanged (idempotency); dot/digit-heavy free text stays under the
+  regex limit. A `klaxon.masking_error` that says "Regular expression considered
+  too many characters" is reported with the exact remediation (raise
+  `script.painless.regex.limit-factor`). Nothing is deployed or persisted. The
+  same assertions run as the pytest marked `integration`/`live`
+  (`tests/test_live_masking.py`), which **skips cleanly** when credentials are
+  missing.
+- **Live-test credentials are environment-only.** `KLAXON_INDEXER_URL`,
+  `KLAXON_INDEXER_USER`, `KLAXON_INDEXER_PASSWORD` (optionally loaded from a
+  gitignored local `.env.live` or `tests/live/.env` file). `tests/live/.env.example`
+  documents the shape with placeholders; the password is never logged, a URL
+  with embedded credentials is sanitised, optional `KLAXON_INDEXER_VERIFY_SSL`
+  (default `true`) covers self-signed lab clusters, and `.gitignore` now covers
+  the local credentials files plus deployable artifact directories that embed
+  the salt.
+
+### Changed
+
+- `klaxon masking selftest --tenant X` now reports the structural compile
+  checks alongside the token-scheme check.
+- Committed artifacts regenerated under `generator_version 0.1.7` (run
+  `klaxon masking generate --tenant customer-a` after any pyproject bump).
+- Deployment prerequisite documented: for long free-text messages the indexer's
+  `script.painless.regex.limit-factor` (default 6) may need raising (see
+  `docs/option-b-masked-stream.md`).
+
+
 ## 0.1.6 – 2026-08-11
 
 ### Security (feature-freeze review)

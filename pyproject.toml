@@ -1,6 +1,6 @@
 [project]
 name = "klaxon-mcp"
-version = "0.1.6"
+version = "0.1.7"
 description = "MCP server for Wazuh 5.x. Query any events or findings datastream, discover which schema fields are actually populated, run logtest. Generic tools instead of fifty narrow ones. 5.x only — no 4.x compatibility layer."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -57,6 +57,10 @@ asyncio_mode = "auto"
 # Default is the bare prefix "test", which also collects an imported
 # `tester_sessions` as a test case. Every test here is named test_*.
 python_functions = ["test_*"]
+markers = [
+    "integration: requires a live OpenSearch/Wazuh 5 indexer; skipped unless KLAXON_INDEXER_URL/KLAXON_INDEXER_USER/KLAXON_INDEXER_PASSWORD are all set",
+    "live: alias for integration — the live masking pipeline test (_execute + _simulate, no writes)",
+]
 
 [tool.mypy]
 python_version = "3.11"

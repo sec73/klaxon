@@ -58,6 +58,7 @@ from .masked_stream import (
     DEFAULT_RETENTION_DAYS,
     TOKEN_RE,
     TenantConfig,
+    _FREETEXT_PATTERN_ORDER,
     build_config_fragment,
     build_index_template,
     build_ism_policy,
@@ -252,7 +253,7 @@ SELF_TEST_VALUES: tuple[tuple[str, str], ...] = (
 
 
 def painless_token_reference(family: str, value: str, salt: str) -> str:
-    """Byte-exact Python transcription of the Painless `token()`/`sha256hex()`/`hex16()`.
+    """Byte-exact Python transcription of the Painless `token()`/`sha256hex()`.
 
     Written as a SEPARATE code path from `derive_token()` on purpose: the
     self-test runs both over the representative values and aborts on ANY
@@ -273,12 +274,13 @@ def painless_token_reference(family: str, value: str, salt: str) -> str:
 # The token-scheme markers the rendered Painless source MUST contain. If any is
 # missing, the script does not implement the scheme `derive_token` implements.
 _SCHEME_MARKERS: tuple[str, ...] = (
-    "def SALT = params.salt;",    "if (value.isEmpty()) return value;",    'MessageDigest.getInstance("SHA-256")',
-    'input.getBytes("UTF-8")',
+    "def SALT = params.salt;",
+    "if (value.isEmpty()) return value;",
+    ".sha256().substring(0, 16)",  # SHA-256, first 16 hex chars
     'sha256hex(family + ":" + value + ":" + SALT)',
-    "for (int i = 0; i < 8; i++)",
     '"[" + family + "_" + sha256hex(family + ":" + value + ":" + SALT) + "]"',
-    'Pattern.compile("^\\\\[(?:IP|USER|HOST|AGENT)_[0-9a-f]{16}\\\\]$")',
+    "Pattern TOKEN_RE()",
+    r"^\[(?:IP|USER|HOST|AGENT)_[0-9a-f]{16}\]$",  # the idempotency regex literal
 )
 
 
@@ -287,11 +289,108 @@ def verify_script_scheme(script: str) -> list[str]:
 
     Binds the self-test to the actual generated artifact: the script must encode
     exactly the scheme `derive_token` implements (SHA-256 over
-    `family:value:salt`, UTF-8, first 8 digest bytes -> 16 hex, `[FAMILY_<hex>]`
-    display, idempotent passthrough, salt injected via `params.salt`). Empty
-    result = the script encodes the scheme.
+    `family:value:salt`, UTF-8, first 16 hex chars, `[FAMILY_<hex>]` display,
+    idempotent passthrough, salt injected via `params.salt`). Empty result = the
+    script encodes the scheme.
     """
     return [marker for marker in _SCHEME_MARKERS if marker not in script]
+
+
+# The function declarations the rendered Painless script MUST define: (name,
+# return type). The free-text regexes are emitted as `Pattern <NAME>()`
+# functions and TOKEN_RE() as a `Pattern` function, matching the live-verified
+# shape (`Pattern.compile`/`MessageDigest` are not whitelisted on restricted
+# clusters; regex literals in functions are).
+_PAINLESS_FUNCTIONS: tuple[tuple[str, str], ...] = (
+    ("sha256hex", "String"),
+    ("token", "String"),
+    ("TOKEN_RE", "Pattern"),
+    ("maskPattern", "String"),
+    ("isWordChar", "boolean"),
+    ("replaceWordBoundary", "String"),
+    ("maskRegistry", "String"),
+    ("maskFreeText", "String"),
+) + tuple((name, "Pattern") for name in _FREETEXT_PATTERN_ORDER)
+
+# The top-level declarations the script emits (functions must precede these).
+_PAINLESS_TOP_DECLS: tuple[str, ...] = (
+    "def SALT =",
+    "def FIELDS =",
+    "def FREE_TEXT =",
+)
+
+# The first statement of the main logic, which must follow every declaration.
+_MAIN_LOGIC_MARKER = "Map masked = new HashMap();"
+
+
+def verify_script_structure(script: str) -> list[str]:
+    """Structural compile-safety problems in a rendered Painless script.
+
+    The scheme markers prove WHAT the script computes; these checks prove the
+    script COMPILES the way the live `_execute`/`_simulate` test exercises it:
+
+      * every function declaration precedes any top-level statement (Painless
+        rejects functions after statements with `unexpected token ['(']`);
+      * the declarations (`def SALT`/`FIELDS`/`FREE_TEXT`) precede the main logic;
+      * no `ctx['_source']` remains — in an ingest script processor `ctx` IS the
+        document, so `ctx['_source']` is null and NPEs on the first document.
+
+    Empty result = structurally sound (the offline counterpart of the live
+    compile check; see `klaxon masking test`).
+    """
+    problems: list[str] = []
+
+    if "ctx['_source']" in script:
+        problems.append(
+            "script still references ctx['_source'] — in an ingest script "
+            "processor ctx IS the document (no nested _source object); this "
+            "NPEs on the first document once the script compiles."
+        )
+
+    def_positions = [script.find(decl) for decl in _PAINLESS_TOP_DECLS]
+    first_statement = min((p for p in def_positions if p >= 0), default=-1)
+
+    for name, rtype in _PAINLESS_FUNCTIONS:
+        sig = f"{rtype} {name}("
+        pos = script.find(sig)
+        if pos < 0:
+            problems.append(
+                f"missing function declaration `{sig}...)` — the pipeline "
+                "would fail to compile at ingest time."
+            )
+            continue
+        if first_statement >= 0 and pos > first_statement:
+            problems.append(
+                f"function `{name}` is declared AFTER a top-level statement "
+                f"(`{_PAINLESS_TOP_DECLS[0]}...`) — Painless requires ALL "
+                "functions before any statement; the indexer rejects the "
+                "pipeline with `unexpected token ['(']`."
+            )
+
+    main_pos = script.find(_MAIN_LOGIC_MARKER)
+    if main_pos < 0:
+        problems.append(
+            f"main-logic marker `{_MAIN_LOGIC_MARKER}` not found — the emitted "
+            "structure changed unexpectedly."
+        )
+    else:
+        for decl, pos in zip(_PAINLESS_TOP_DECLS, def_positions):
+            if pos < 0:
+                problems.append(f"missing top-level declaration `{decl}`")
+            elif pos > main_pos:
+                problems.append(
+                    f"declaration `{decl}` appears AFTER the main logic — the "
+                    "script would use FIELDS/SALT before they are assigned."
+                )
+        if not any(
+            f"Pattern {name}() {{" in script for name in _FREETEXT_PATTERN_ORDER
+        ):
+            problems.append(
+                "no free-text Pattern functions found — the free-text pass "
+                "references them by name and the script would fail to compile."
+            )
+
+    return problems
 
 
 def run_token_selftest(salt: str) -> list[str]:
@@ -322,6 +421,7 @@ def run_generator_selftest(cfg: TenantConfig, salt: str) -> list[str]:
             f"{script.get('params', {}).get('salt')!r}"
         )
     problems.extend(verify_script_scheme(script["source"]))
+    problems.extend(verify_script_structure(script["source"]))
     return problems
 
 
