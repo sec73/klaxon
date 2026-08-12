@@ -563,6 +563,30 @@ def update_mask_fields(
     return bool(added), merged, warning
 
 
+def apply_mask_fields(
+    config_file: str, log_path: str, index: str, to_add: list[str]
+) -> tuple[bool, list[str], str | None]:
+    """Merge `to_add` into `anonymization.mask_fields`, then log the action.
+
+    The single shared home for the update+audit-log side effect used by BOTH
+    the MCP tool (`server.gdpr_check`) and the CLI
+    (`__main__._gdpr_check_once`), so the two surfaces write the exact same
+    German audit-log lines. Returns `(changed, merged_list, warning)`; the
+    compliance-report write stays at each call site (its trigger differs).
+    """
+    changed, merged, warning = update_mask_fields(config_file, to_add)
+    log = GdprLog(log_path)
+    if changed:
+        joined = ", ".join(to_add)
+        log.write(
+            f'Felder "{joined}" zur Anonymisierungsliste hinzugef\u00fcgt '
+            f"(index {index})."
+        )
+    if warning:
+        log.write(f"Warnung: {warning}")
+    return changed, merged, warning
+
+
 class GdprLog:
     """Append-only audit log for check actions, e.g. gdpr_check.log."""
 
