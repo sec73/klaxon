@@ -311,14 +311,19 @@ def build_index_template(
     queries behave identically); when omitted (None — the offline generator
     path), the `mappings` key is not emitted and the operator merges them at
     deploy time (see `--apply-masked-infra`, which fetches them from the
-    indexer). Only `klaxon-masked-<tenant>-v5-*` matches — Wazuh streams are
+    indexer). Only `klaxon-masked-<tenant>-v5*` matches — Wazuh streams are
     never touched.
 
-    The ISM policy is attached the OpenSearch-native way: the policy's
-    `ism_template` (see `build_ism_policy`) auto-applies it to newly created
-    backing indices. `index.lifecycle.name` is intentionally NOT set — it is an
-    Elasticsearch ILM setting that OpenSearch rejects (HTTP 400 "expected
-    [index.lifecycle.name] to be private but it was not").
+    `index_patterns` is `klaxon-masked-<tenant>-v5*` (NOT `...-v5-*`): OpenSearch
+    requires the template to match the DATA STREAM NAME
+    (`klaxon-masked-<tenant>-v5`, no trailing dash) to create the stream, and
+    the same pattern also covers its `...-v5-000001` backing indices. The `-*`
+    form is only used for query patterns and the ISM `ism_template` (which
+    targets concrete indices). The ISM policy is attached the OpenSearch-native
+    way: the policy's `ism_template` (see `build_ism_policy`) auto-applies it to
+    newly created backing indices. `index.lifecycle.name` is intentionally NOT
+    set — it is an Elasticsearch ILM setting that OpenSearch rejects (HTTP 400
+    "expected [index.lifecycle.name] to be private but it was not").
     """
     template: dict[str, Any] = {
         "settings": {
@@ -330,7 +335,7 @@ def build_index_template(
     if mappings is not None:
         template["mappings"] = mappings
     return {
-        "index_patterns": [cfg.masked_stream_pattern],
+        "index_patterns": [f"{cfg.masked_stream}*"],
         "priority": TEMPLATE_PRIORITY,
         "template": template,
         "data_stream": {},

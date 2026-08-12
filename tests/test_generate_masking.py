@@ -440,7 +440,10 @@ def test_ism_policy_retention_and_priority(cfg: Any) -> None:
 
 def test_index_template_targets_only_masked_stream(cfg: Any) -> None:
     template = build_index_template(cfg, {"properties": {}})
-    assert template["index_patterns"] == ["klaxon-masked-test-a-v5-*"]
+    # The pattern must match the DATA STREAM NAME (klaxon-masked-test-a-v5, no
+    # trailing dash) for OpenSearch to create the stream; it also covers the
+    # ...-v5-000001 backing indices. Wazuh streams are never matched.
+    assert template["index_patterns"] == ["klaxon-masked-test-a-v5*"]
     assert template["priority"] == TEMPLATE_PRIORITY
     assert template["data_stream"] == {}
     settings = template["template"]["settings"]

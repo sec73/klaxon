@@ -1,6 +1,6 @@
 {
   "index_patterns": [
-    "klaxon-masked-customer-a-v5-*"
+    "klaxon-masked-customer-a-v5*"
   ],
   "priority": 200,
   "template": {

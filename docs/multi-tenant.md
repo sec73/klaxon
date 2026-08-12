@@ -4,8 +4,9 @@ Option B (ingest-side masking, [`option-b-masked-stream.md`](option-b-masked-str
 is organised per **tenant**. One tenant = one `tenants/<tenant>/fields.yaml`
 (the single source of truth) + one generated resource set. All generated
 resources are namespaced with the tenant: `klaxon-mask-<tenant>`,
-`klaxon-masked-<tenant>-v5-*`, `klaxon-masked-retention-<tenant>`,
-`klaxon-masked-<tenant>` (template), sync-state doc `klaxon-sync-<tenant>`.
+`klaxon-masked-<tenant>-v5` (data stream; backing indices `...-v5-*`),
+`klaxon-masked-retention-<tenant>`, `klaxon-masked-<tenant>` (template),
+sync-state doc `klaxon-sync-<tenant>`.
 
 > Want the end-to-end stream operation (pipeline, deploy, sync job, query
 > redirection) instead? See [`option-b-masked-stream.md`](option-b-masked-stream.md).

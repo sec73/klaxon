@@ -13,8 +13,8 @@ Hard constraints, enforced in code:
   written to**. The sync job only reads them (`_reindex` with a range query).
 * Every new resource is namespaced `klaxon-*`: pipeline
   `klaxon-mask-<tenant>`, ISM policy `klaxon-masked-retention-<tenant>`, index
-  template `klaxon-masked-<tenant>`, data stream `klaxon-masked-<tenant>-v5-*`,
-  checkpoint index `klaxon-sync-state`.
+  template `klaxon-masked-<tenant>`, data stream `klaxon-masked-<tenant>-v5`
+  (backing indices `...-v5-*`), checkpoint index `klaxon-sync-state`.
 * Masking is **deterministic**: the same raw value always produces the same
   token, so aggregations over the masked stream still count distinct entities
   correctly.
@@ -53,12 +53,14 @@ artifacts from it:
   <tenant>`): hot (rollover) -> delete after `--retention-days` (default 30).
 * `tenants/<tenant>/generated/index-template-klaxon-masked-<tenant>.json` — the
   index template (`PUT /_index_template/klaxon-masked-<tenant>`):
-  `index_patterns: [klaxon-masked-<tenant>-v5-*]`, priority 200,
-  `data_stream: {}`, `index.default_pipeline`. Retention is attached the
-  OpenSearch-native way — the ISM policy's `ism_template` (priority 100)
-  matches the same stream pattern (`index.lifecycle.name` is an Elasticsearch
-  ILM setting OpenSearch rejects). The offline generator omits `mappings`;
-  `--apply-masked-infra` fetches them from the Wazuh stream at deploy time.
+  `index_patterns: [klaxon-masked-<tenant>-v5*]` (must match the DATA STREAM
+  NAME `...-v5` so OpenSearch can create it; also covers the `...-v5-000001`
+  backing indices), priority 200, `data_stream: {}`, `index.default_pipeline`.
+  Retention is attached the OpenSearch-native way — the ISM policy's
+  `ism_template` (priority 100) matches the backing-index pattern
+  `...-v5-*` (`index.lifecycle.name` is an Elasticsearch ILM setting OpenSearch
+  rejects). The offline generator omits `mappings`; `--apply-masked-infra`
+  fetches them from the Wazuh stream at deploy time.
 
 Regenerate after editing `fields.yaml`:
 
@@ -235,8 +237,10 @@ Change retention and redeploy:
 klaxon-mcp --apply-masked-infra --tenant customer-a --retention-days 14
 ```
 
-The index template (`priority` 200) and ISM template (`priority` 100) match only
-`klaxon-masked-<tenant>-v5-*`; Wazuh streams are untouched.
+The index template (`priority` 200) matches `klaxon-masked-<tenant>-v5*` (the
+data stream name plus its backing indices); the ISM template (`priority` 100)
+matches `klaxon-masked-<tenant>-v5-*` (concrete backing indices). Wazuh
+streams are untouched.
 
 ## Pointing reports at the masked stream
 
