@@ -47,6 +47,7 @@ from typing import Any
 
 import httpx
 
+from .hmac_vectors import KLAXON_VECTORS
 from .live_config import (
     DEFAULT_TEST_SALT,
     ENV_FILE_CANDIDATES,
@@ -81,6 +82,7 @@ __all__ = [
     "LiveTestError",
     "_env_bool",
     "_url_has_embedded_credentials",
+    "check_hmac_vectors",
     "check_quarantine_routing",
     "check_simulated",
     "find_env_file",
@@ -93,6 +95,7 @@ __all__ = [
     "stage_a_ingest_allowlist",
     "stage_b_simulate",
     "stage_b_simulate_failure",
+    "stage_b_simulate_hmac_vectors",
     "test_main",
 ]
 
@@ -654,6 +657,102 @@ def check_quarantine_routing(
 
 
 # --------------------------------------------------------------------------- #
+# Stage B — HMAC edge-case vectors (_simulate, one pipeline per vector salt)
+# --------------------------------------------------------------------------- #
+
+# Family -> a structured field the live-test tenant's fields.yaml masks, so the
+# vector's `family:value` flows through the REAL generated pipeline.
+_FAMILY_FIELD = {
+    "USER": "user.name",
+    "IP": "destination.ip",
+    "HOST": "host.hostname",
+    "AGENT": "wazuh.agent.id",
+}
+
+
+async def stage_b_simulate_hmac_vectors(
+    client: httpx.AsyncClient, cfg: Any
+) -> tuple[list[tuple[str, str, str | None]], list[str]]:
+    """Simulate one document per Klaxon HMAC vector against the generated pipeline.
+
+    Each vector's salt is baked into a pipeline via `build_pipeline(cfg, salt)`
+    and `_simulate`d with one doc per vector (the `family:value` placed in a
+    structured field the tenant masks). Returns `(results, errors)` where each
+    result is `(label, field, actual_token_or_None)`. This proves the DEPLOYED
+    pure-Painless script — not just the Python port — reproduces the
+    offline-expected tokens, including the >64-byte salt (hash-first branch)
+    and UTF-8 (umlaut/CJK/emoji) cases. Writes nothing; skips cleanly when the
+    credentials are unset (the caller does that).
+    """
+    results: list[tuple[str, str, str | None]] = []
+    errors: list[str] = []
+
+    by_salt: dict[str, list[tuple[str, str, str, str, str, str]]] = {}
+    for vec in KLAXON_VECTORS:
+        by_salt.setdefault(vec[1], []).append(vec)
+
+    for salt, vecs in by_salt.items():
+        sent: list[tuple[str, str, str, str, str, str]] = []
+        docs: list[dict[str, Any]] = []
+        for vec in vecs:
+            label, _salt, family, value, _full, _tok = vec
+            field = _FAMILY_FIELD.get(family)
+            if field is None or field not in cfg.all_masked_fields:
+                errors.append(
+                    f"HMAC vector {label}: no masked field for family "
+                    f"{family} in the live-test tenant"
+                )
+                continue
+            sent.append(vec)
+            docs.append(
+                {
+                    "_index": "klaxon-masked-customer-a-v5-000001",
+                    "_id": label,
+                    "_source": {field: value},
+                }
+            )
+        if not docs:
+            continue
+
+        pipeline = build_pipeline(cfg, salt)
+        sources, sim_errors = await stage_b_simulate(client, pipeline, docs)
+        for doc, err in zip(docs, sim_errors):
+            if err:
+                errors.append(f"HMAC vector {doc['_id']}: {err}")
+
+        for vec, src in zip(sent, sources):
+            label, _s, family, value, _full, _tok = vec
+            field = _FAMILY_FIELD[family]
+            results.append((label, field, src.get(field) if src else None))
+
+    return results, errors
+
+
+def check_hmac_vectors(
+    results: list[tuple[str, str, str | None]], cfg: Any
+) -> list[str]:
+    """Assert the simulated Klaxon HMAC vectors against the offline-expected tokens.
+
+    Pure function (runs from the CLI and the pytest without a cluster): each
+    vector's simulated token must equal the authoritative expected token from
+    the shared vector table. Empty list = the deployed pure-Painless script is
+    byte-identical to the reference for every edge case.
+    """
+    expected: dict[str, str] = {vec[0]: vec[5] for vec in KLAXON_VECTORS}
+    problems: list[str] = []
+    for label, field, actual in results:
+        exp = expected.get(label)
+        if actual is None:
+            problems.append(f"HMAC vector {label}: no token produced")
+        elif exp is not None and actual != exp:
+            problems.append(
+                f"HMAC vector {label} ({field}): simulated {actual!r}, "
+                f"expected {exp!r}"
+            )
+    return problems
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration + CLI
 # --------------------------------------------------------------------------- #
 
@@ -737,6 +836,35 @@ async def _run_live_test(
             "(same token for user.name and uid=, arrays element-wise, "
             "event.original single token, related.hash untouched, idempotent, "
             "no masking_error)."
+        )
+
+        # Stage B (HMAC vectors) — the deployed pure-Painless script must
+        # reproduce the offline-expected tokens for every Klaxon HMAC vector:
+        # UTF-8 values (umlaut/CJK/emoji), ':'-containing value, empty value,
+        # preserved spaces, 16/64/131/empty-byte salts (131 exercises the
+        # hash-first branch). One _simulate per distinct vector salt.
+        try:
+            hmac_results, hmac_errors = await stage_b_simulate_hmac_vectors(
+                client, cfg
+            )
+        except LiveTestError as exc:
+            lines.append("Stage B — HMAC edge-case vectors (_simulate): FAIL")
+            lines.append(f"  {exc}")
+            return "\n".join(lines), False
+        lines.append(
+            "Stage B — HMAC edge-case vectors (_simulate): "
+            f"{len(hmac_results)} vector(s), {len(hmac_errors)} error(s)"
+        )
+        for err in hmac_errors:
+            lines.append(f"  {err}")
+        hmac_problems = check_hmac_vectors(hmac_results, cfg)
+        if hmac_problems:
+            lines.append("Stage B — HMAC edge-case vectors: FAIL")
+            lines.extend(f"  {p}" for p in hmac_problems)
+            return "\n".join(lines), False
+        lines.append(
+            "  ok: deployed pure-Painless HMAC reproduces every offline-expected "
+            "token (RFC 4231 / key-length / UTF-8 / truncation)."
         )
 
         # Stage C — quarantine on_failure routing (fail-closed). Force the
