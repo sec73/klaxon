@@ -62,7 +62,10 @@ Painless: the restricted ingest allowlist has no `javax.crypto.Mac`, and
 `String.sha256()` can only hash UTF-8 text (not the raw inner digest bytes of
 HMAC), so SHA-256 is reimplemented over an `int[]` byte sequence — byte-
 identical to Python's `hmac` and proven by the mandatory self-test and the live
-`_simulate` (`klaxon masking test`). Idempotent on already-tokenised values.
+`_simulate` (`klaxon masking test`). This is a **deliberate design decision**, not
+a workaround: the hand-rolled SHA-256 is pinned against authoritative RFC 4231
+vectors (plus key-length, UTF-8 and truncation edge cases) by the generator
+self-test. Idempotent on already-tokenised values.
 `tokens.py` is the single canonical Python source for this scheme.
 
 ## Why 16 hex (64 bits)

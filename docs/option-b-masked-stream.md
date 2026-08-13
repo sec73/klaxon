@@ -1,5 +1,11 @@
 # Option B: a separate, masked data stream
 
+> **Status: implemented & live-verified — NOT deployed.** The generator, the
+> self-test and the live `klaxon masking test` all cover Option B, but no
+> `klaxon-masked-<tenant>-v5-*` data stream exists on the indexer yet (0
+> shards). Deploying is the operator's/CI's job — see
+> [Deploying and running](#deploying-and-running).
+
 The response-layer masker (`anonymization.py`) is the safety net that keeps
 personal data out of the LLM's view. Option B moves masking **to the ingest
 side**: a periodic sync job reindexes a recent time window from the raw Wazuh
