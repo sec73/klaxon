@@ -43,7 +43,7 @@ def anon(**kw: Any) -> AnonymizationConfig:
         "mask_fields": ("user.name", "source.ip"),
         "mask_aggregation_keys": True,
         "mask_free_text_users": True,
-        "masked_streams": ("klaxon-masked-customer-a-v5-*",),
+        "masked_streams": ("klaxon-masked-customer-a-v5*",),
         "whitelist_enabled": True,
     }
     defaults.update(kw)
@@ -267,6 +267,19 @@ class TestPostureChecks:
         assert "not present" in find(lines, "mode")
         assert "planned, not implemented" in find(lines, "mode")
 
+    async def test_mode_warns_when_config_does_not_cover_deployed_stream(
+        self,
+    ) -> None:
+        """The divergence guard: the data stream is named
+        klaxon-masked-customer-a-v5, so a masked_streams config of ...-v5-* would
+        make every Klaxon query match nothing — the mode check must WARN."""
+        a = anon(masked_streams=("klaxon-masked-customer-a-v5-*",))
+        lines = await run_posture(FakeIndexer(masked_streams=True), a=a)
+        line = find(lines, "mode")
+        assert line.startswith("mode: WARN")
+        assert "NOT covered by the masked_streams config" in line
+        assert "klaxon-masked-customer-a-v5-*" in line
+
     async def test_pipeline_not_deployed_warns(self) -> None:
         lines = await run_posture(FakeIndexer(pipeline=None))
         assert find(lines, "pipeline_drift").startswith("pipeline_drift: WARN")
@@ -311,7 +324,7 @@ class TestPostureChecks:
         assert line.startswith("rbac: OK")
         for role in ALL_ROLES:
             assert f"{role} present" in line
-        assert "klaxon-masked-customer-a-v5-*" in line  # grants reported
+        assert "klaxon-masked-customer-a-v5*" in line  # grants reported
 
     async def test_rbac_missing_warns(self) -> None:
         lines = await run_posture(FakeIndexer(roles={"klaxon_llm_report_customer-a"}))

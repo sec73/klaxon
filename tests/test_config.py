@@ -264,21 +264,21 @@ class TestAnonymizationEnv:
     def test_masked_streams_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(
             "KLAXON_ANONYMIZATION_MASKED_STREAMS",
-            "klaxon-masked-customer-a-v5-*,klaxon-masked-customer-b-v5-*",
+            "klaxon-masked-customer-a-v5*,klaxon-masked-customer-b-v5*",
         )
         assert AnonymizationConfig.from_env().masked_streams == (
-            "klaxon-masked-customer-a-v5-*",
-            "klaxon-masked-customer-b-v5-*",
+            "klaxon-masked-customer-a-v5*",
+            "klaxon-masked-customer-b-v5*",
         )
 
     def test_masked_streams_env_tolerates_whitespace(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(
-            "KLAXON_ANONYMIZATION_MASKED_STREAMS", " klaxon-masked-a-v5-* "
+            "KLAXON_ANONYMIZATION_MASKED_STREAMS", " klaxon-masked-a-v5* "
         )
         assert AnonymizationConfig.from_env().masked_streams == (
-            "klaxon-masked-a-v5-*",
+            "klaxon-masked-a-v5*",
         )
 
 
@@ -320,7 +320,7 @@ class TestQuarantineMaskedStreamsGuard:
         assert config.quarantine_pattern_overlap("klaxon-quarantine-a-v5-*")
 
     def test_quarantine_pattern_overlap_allows_masked(self) -> None:
-        assert not config.quarantine_pattern_overlap("klaxon-masked-customer-a-v5-*")
+        assert not config.quarantine_pattern_overlap("klaxon-masked-customer-a-v5*")
         assert not config.quarantine_pattern_overlap("wazuh-events-v5-*")
         assert not config.quarantine_pattern_overlap("klaxon-masked-*")
 
@@ -339,10 +339,10 @@ class TestQuarantineMaskedStreamsGuard:
     def test_from_env_allows_only_masked(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(
             "KLAXON_ANONYMIZATION_MASKED_STREAMS",
-            "klaxon-masked-customer-a-v5-*",
+            "klaxon-masked-customer-a-v5*",
         )
         assert AnonymizationConfig.from_env().masked_streams == (
-            "klaxon-masked-customer-a-v5-*",
+            "klaxon-masked-customer-a-v5*",
         )
 
     def test_generated_config_fragment_never_adds_quarantine(self) -> None:
@@ -353,7 +353,7 @@ class TestQuarantineMaskedStreamsGuard:
 
         data = yaml.safe_load(build_config_fragment(load_tenant_config("customer-a")))
         streams = data["anonymization"]["masked_streams"]
-        assert streams == ["klaxon-masked-customer-a-v5-*"]
+        assert streams == ["klaxon-masked-customer-a-v5*"]
         for stream in streams:
             assert not config.quarantine_pattern_overlap(stream)
 
@@ -469,12 +469,12 @@ class TestAnonymizationYaml:
     def test_yaml_masked_streams(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         path = tmp_path / "config.yaml"
         path.write_text(
-            "anonymization:\n  masked_streams:\n    - klaxon-masked-customer-a-v5-*\n",
+            "anonymization:\n  masked_streams:\n    - klaxon-masked-customer-a-v5*\n",
             encoding="utf-8",
         )
         monkeypatch.setenv("KLAXON_CONFIG", str(path))
         assert AnonymizationConfig.from_env().masked_streams == (
-            "klaxon-masked-customer-a-v5-*",
+            "klaxon-masked-customer-a-v5*",
         )
 
     def test_env_beats_yaml_masked_streams(
@@ -482,15 +482,15 @@ class TestAnonymizationYaml:
     ) -> None:
         path = tmp_path / "config.yaml"
         path.write_text(
-            "anonymization:\n  masked_streams:\n    - klaxon-masked-a-v5-*\n",
+            "anonymization:\n  masked_streams:\n    - klaxon-masked-a-v5*\n",
             encoding="utf-8",
         )
         monkeypatch.setenv("KLAXON_CONFIG", str(path))
         monkeypatch.setenv(
-            "KLAXON_ANONYMIZATION_MASKED_STREAMS", "klaxon-masked-b-v5-*"
+            "KLAXON_ANONYMIZATION_MASKED_STREAMS", "klaxon-masked-b-v5*"
         )
         assert AnonymizationConfig.from_env().masked_streams == (
-            "klaxon-masked-b-v5-*",
+            "klaxon-masked-b-v5*",
         )
 
     def test_env_and_yaml_mask_fields_conflict_is_fail_closed(

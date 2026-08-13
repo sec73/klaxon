@@ -219,7 +219,7 @@ class AnonymizationConfig:
     # (message, *.log, raw, ...), that get the free-text username pass.
     mask_free_text_fields: tuple[str, ...] = ()
     # Data streams that are already masked at ingest (Option B, e.g.
-    # klaxon-masked-<tenant>-v5-*). The response layer passes already-tokenized
+    # klaxon-masked-<tenant>-v5*). The response layer passes already-tokenized
     # values through unchanged, so masking is idempotent for these streams.
     masked_streams: tuple[str, ...] = ()
     # Whitelist semantics for this server: only responses that mask cleanly go

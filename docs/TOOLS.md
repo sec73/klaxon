@@ -40,7 +40,7 @@ diagnostics line — with `[UNMASKED MODE]` and/or `[RAW STREAM QUERY]` whenever
 the response may carry personal data: anonymization is disabled, the LLM
 endpoint is not local (no loopback) and the response gate is inactive, or the
 query targeted a raw stream (`wazuh-events-v5-*` / `wazuh-findings-v5-*`)
-instead of a masked stream (`klaxon-masked-<tenant>-v5-*`). It is automatic (no
+instead of a masked stream (`klaxon-masked-<tenant>-v5*`). It is automatic (no
 opt-in, no separate tool) so it cannot be forgotten, fires on every response
 including zero-hit/error/aggregation-only ones, and carries only the condition
 + a one-line reason — never values, tokens or the salt.
@@ -444,11 +444,11 @@ The nine checks:
 ```
 masking: OK — 19 field(s) masked, aggregation keys on, free-text users on (source: config.anonymization.*)
 response_gate: OK — llm_base_url is loopback (local model) (source: config.anonymization.llm_base_url loopback check)
-mode: WARN — response-layer masking only; klaxon-masked-customer-a-v5-* is not present on the indexer (Option B not deployed); quarantine stream not present (planned, not implemented) (source: config.anonymization.masked_streams + GET /_data_stream)
+mode: WARN — response-layer masking only; klaxon-masked-customer-a-v5* is not present on the indexer (Option B not deployed); quarantine stream not present (planned, not implemented) (source: config.anonymization.masked_streams + GET /_data_stream)
 pipeline_drift: OK — fingerprint matches fields.yaml (source: verify-config / fingerprint_matches)
 salt_strength: OK — >= 256 bits (source: KLAXON_ANONYMIZATION_SALT length only; the salt itself is never emitted)
 quarantine_backlog: WARN — 340 doc(s) since 06:00 UTC in the last 24h — investigate cause (source: POST /klaxon-quarantine-customer-a-v5-*/_count)
-rbac: OK — klaxon_llm_report_customer-a present (grants: klaxon-masked-customer-a-v5-*); klaxon_ops_customer-a present ... (source: roles-<tenant>.yaml fragment vs GET /_plugins/_security/api/roles)
+rbac: OK — klaxon_llm_report_customer-a present (grants: klaxon-masked-customer-a-v5*); klaxon_ops_customer-a present ... (source: roles-<tenant>.yaml fragment vs GET /_plugins/_security/api/roles)
 retention: OK — masked 30d / quarantine 90d (source: masked_stream.DEFAULT_RETENTION_DAYS / QUARANTINE_RETENTION_DAYS)
 startup_fail_closed: OK — no masked_streams pattern overlaps the quarantine stream (source: Config.from_env() / quarantine_pattern_overlap)
 ```

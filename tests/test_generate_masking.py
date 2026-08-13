@@ -14,6 +14,7 @@ the deploy-time salt comparison helpers.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 from pathlib import Path
@@ -515,7 +516,7 @@ def test_ism_policy_retention_and_priority(cfg: Any) -> None:
     assert hot["transitions"][0]["conditions"]["min_index_age"] == "14d"
     assert ism["policy"]["ism_template"]["priority"] == 100
     assert ism["policy"]["ism_template"]["index_patterns"] == [
-        "klaxon-masked-test-a-v5-*"
+        "klaxon-masked-test-a-v5*"
     ]
 
 
@@ -661,13 +662,34 @@ def test_config_fragment_matches_fields_yaml(cfg: Any) -> None:
         "host.hostname",
         "related.ip",
     ]
-    assert data["anonymization"]["masked_streams"] == ["klaxon-masked-test-a-v5-*"]
+    assert data["anonymization"]["masked_streams"] == ["klaxon-masked-test-a-v5*"]
     assert data["anonymization"]["mask_free_text_fields"] == ["message"]
     kinds = {p["field"]: p["type"] for p in data["gdpr_checker"]["custom_patterns"]}
     assert kinds["destination.ip"] == "IP_ADDRESS"
     assert kinds["user.name"] == "USERNAME"
     assert kinds["user.effective.name"] == "USERNAME"
     assert kinds["host.hostname"] == "HOSTNAME"
+
+
+def test_masked_stream_pattern_matches_data_stream_name(cfg: Any) -> None:
+    """An index pattern ending in '-*' must NOT be silently used for a data
+    stream whose name lacks the trailing '-' — it would match neither the
+    stream name nor resolve to its backing indices, and every query would
+    return 0 documents (the klaxon-masked-sec73-v5 divergence). The effective
+    masked_streams pattern must glob-match the actual data stream name
+    (klaxon-masked-<tenant>-v5, no trailing dash)."""
+    # The stream name has NO trailing dash; the pattern is `-v5*`, never `-v5-*`.
+    assert not cfg.masked_stream.endswith("-")
+    assert cfg.masked_stream_pattern == "klaxon-masked-test-a-v5*"
+    assert not cfg.masked_stream_pattern.endswith("-*")
+    # The generated config fragment (the effective masked_streams source)
+    # carries the SAME pattern and it must match the stream name itself.
+    fragment = yaml.safe_load(build_config_fragment(cfg))
+    streams = fragment["anonymization"]["masked_streams"]
+    assert streams == [cfg.masked_stream_pattern]
+    assert all(
+        fnmatch.fnmatchcase(cfg.masked_stream, pattern) for pattern in streams
+    ), "masked_streams must match the actual data stream name pattern"
 
 
 def test_config_fragment_custom_patterns_use_field_key_not_pattern(cfg: Any) -> None:

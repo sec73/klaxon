@@ -2,7 +2,7 @@
 
 > **Status: implemented & live-verified — NOT deployed.** The generator, the
 > self-test and the live `klaxon masking test` all cover Option B, but no
-> `klaxon-masked-<tenant>-v5-*` data stream exists on the indexer yet (0
+> `klaxon-masked-<tenant>-v5` data stream exists on the indexer yet (0
 > shards). Deploying is the operator's/CI's job — see
 > [Deploying and running](#deploying-and-running).
 
@@ -36,7 +36,7 @@ Hard constraints, enforced in code:
 ```mermaid
 flowchart LR
     RAW[wazuh-events-v5-*<br/>raw, never written] -->|sync job reads a window| SYNC[klaxon-mcp --sync-masked]
-    SYNC -->|"_reindex through<br/>klaxon-mask-<tenant>"| MASKED[klaxon-masked-&lt;tenant&gt;-v5-*]
+    SYNC -->|"_reindex through<br/>klaxon-mask-<tenant>"| MASKED[klaxon-masked-&lt;tenant&gt;-v5*]
     MASKED -->|queries only| R[reports / LLM]
     MASKED -->|ISM 30d| DEL[delete]
     MASKED -. "on_failure reroutes<br/>masking failures" .-> QUAR[klaxon-quarantine-&lt;tenant&gt;-v5-*<br/>raw, forensics]
@@ -55,7 +55,7 @@ artifacts from it:
 * `tenants/<tenant>/generated/klaxon-config.yaml` — the Klaxon config fragment
   (`anonymization.mask_fields`, `masked_streams`, `mask_free_text_users`,
   `mask_free_text_fields`, `gdpr_checker.custom_patterns`). Merge it into the
-  server config. `masked_streams` lists **only** `klaxon-masked-<tenant>-v5-*` —
+  server config. `masked_streams` lists **only** `klaxon-masked-<tenant>-v5*` —
   the quarantine stream is deliberately **never** added (see
   [Startup fail-closed check](#startup-fail-closed-check)).
 * `tenants/<tenant>/generated/pipeline-klaxon-mask-<tenant>.json` — the ingest
@@ -223,7 +223,7 @@ The salt is the HMAC key: keep it ≥ 256 bits, restrict who can read it, and do
 The quarantine stream `klaxon-quarantine-<tenant>-v5-*` holds documents whose
 masking threw (raw, unmasked, with `klaxon.masking_error` and the quarantine
 metadata). It is deliberately **not** named `klaxon-masked-*`, so it can never
-overlap the LLM allowlist `klaxon-masked-<tenant>-v5-*` — an LLM query through
+overlap the LLM allowlist `klaxon-masked-<tenant>-v5*` — an LLM query through
 Klaxon can never read it. It exists to answer the forensic questions a masking
 failure raises: *which document failed, why, and what was its original content?*
 
@@ -263,7 +263,7 @@ klaxon masking migrate --tenant customer-a            # migrate + delete
 klaxon masking migrate --tenant customer-a --dry-run  # show what would happen
 ```
 
-The command finds `klaxon.masking_error` docs in `klaxon-masked-<tenant>-v5-*`,
+The command finds `klaxon.masking_error` docs in `klaxon-masked-<tenant>-v5*`,
 reindexes them into `klaxon-quarantine-<tenant>-v5-raw` (`op_type: create`,
 `conflicts: proceed`, **no masking pipeline** — quarantine never re-enters
 masking), then deletes them from the masked stream (`_delete_by_query`) and
@@ -459,8 +459,12 @@ klaxon-mcp --apply-masked-infra --tenant customer-a --retention-days 14
 
 The index templates (`priority` 200) match `klaxon-masked-<tenant>-v5*` /
 `klaxon-quarantine-<tenant>-v5*` (each data stream name plus its backing
-indices); the ISM templates (`priority` 100) match the concrete backing-index
-patterns `...-v5-*`. Wazuh streams are untouched.
+indices). The SAME `...-v5*` pattern is used everywhere for the masked stream —
+queries, the `masked_streams` allowlist, the ISM `ism_template` and the report
+role — because the data stream is named `klaxon-masked-<tenant>-v5` (no
+trailing dash): a `...-v5-*` pattern matches neither the stream name nor its
+backing indices and would silently return 0 documents. Wazuh streams are
+untouched.
 
 ## Access control
 
@@ -471,7 +475,7 @@ cluster):
 
 | Role | Reads | Notes |
 |---|---|---|
-| `klaxon_llm_report_<tenant>` | `klaxon-masked-<tenant>-v5-*` **only** | Can never read the quarantine stream or the raw stream. |
+| `klaxon_llm_report_<tenant>` | `klaxon-masked-<tenant>-v5*` **only** | Can never read the quarantine stream or the raw stream. |
 | `klaxon_ops_<tenant>` | `klaxon-quarantine-<tenant>-v5-*` + `wazuh-events-v5-*` | Forensics. No LLM mapping. |
 | `klaxon_sync_<tenant>` | `wazuh-events-v5-*` (reindex source) | Writes the masked + quarantine streams + `crud` on `klaxon-sync-state`. |
 
@@ -489,7 +493,7 @@ LLM/report role.
 `masked_streams` (env `KLAXON_ANONYMIZATION_MASKED_STREAMS`, or the generated
 config fragment) lists the masked stream patterns. The response layer treats
 those streams' values as already masked and passes tokens through unchanged.
-Reports and LLM tool calls should query `klaxon-masked-<tenant>-v5-*` instead
+Reports and LLM tool calls should query `klaxon-masked-<tenant>-v5*` instead
 of `wazuh-events-v5-*`. **Never** add `klaxon-quarantine-<tenant>-v5-*` to
 `masked_streams` — Klaxon refuses to start if you do (fail-closed).
 

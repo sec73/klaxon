@@ -1,6 +1,6 @@
 {
   "policy": {
-    "description": "Short retention for the masked stream klaxon-masked-customer-a-v5-*.",
+    "description": "Short retention for the masked stream klaxon-masked-customer-a-v5*.",
     "default_state": "hot",
     "states": [
       {
@@ -34,7 +34,7 @@
     ],
     "ism_template": {
       "index_patterns": [
-        "klaxon-masked-customer-a-v5-*"
+        "klaxon-masked-customer-a-v5*"
       ],
       "priority": 100
     }

@@ -22,6 +22,7 @@ explicitly ("unknown — <reason>") instead of silently skipping or guessing.
 
 from __future__ import annotations
 
+import fnmatch
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -88,13 +89,19 @@ def _gate_line(anon: AnonymizationConfig) -> str:
     )
 
 
-async def _data_stream_present(client: IndexerClient, pattern: str) -> bool:
-    """Whether a data stream matching `pattern` exists on the indexer."""
+async def _data_stream_names(client: IndexerClient, pattern: str) -> list[str]:
+    """The names of data streams matching `pattern` on the indexer."""
     resp = await client.get(f"/_data_stream/{pattern}")
     if not resp.ok:
-        return False
+        return []
     parsed = resp.json()
-    return bool(parsed.get("data_streams")) if isinstance(parsed, dict) else False
+    if not isinstance(parsed, dict):
+        return []
+    return [
+        str(ds.get("name"))
+        for ds in parsed.get("data_streams") or []
+        if isinstance(ds, dict) and ds.get("name")
+    ]
 
 
 async def _mode_line(
@@ -103,21 +110,39 @@ async def _mode_line(
     masked_pattern = f"{cfg.masked_stream}*"
     quarantine_pattern = f"{cfg.quarantine_stream}*"
     try:
-        masked_exists = await _data_stream_present(client, masked_pattern)
-        quarantine_exists = await _data_stream_present(client, quarantine_pattern)
+        masked_live = await _data_stream_names(client, masked_pattern)
+        quarantine_live = await _data_stream_names(client, quarantine_pattern)
     except TransportError as exc:
         return (
             f"mode: unknown — indexer not reachable: {exc} "
             f"(source: GET /_data_stream/{masked_pattern})"
         )
 
+    masked_exists = bool(masked_live)
+    quarantine_exists = bool(quarantine_live)
     cfg_masked = ", ".join(masked_streams) if masked_streams else "none configured"
     if masked_exists:
-        status = "OK"
-        fact = (
-            f"masked stream present ({cfg.masked_stream_pattern}); "
-            f"masked_streams config: {cfg_masked}"
-        )
+        live = ", ".join(masked_live)
+        # The DEPLOYED data stream name must be covered by the configured
+        # masked_streams allowlist, or Klaxon queries it with a pattern that
+        # matches nothing (the divergence this guard exists to catch: stream
+        # `klaxon-masked-<tenant>-v5` vs a config of `...-v5-*`).
+        covered = any(
+            fnmatch.fnmatchcase(name, pattern)
+            for name in masked_live
+            for pattern in masked_streams
+        ) if masked_streams else False
+        if not covered:
+            status = "WARN"
+            fact = (
+                f"masked stream present ({live}) but NOT covered by the "
+                f"masked_streams config ({cfg_masked}) — Klaxon queries would "
+                "match nothing; align the config pattern with the data stream "
+                "name"
+            )
+        else:
+            status = "OK"
+            fact = f"masked stream present ({live}); masked_streams config: {cfg_masked}"
     else:
         status = "WARN"
         fact = (

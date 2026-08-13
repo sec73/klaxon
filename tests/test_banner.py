@@ -36,7 +36,7 @@ def make_config(
     llm_base_url: str = "",
     whitelist_enabled: bool = True,
     mask_fields: tuple[str, ...] = ("user.name", "source.ip"),
-    masked_streams: tuple[str, ...] = ("klaxon-masked-customer-a-v5-*",),
+    masked_streams: tuple[str, ...] = ("klaxon-masked-customer-a-v5*",),
 ) -> Config:
     return Config(
         indexer_url="https://indexer.example:9200",
@@ -77,7 +77,7 @@ class TestSafetyBanner:
     def test_no_banner_in_safe_state_loopback(self) -> None:
         # Masking on + masked stream + loopback LLM: nothing to warn about.
         lines = safety_banner(
-            cfg(llm_base_url="http://127.0.0.1:11434"), "klaxon-masked-customer-a-v5-*"
+            cfg(llm_base_url="http://127.0.0.1:11434"), "klaxon-masked-customer-a-v5*"
         )
         assert lines == []
 
@@ -86,23 +86,23 @@ class TestSafetyBanner:
         # active: no banner.
         lines = safety_banner(
             cfg(llm_base_url="https://api.deepseek.com"),
-            "klaxon-masked-customer-a-v5-*",
+            "klaxon-masked-customer-a-v5*",
         )
         assert lines == []
 
     def test_masking_feature_off_emits_unmasked(self) -> None:
-        lines = safety_banner(cfg(enabled=False), "klaxon-masked-customer-a-v5-*")
+        lines = safety_banner(cfg(enabled=False), "klaxon-masked-customer-a-v5*")
         assert "UNMASKED MODE" in tags(lines)
         assert any("Anonymization is disabled" in line for line in lines)
 
     def test_empty_mask_fields_emits_unmasked(self) -> None:
-        lines = safety_banner(cfg(mask_fields=()), "klaxon-masked-customer-a-v5-*")
+        lines = safety_banner(cfg(mask_fields=()), "klaxon-masked-customer-a-v5*")
         assert "UNMASKED MODE" in tags(lines)
 
     def test_external_llm_gate_off_emits_unmasked(self) -> None:
         lines = safety_banner(
             cfg(llm_base_url="https://api.deepseek.com", whitelist_enabled=False),
-            "klaxon-masked-customer-a-v5-*",
+            "klaxon-masked-customer-a-v5*",
         )
         assert "UNMASKED MODE" in tags(lines)
         assert any("response gate is inactive" in line for line in lines)
@@ -110,7 +110,7 @@ class TestSafetyBanner:
     def test_external_llm_gate_on_has_no_gate_line(self) -> None:
         lines = safety_banner(
             cfg(llm_base_url="https://api.deepseek.com"),
-            "klaxon-masked-customer-a-v5-*",
+            "klaxon-masked-customer-a-v5*",
         )
         assert not any("response gate is inactive" in line for line in lines)
 
@@ -128,13 +128,24 @@ class TestSafetyBanner:
         assert "RAW STREAM QUERY" in tags(lines)
 
     def test_masked_index_has_no_raw_stream_banner(self) -> None:
-        lines = safety_banner(cfg(), "klaxon-masked-customer-a-v5-*")
+        lines = safety_banner(cfg(), "klaxon-masked-customer-a-v5*")
+        assert "RAW STREAM QUERY" not in tags(lines)
+
+    def test_covered_masked_pattern_is_never_raw(self) -> None:
+        """Raw-vs-masked is decided against the EFFECTIVE masked_streams value:
+        an index covered by a configured masked stream is never flagged raw,
+        even under a raw-looking prefix (defensive — the wazuh-* and
+        klaxon-masked-* namespaces do not currently overlap)."""
+        lines = safety_banner(
+            cfg(masked_streams=("wazuh-events-v5-masked-*",)),
+            "wazuh-events-v5-masked-*",
+        )
         assert "RAW STREAM QUERY" not in tags(lines)
 
     def test_banner_never_contains_salt_or_tokens(self) -> None:
         # Only the condition + reason + index pattern; no salt, no raw values,
         # no token shapes.
-        for index in ("wazuh-events-v5-*", "klaxon-masked-customer-a-v5-*"):
+        for index in ("wazuh-events-v5-*", "klaxon-masked-customer-a-v5*"):
             for line in safety_banner(
                 cfg(enabled=False, whitelist_enabled=False), index
             ):
@@ -209,12 +220,12 @@ class TestSearchBanner:
 
     async def test_safe_state_no_banner(self, run_search: Any) -> None:
         run_search(llm_base_url="http://127.0.0.1:11434")
-        out = await run("klaxon-masked-customer-a-v5-*", {"query": {"match_all": {}}})
+        out = await run("klaxon-masked-customer-a-v5*", {"query": {"match_all": {}}})
         assert "[UNMASKED MODE]" not in out
         assert "[RAW STREAM QUERY]" not in out
 
     async def test_external_gate_off_banner_on_masked_index(self, run_search: Any) -> None:
         run_search(llm_base_url="https://api.deepseek.com", whitelist_enabled=False)
-        out = await run("klaxon-masked-customer-a-v5-*", {"query": {"match_all": {}}})
+        out = await run("klaxon-masked-customer-a-v5*", {"query": {"match_all": {}}})
         assert "[UNMASKED MODE]" in out
         assert "[RAW STREAM QUERY]" not in out

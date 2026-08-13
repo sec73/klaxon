@@ -75,7 +75,16 @@ class TenantConfig:
 
     @property
     def masked_stream_pattern(self) -> str:
-        return f"{self.masked_stream}-*"
+        """Query/allowlist pattern for the masked data stream.
+
+        `klaxon-masked-<tenant>-v5*` (NOT `...-v5-*`): the data stream is named
+        `klaxon-masked-<tenant>-v5` with NO trailing dash (see `masked_stream`),
+        so a `-*` suffix matches neither the stream name nor resolves to its
+        backing indices, and every query returns 0 documents. The `*` directly
+        after `v5` matches the stream name itself and its `...-v5-000001`
+        backing indices.
+        """
+        return f"{self.masked_stream}*"
 
     @property
     def quarantine_index_template_name(self) -> str:
@@ -89,9 +98,9 @@ class TenantConfig:
     def quarantine_stream_pattern(self) -> str:
         """Query/ISM pattern for the quarantine data stream.
 
-        Deliberately NOT `klaxon-masked-<tenant>-v5-*` — the quarantine stream
+        Deliberately NOT `klaxon-masked-<tenant>-v5*` — the quarantine stream
         lives in its OWN `klaxon-quarantine-` namespace so it can never overlap
-        the LLM allowlist `klaxon-masked-<tenant>-v5-*`.
+        the LLM allowlist `klaxon-masked-<tenant>-v5*`.
         """
         return f"{self.quarantine_stream}-*"
 
@@ -152,7 +161,7 @@ def find_tenant_dir(tenant: str, root: str | Path | None = None) -> Path:
 
     The tenant name is validated here — the single choke point before it is
     used as a path component, a resource name and an index-pattern component
-    everywhere downstream (`klaxon-mask-<tenant>`, `klaxon-masked-<tenant>-v5-*`,
+    everywhere downstream (`klaxon-mask-<tenant>`, `klaxon-masked-<tenant>-v5*`,
     sync-state doc id, ...).
     """
     base = Path(root) if root is not None else find_repo_root()

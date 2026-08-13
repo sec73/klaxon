@@ -137,7 +137,7 @@ scheme change — it only checks that the generated Painless is byte-identical t
 `derive_token`; the operational migration is the operator's job.
 
 **Status: settle before the first productive deploy.** Option B is currently
-**not deployed** (`klaxon-masked-*-v5-*` = 0 shards) — so there is **no
+**not deployed** (`klaxon-masked-*-v5*` = 0 shards) — so there is **no
 production data** to migrate today. This is not an urgent incident, but a
 **must-fix before the first productive deploy / migration window**: the scheme
 change 0.1.8 → 0.1.9 has already happened, so the operator must decide before

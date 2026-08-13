@@ -10,6 +10,28 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The masked-stream pattern is now consistent everywhere
+  (`klaxon-masked-<tenant>-v5*`), fixing queries that silently returned 0
+  documents against a deployed Option B data stream.** The data stream is named
+  `klaxon-masked-<tenant>-v5` (no trailing dash), but every query/config path
+  used `klaxon-masked-<tenant>-v5-*`, which matches neither the stream name nor
+  its `...-v5-000001` backing indices — so `masked_streams`, the report-role
+  allowlist, the sync backstop counts and LLM queries all matched nothing
+  (live: 1.23M correctly-masked docs invisible to consumers). The single source
+  `TenantConfig.masked_stream_pattern` is now `...-v5*`; the generated config
+  fragment (`masked_streams`), the ISM `ism_template`, the roles fragment
+  (`klaxon_llm_report_<tenant>`) and the Painless comments all flow from it.
+  The `[RAW STREAM QUERY]` banner now decides raw-vs-masked against the
+  EFFECTIVE `masked_streams` value (an index covered by a configured masked
+  stream is never flagged raw). The posture check's `mode` now also WARNs when a
+  deployed masked data stream is NOT covered by the configured `masked_streams`
+  (the divergence guard), instead of reporting OK. No reindex, no checkpoint
+  change, no masking/pipeline/quarantine change — only the naming scheme, plus
+  the committed/golden artifacts regenerated from it. New unit test asserts the
+  effective `masked_streams` value glob-matches the actual data stream name
+  (an index pattern ending in `-*` must not be used for a stream without the
+  trailing `-`).
+
 - **`klaxon masking deploy` no longer fails with HTTP 409 when an ISM policy
   already exists.** ISM policies are versioned documents: updating an existing
   one requires `?if_seq_no=<seq>&if_primary_term=<term>` taken from a prior
@@ -124,7 +146,7 @@ section) and `docs/TOOLS.md`.
   no fields configured), the LLM endpoint is not local (no loopback) and the
   response gate (`whitelist_enabled`) is inactive, or the query targeted a raw
   stream (`wazuh-events-v5-*` / `wazuh-findings-v5-*`) instead of a masked
-  stream (`klaxon-masked-<tenant>-v5-*`). Automatic (no opt-in, no separate
+  stream (`klaxon-masked-<tenant>-v5*`). Automatic (no opt-in, no separate
   tool), fires on every response including zero-hit/error/aggregation-only
   ones, and never contains values, tokens or the salt. New
   `diagnostics.safety_banner`; wired into `search` and `findings_overview`
@@ -260,7 +282,7 @@ Verified against a live OpenSearch 3.6.0 indexer.
   the LLM allowlist can never read quarantine (raw) data. The generated config
   fragment never adds the quarantine stream.
 - **Access control** (roles fragment): LLM/report role reads
-  `klaxon-masked-<tenant>-v5-*` ONLY; ops role reads quarantine + raw events;
+  `klaxon-masked-<tenant>-v5*` ONLY; ops role reads quarantine + raw events;
   the sync service user additionally WRITES the quarantine stream (without it,
   the security plugin rejects the on_failure reroute — a fail-closed backstop).
 - **Live test Stage C** (`klaxon masking test`): a forced masking failure is

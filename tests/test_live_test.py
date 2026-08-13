@@ -291,7 +291,9 @@ def test_check_quarantine_routing_passes_on_expected_reroute(cfg: Any) -> None:
 
 def test_check_quarantine_routing_flags_wrong_index(cfg: Any) -> None:
     sources = [_rerouted_source()]
-    indexes = [cfg.masked_stream_pattern.replace("-*", "-000001")]
+    # A masking-failure doc that landed in the MASKED stream (concrete backing
+    # index name) instead of the quarantine routing index must be flagged.
+    indexes = [f"{cfg.masked_stream}-000001"]
     problems = live_test.check_quarantine_routing(sources, indexes, cfg)
     assert any(cfg.quarantine_routing_index in p for p in problems)
 

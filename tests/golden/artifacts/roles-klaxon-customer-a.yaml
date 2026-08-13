@@ -4,7 +4,7 @@
 # klaxon-provenance: {"generated_by":"klaxon masking generate","generator_version":"0.1.9","sha256":"57779b1435c6f56b08a399efc85fce103a78457a86fbe29b8d72f2670900408f","source":"tenants/customer-a/fields.yaml","tenant":"customer-a"}
 #
 # Fail-closed access model:
-#   * LLM/report role reads ONLY klaxon-masked-customer-a-v5-* — it can never
+#   * LLM/report role reads ONLY klaxon-masked-customer-a-v5* — it can never
 #     read the quarantine stream (no klaxon-quarantine- pattern).
 #   * Ops/security role reads the quarantine stream + raw wazuh-events-v5-*.
 #   * Sync-job service user additionally WRITES the quarantine stream; without
@@ -19,7 +19,7 @@ klaxon_llm_report_customer-a:
   cluster_permissions: []
   index_permissions:
     - index_patterns:
-        - "klaxon-masked-customer-a-v5-*"
+        - "klaxon-masked-customer-a-v5*"
       allowed_actions:
         - "read"
   tenant_permissions: []
@@ -44,7 +44,7 @@ klaxon_sync_customer-a:
   cluster_permissions: []
   index_permissions:
     - index_patterns:
-        - "klaxon-masked-customer-a-v5-*"
+        - "klaxon-masked-customer-a-v5*"
         - "klaxon-quarantine-customer-a-v5-*"
       allowed_actions:
         - "write"

@@ -420,7 +420,7 @@ vLLM on localhost) are exempted by a loopback `KLAXON_LLM_BASE_URL`.
 For report/LLM consumers, masking once at ingest beats masking per query. The
 Option B design (full detail in `docs/option-b-masked-stream.md`) reindexes a
 recent window of the raw Wazuh stream through a generated ingest pipeline into
-a separate stream `klaxon-masked-<tenant>-v5-*`; the raw stream is never
+a separate stream `klaxon-masked-<tenant>-v5*`; the raw stream is never
 written to. `klaxon masking generate` is the **single** generator: it builds the seven
 artifacts — the config fragment, the ingest pipeline, the masked-stream ISM
 policy + index template, the quarantine ISM policy + index template (fail-

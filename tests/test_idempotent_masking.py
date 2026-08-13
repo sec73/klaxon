@@ -171,6 +171,6 @@ class TestNoDoubleMasking:
         # The pipeline scheme ([FAMILY_<16 hex>]) is exactly what the response
         # layer's passthrough recognises, so stream tokens stay stable.
         pipeline_token = token(IP, "10.0.0.1")
-        a = anon(masked_streams=("klaxon-masked-customer-a-v5-*",))
+        a = anon(masked_streams=("klaxon-masked-customer-a-v5*",))
         out = a.mask_json({"_source": {"source.ip": pipeline_token}})
         assert out["_source"]["source.ip"] == pipeline_token
