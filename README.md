@@ -90,14 +90,17 @@ body=…)` and returns the masked response:
 ```json
 {
   "hits": { "hits": [ { "_source": {
-      "user":    { "name": "[USER_9f2a1c…]" },
-      "source":  { "ip": "[IP_5c01e7…]" },
-      "message": "user [USER_9f2a1c…] logged in via ssh from [IP_5c01e7…]"
+      "user":    { "name": "[USER_9f2a1c467dd5e2b8]" },
+      "source":  { "ip": "[IP_5c01e73f9a2b4c1d]" },
+      "message": "user [USER_9f2a1c467dd5e2b8] logged in via ssh from [IP_5c01e73f9a2b4c1d]"
   } } ] }
 }
 ```
 
-The same value always maps to the same token; the personal data never appears.
+The same value always maps to the same token. Masking is pseudonymization, not
+anonymization, and it has documented blind spots — see
+[`docs/llm-safety.md`](docs/llm-safety.md) (in particular the verified leaks in
+"Known limitations") before pointing an external model at Klaxon.
 
 ---
 

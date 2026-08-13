@@ -399,10 +399,12 @@ Three mechanisms, in order (see `src/klaxon_mcp/anonymization.py`):
    (a username in unrecognised free text), the gate still covers the classes
    that can be verified mechanically.
 
-**Determinism and no-PII-by-default.** Placeholders are derived from the value
-itself (MD5 or SHA-256, truncated to six hex digits), so the same value maps to
-the same placeholder across requests without shared state. The audit log stores
-MASKED output only; RAW output is written only when
+**Determinism and no-PII-by-default.** Tokens are derived from the value and
+its family by `HMAC-SHA256(key = salt, message = "kind:value")`, truncated to
+the first **16 hex** chars (64 bits) — the MD5/SHA-256 six-hex scheme was
+replaced in 0.1.9 because 24 bits was reversible. `use_hash=false` switches to
+generic labels (`[USERNAME]`, `[IP_ADDRESS]`, …) instead of keyed tokens. The
+audit log stores MASKED output only; RAW output is written only when
 `KLAXON_ANONYMIZATION_LOG_RAW=true`, which makes the log a personal-data store
 and is warned about. The compliance report and the export command both emit
 placeholders and counts, never the underlying values — the export drops RAW
@@ -419,11 +421,13 @@ For report/LLM consumers, masking once at ingest beats masking per query. The
 Option B design (full detail in `docs/option-b-masked-stream.md`) reindexes a
 recent window of the raw Wazuh stream through a generated ingest pipeline into
 a separate stream `klaxon-masked-<tenant>-v5-*`; the raw stream is never
-written to. `klaxon masking generate` is the **single** generator: it builds
-the config fragment, the ingest pipeline, the ISM policy and the index template
-from `tenants/<tenant>/fields.yaml`, with the field list injected into the
-Painless script as a table (no hardcoded field names) and the salt carried as
-the script processor's `params.salt`.
+written to. `klaxon masking generate` is the **single** generator: it builds the seven
+artifacts — the config fragment, the ingest pipeline, the masked-stream ISM
+policy + index template, the quarantine ISM policy + index template (fail-
+closed `on_failure` routing) and the security-plugin roles fragment — from
+`tenants/<tenant>/fields.yaml`, with the field list injected into the Painless
+script as a table (no hardcoded field names) and the salt carried as the
+script processor's `params.salt`.
 
 Two properties of the design are load-bearing:
 

@@ -318,9 +318,10 @@ inside username formulations — to avoid false positives, and numeric ids
 (`uid=0`) are not usernames and are left alone.
 
 **Token format.** Tokens are `[FAMILY_…]` with 16 hex chars (64 bits of
-entropy), derived by keyed HMAC-SHA256 over `salt` with the family as context,
-so `[USER_…]` and `[HOST_…]` never collide for the same value and dictionary
-reversal of a token is infeasible. Set `KLAXON_ANONYMIZATION_SALT` for a stable
+entropy), derived by `HMAC-SHA256(key = salt, message = "family:value")` (the
+salt is the key, the family is part of the message), so `[USER_…]` and
+`[HOST_…]` never collide for the same value and dictionary reversal of a token
+is infeasible. Set `KLAXON_ANONYMIZATION_SALT` for a stable
 salt across restarts; when unset a random salt is generated once and persisted
 next to the config file (`config.yaml.salt`, gitignored) with a warning. Tokens
 are per-response and never stored, so changing the salt needs no reindex.
