@@ -24,6 +24,23 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`klaxon_posture_check` — on-demand security/DSGVO posture check (facts +
+  gaps, never a verdict).** Read-only MCP tool returning one `check: status —
+  fact` line per item with source attribution: masking, response gate +
+  loopback, mode (response-layer vs Option B masked stream, derived from
+  `masked_streams` config vs which data streams actually exist on the indexer),
+  pipeline drift vs `fields.yaml` (reuses verify-config), salt strength
+  (length-only, via `weak_salt()`), quarantine backlog (count over the last
+  `hours`, default 24), RBAC tenant roles (`klaxon_llm_report_<tenant>` /
+  `klaxon_ops_<tenant>` / `klaxon_sync_<tenant>`, fragment vs the OpenSearch
+  security roles API), retention (masked 30d / quarantine 90d), and the
+  startup fail-closed check. Statuses are OK / WARN / unknown only — no overall
+  compliance verdict, no legal judgment. The salt is never emitted (not even
+  partially, not hashed); no PII, raw values, tokens, hostnames, usernames, IPs
+  or sampled values appear in the output; an unreachable indexer yields
+  "unknown — reason" per check. New `src/klaxon_mcp/posture.py`; tool wired
+  into the MCP server. Read-only: nothing written, nothing deployed.
+
 - **Automatic safety banner in the diagnostics layer** (`[UNMASKED MODE]` /
   `[RAW STREAM QUERY]`). Every search response is prefixed — before any other
   diagnostics line — with a one-line banner per active condition whenever the

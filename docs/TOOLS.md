@@ -426,6 +426,45 @@ naming sensitive fields present in the hits.
 
 ---
 
+## `klaxon_posture_check`
+
+Read-only security/DSGVO posture check: **facts + gaps, never a verdict.** It
+returns one `check: status — fact` line per item, each traceable to its source
+(config field / CLI check / indexer API). Statuses are `OK` / `WARN` / `unknown`
+only — there is no overall compliance verdict and no legal judgment (the same
+principle as `gdpr_check`: report what can be established, nothing more).
+
+| Parameter | Type | |
+|---|---|---|
+| `tenant` | string | default `customer-a` — whose masked/quarantine streams and RBAC roles are checked |
+| `hours` | int | default `24` — quarantine-backlog window |
+
+The nine checks:
+
+```
+masking: OK — 19 field(s) masked, aggregation keys on, free-text users on (source: config.anonymization.*)
+response_gate: OK — llm_base_url is loopback (local model) (source: config.anonymization.llm_base_url loopback check)
+mode: WARN — response-layer masking only; klaxon-masked-customer-a-v5-* is not present on the indexer (Option B not deployed); quarantine stream not present (planned, not implemented) (source: config.anonymization.masked_streams + GET /_data_stream)
+pipeline_drift: OK — fingerprint matches fields.yaml (source: verify-config / fingerprint_matches)
+salt_strength: OK — >= 256 bits (source: KLAXON_ANONYMIZATION_SALT length only; the salt itself is never emitted)
+quarantine_backlog: WARN — 340 doc(s) since 06:00 UTC in the last 24h — investigate cause (source: POST /klaxon-quarantine-customer-a-v5-*/_count)
+rbac: OK — klaxon_llm_report_customer-a present (grants: klaxon-masked-customer-a-v5-*); klaxon_ops_customer-a present ... (source: roles-<tenant>.yaml fragment vs GET /_plugins/_security/api/roles)
+retention: OK — masked 30d / quarantine 90d (source: masked_stream.DEFAULT_RETENTION_DAYS / QUARANTINE_RETENTION_DAYS)
+startup_fail_closed: OK — no masked_streams pattern overlaps the quarantine stream (source: Config.from_env() / quarantine_pattern_overlap)
+```
+
+**Hard contract.** The tool is itself callable from chat, so its output must
+never leak what it checks: the salt is never emitted (not even partially, not
+hashed), and no PII, raw values, tokens, hostnames, usernames, IPs or sampled
+values appear — only counts, booleans, statuses, index patterns, durations and
+role names. The GDPR checker may sample values internally; those samples never
+reach this tool's output. If a check cannot be established (e.g. the indexer is
+unreachable), it reports `unknown — <reason>` instead of a guessed value.
+Read-only: nothing is written to the indexer, nothing deployed, no config
+change.
+
+---
+
 ## `klaxon masking` (Option B generator)
 
 Builds the deployable artifacts for the separate masked stream from

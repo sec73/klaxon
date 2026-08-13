@@ -117,6 +117,7 @@ The handful of tools a normal user needs (full reference:
 | `findings_overview` | Findings by severity, agent, title, category | `findings_overview(hours=48)` |
 | `logtest` | Push a raw line through the decoder chain | `logtest(event="<raw line>")` |
 | `gdpr_check` | Find sensitive fields the mask list should cover | `gdpr_check(index="wazuh-events-v5-*")` |
+| `klaxon_posture_check` | Read-only security posture: facts + gaps, no verdict | `klaxon_posture_check(tenant="customer-a")` |
 
 On an unfamiliar cluster, start with `field_coverage`. Every thin result gets a
 notice block before the data (empty aggregation, capped size, missing index —
