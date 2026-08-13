@@ -21,7 +21,7 @@ from typing import Any
 import httpx
 import pytest
 
-from klaxon_mcp.clients import ManagerClient, TransportError
+from klaxon_mcp.clients import IndexerClient, ManagerClient, TransportError
 from klaxon_mcp.config import Config
 
 MANAGER_URL = "https://manager.example:55000"
@@ -201,3 +201,39 @@ class TestAuthenticationFailures:
 
         response = await asyncio.wait_for(manager.get("/agents"), timeout=2)
         assert response.status_code == 200
+
+
+class TestIndexerClientPerRequestTimeout:
+    """IndexerClient.request forwards a per-request `timeout` to httpx (None
+    keeps the client-wide default). The long-running `_reindex` needs a much
+    more generous timeout than the short reads the default is sized for."""
+
+    async def test_timeout_is_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: dict[str, Any] = {}
+
+        class FakeHttp:
+            async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+                seen["timeout"] = kwargs.get("timeout")
+                return httpx.Response(
+                    200, text="{}", request=httpx.Request(method, url)
+                )
+
+        client = IndexerClient(make_config())
+        monkeypatch.setattr(client, "_ensure", lambda: FakeHttp())
+
+        await client.get("/_tasks/node:1", timeout=123.0)
+        assert seen["timeout"] == 123.0
+
+        # No timeout -> the httpx client default applies (None forwarded).
+        await client.post("/_reindex", body={"source": {}})
+        assert seen["timeout"] is None
+
+    async def test_transport_error_still_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class Boom:
+            async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+                raise httpx.ReadTimeout("read timed out")
+
+        client = IndexerClient(make_config())
+        monkeypatch.setattr(client, "_ensure", lambda: Boom())
+        with pytest.raises(TransportError, match="failed at transport level"):
+            await client.post("/_reindex", body={}, timeout=1800.0)

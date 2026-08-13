@@ -408,6 +408,30 @@ After every reindex, the sync job counts the quarantine stream for the window
 * The preflight (see above) refuses to sync on a deployed pipeline that lacks
   the quarantine `on_failure`.
 
+### Reindex transport: async task + polling + retry
+
+The reindex is submitted with `wait_for_completion=false`, so the `POST /_reindex`
+returns a task id immediately and the job then polls `GET /_tasks/<id>` until the
+task completes. A long synchronous `_reindex` connection is exactly what a proxy
+or load balancer closes on long requests — the transport-level failure that
+killed a large window. Submitting asynchronously and polling short requests
+avoids that whole class of failure.
+
+* The reindex POST and each task-poll GET use a **generous per-request timeout**
+  (`KLAXON_SYNC_REINDEX_TIMEOUT`, seconds, default `1800` = 30 min) instead of
+  the default short `WAZUH_TIMEOUT`; the overall deadline for the task to
+  complete is `KLAXON_SYNC_TASK_TIMEOUT` (seconds, default `3600` = 60 min).
+* **Transport-level failures** (connect/read timeout, connection reset, protocol
+  errors — the `httpx.TransportError` family) are **transient** and retried with
+  exponential backoff for the SAME window (3 attempts: 5s, 15s, 45s), then the
+  run fails with a clear message.
+* **HTTP 4xx/5xx** are reported with status + body and are **not** retried
+  blindly — they will not heal by retrying and would only amplify load on a
+  cluster that already answered.
+* The checkpoint advances **only** after the task completes without failures
+  (and the quarantine backstop is empty) — the fail-closed semantics are
+  unchanged.
+
 ### `klaxon.masking_error` — defense-in-depth filter
 
 Because masking failures are rerouted to the quarantine stream, the masked

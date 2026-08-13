@@ -27,7 +27,7 @@ from typing import Any
 import pytest
 
 from klaxon_mcp import sync_masked
-from klaxon_mcp.clients import Response
+from klaxon_mcp.clients import Response, TransportError
 from klaxon_mcp.config import AnonymizationConfig, Config
 from klaxon_mcp.masked_stream import (
     build_pipeline,
@@ -240,6 +240,11 @@ class FakeIndexer:
         self.reindex_ok = True
         self.reindex_failures: list[Any] | None = None
         self.reindex_created = 0
+        # Number of /_reindex posts that raise a transport-level error before
+        # the request succeeds (retry path). 0 = never fail at transport level.
+        self.reindex_transport_errors = 0
+        # When True, GET /_tasks/<id> never reports the reindex task completed.
+        self.task_pending = False
         self.masking_error_hits = 0
         # Fail-closed backstop counts, keyed by stream namespace.
         self.quarantine_hits = 0
@@ -251,8 +256,27 @@ class FakeIndexer:
             status, json.dumps(payload), f"https://indexer.example{path}"
         )
 
-    async def get(self, path: str, body: Any = None) -> Response:
+    async def get(
+        self, path: str, body: Any = None, params: Any = None, timeout: Any = None
+    ) -> Response:
         self.calls.append(("get", path, body))
+        if path.startswith("/_tasks/"):
+            if self.task_pending:
+                return self._resp(200, {"completed": False}, path)
+            return self._resp(
+                200,
+                {
+                    "completed": True,
+                    "task": {
+                        "status": {
+                            "total": self.reindex_created,
+                            "created": self.reindex_created,
+                            "failures": self.reindex_failures or [],
+                        }
+                    },
+                },
+                path,
+            )
         if path.startswith("/_ingest/pipeline/"):
             if self.deployed_pipeline is None:
                 return self._resp(404, {}, path)
@@ -270,11 +294,22 @@ class FakeIndexer:
             )
         return self._resp(404, {}, path)
 
-    async def post(self, path: str, body: Any = None) -> Response:
+    async def post(
+        self, path: str, body: Any = None, params: Any = None, timeout: Any = None
+    ) -> Response:
         self.calls.append(("post", path, body))
         if path.endswith("/_reindex"):
+            if self.reindex_transport_errors > 0:
+                self.reindex_transport_errors -= 1
+                raise TransportError(
+                    f"POST https://indexer.example{path} failed at transport "
+                    "level: ReadTimeout"
+                )
             if not self.reindex_ok:
                 return self._resp(500, {"error": {"type": "boom"}}, path)
+            if params and params.get("wait_for_completion") == "false":
+                # Async submission: returns a task id immediately.
+                return self._resp(200, {"task": "node:1"}, path)
             return self._resp(
                 200,
                 {
@@ -319,6 +354,8 @@ def _config(cfg: Any) -> Config:
         engine_url="",
         verify_ssl=False,
         timeout=60.0,
+        sync_reindex_timeout=1800.0,
+        sync_task_timeout=3600.0,
         schema_field_limit=200,
         schema_probe_batch=100,
         search_max_size=100,
@@ -353,7 +390,7 @@ def frozen_now(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _run_sync(
-    cfg: Any, fake: FakeIndexer, **kwargs: Any
+    cfg: Any, fake: FakeIndexer, *, config: Config | None = None, **kwargs: Any
 ) -> int:
     opts = {
         "overlap_hours": 1,
@@ -362,7 +399,7 @@ def _run_sync(
         **kwargs,
     }
     return asyncio.run(
-        sync_masked._sync(fake, cfg, _config(cfg), **opts)
+        sync_masked._sync(fake, cfg, config or _config(cfg), **opts)
     )
 
 
@@ -423,6 +460,122 @@ class TestSyncWindow:
         assert _run_sync(cfg, fake, dry_run=True) == 0
         assert _reindex_call(fake) is None
         assert _checkpoint_puts(fake) == []
+
+
+class TestSyncReindexTransportRetry:
+    """Transport-level failures are retried with backoff for the SAME window;
+    HTTP errors are reported with status + body, never retried blindly.
+    Checkpoint semantics stay fail-closed either way."""
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Do not sleep for real in tests.
+        monkeypatch.setattr(sync_masked, "SYNC_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+
+    def test_transport_error_retried_then_succeeds(
+        self, cfg: Any, capsys: Any
+    ) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.reindex_transport_errors = 1  # first attempt fails, second succeeds
+        assert _run_sync(cfg, fake) == 0
+        reindex_bodies = [
+            body
+            for kind, path, body in fake.calls
+            if kind == "post" and path.endswith("/_reindex")
+        ]
+        assert len(reindex_bodies) == 2
+        # The SAME window was retried (identical reindex bodies).
+        assert reindex_bodies[0] == reindex_bodies[1]
+        assert len(_checkpoint_puts(fake)) == 1
+        assert "retrying" in capsys.readouterr().err
+
+    def test_transport_error_exhausted_after_n_attempts(
+        self, cfg: Any, capsys: Any
+    ) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.reindex_transport_errors = 99  # never succeeds at transport level
+        assert _run_sync(cfg, fake) == 1
+        reindex_posts = [
+            body
+            for kind, path, body in fake.calls
+            if kind == "post" and path.endswith("/_reindex")
+        ]
+        assert len(reindex_posts) == sync_masked.SYNC_REINDEX_ATTEMPTS
+        assert _checkpoint_puts(fake) == []
+        err = capsys.readouterr().err
+        assert "failed at transport level after 3 attempts" in err
+        assert "checkpoint was NOT advanced" in err
+
+    def test_http_error_reported_not_retried(
+        self, cfg: Any, capsys: Any
+    ) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.reindex_ok = False  # HTTP 500 — an HTTP error, not a transport one
+        assert _run_sync(cfg, fake) == 1
+        reindex_posts = [
+            body
+            for kind, path, body in fake.calls
+            if kind == "post" and path.endswith("/_reindex")
+        ]
+        assert len(reindex_posts) == 1  # HTTP errors are NOT retried
+        assert _checkpoint_puts(fake) == []
+        err = capsys.readouterr().err
+        assert "HTTP 500" in err
+        assert "checkpoint NOT advanced" in err
+
+
+class TestSyncReindexTaskPoll:
+    """Async-task path: the reindex is submitted with wait_for_completion=false
+    and polled via GET /_tasks/<id>. Task completes -> checkpoint advances;
+    task fails or times out -> checkpoint NOT advanced."""
+
+    @pytest.fixture(autouse=True)
+    def _no_poll_sleep(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(sync_masked, "SYNC_TASK_POLL_SECONDS", 0.0)
+
+    def test_task_completes_checkpoint_advanced(self, cfg: Any) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.reindex_created = 7
+        assert _run_sync(cfg, fake) == 0
+        assert len(_checkpoint_puts(fake)) == 1
+        # Submitted as an async task, then polled.
+        assert any(
+            kind == "post" and path.endswith("/_reindex")
+            for kind, path, _ in fake.calls
+        )
+        assert any(
+            kind == "get" and path.startswith("/_tasks/")
+            for kind, path, _ in fake.calls
+        )
+
+    def test_task_failure_checkpoint_not_advanced(
+        self, cfg: Any, capsys: Any
+    ) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.reindex_failures = [{"index": "x", "reason": "boom"}]
+        assert _run_sync(cfg, fake) == 1
+        assert _checkpoint_puts(fake) == []
+        assert "failure(s)" in capsys.readouterr().err
+
+    def test_task_poll_timeout_checkpoint_not_advanced(
+        self, cfg: Any, capsys: Any
+    ) -> None:
+        from dataclasses import replace
+
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.task_pending = True  # the task never completes
+        config = replace(_config(cfg), sync_task_timeout=0.01)
+        assert _run_sync(cfg, fake, config=config) == 1
+        assert _checkpoint_puts(fake) == []
+        err = capsys.readouterr().err
+        assert "did not complete within" in err
+        assert "checkpoint NOT advanced" in err
 
 
 class TestSyncPreflight:

@@ -64,6 +64,8 @@ KLAXON_VARS = (
     "KLAXON_GDPR_CHECK_ON_SEARCH",
     "KLAXON_GDPR_INDEX",
     "KLAXON_CONFIG",
+    "KLAXON_SYNC_REINDEX_TIMEOUT",
+    "KLAXON_SYNC_TASK_TIMEOUT",
 )
 
 
@@ -278,6 +280,32 @@ class TestAnonymizationEnv:
         assert AnonymizationConfig.from_env().masked_streams == (
             "klaxon-masked-a-v5-*",
         )
+
+
+class TestSyncTimeouts:
+    """The Option B sync reindex uses a generous per-request timeout and a
+    separate overall task deadline (KLAXON_SYNC_REINDEX_TIMEOUT /
+    KLAXON_SYNC_TASK_TIMEOUT): the default short read timeout is what kills a
+    long-running `_reindex` at the transport level."""
+
+    def test_defaults_are_generous(self) -> None:
+        c = Config.from_env()
+        assert c.sync_reindex_timeout == 1800.0  # 30 min
+        assert c.sync_task_timeout == 3600.0  # 60 min
+
+    def test_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLAXON_SYNC_REINDEX_TIMEOUT", "900")
+        monkeypatch.setenv("KLAXON_SYNC_TASK_TIMEOUT", "7200")
+        c = Config.from_env()
+        assert c.sync_reindex_timeout == 900.0
+        assert c.sync_task_timeout == 7200.0
+
+    def test_a_non_numeric_timeout_is_a_config_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KLAXON_SYNC_REINDEX_TIMEOUT", "soon")
+        with pytest.raises(ConfigError, match="must be a number"):
+            Config.from_env()
 
 
 class TestQuarantineMaskedStreamsGuard:

@@ -53,6 +53,25 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `masked_stream.py`), so generated artifacts' `generator_version` could have
   been stamped wrong in that path.
 
+- **`klaxon-mcp --sync-masked` no longer dies on a transport-level reindex
+  timeout for a large window.** The reindex is now submitted as an async task
+  (`POST /_reindex?wait_for_completion=false` returns a task id immediately)
+  and polled via `GET /_tasks/<id>`, so a proxy/LB closing a long synchronous
+  connection cannot abort the run. The reindex POST and each task-poll GET use
+  a generous per-request timeout (`KLAXON_SYNC_REINDEX_TIMEOUT`, default 30
+  min) instead of the default short `WAZUH_TIMEOUT`, with an overall task
+  deadline `KLAXON_SYNC_TASK_TIMEOUT` (default 60 min). Transport-level
+  failures (the `httpx.TransportError` family) are retried with exponential
+  backoff for the SAME window (3 attempts: 5s, 15s, 45s) then fail with a clear
+  message; HTTP 4xx/5xx are reported with status + body and never retried
+  blindly. Checkpoint semantics are unchanged and stay fail-closed: the
+  checkpoint advances only after the task completes without failures, the
+  quarantine backstop is empty and (when enabled) the reconcile matches.
+  `IndexerClient.request`/`get`/`post` gained a per-request `timeout` override;
+  new unit tests mock the client for read-timeout-retried, exhausted-retries,
+  HTTP-not-retried, task-completes and task-times-out (no real cluster). See
+  `docs/option-b-masked-stream.md` "Reindex transport".
+
 ### Changed
 
 - `starlette` is now a declared direct dependency (upper-bounded `<2`).
