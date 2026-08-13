@@ -8,6 +8,17 @@ list, so you discover personal data you did not know you were collecting.
 The same logic is shared by the MCP tool (`gdpr_check`), the CLI
 (`klaxon-mcp --gdpr-check`) and the standalone `klaxon_check_gdpr` entry point.
 
+> **Scope matters (events vs. findings).** The checker runs against **one
+> `index` argument at a time**; coverage numbers are only meaningful with the
+> scope attached. On `wazuh-events-v5-*` it currently reports **"0 to add"**
+> for the leak fields — but that is a value-heuristic blind spot, not proof
+> there is nothing to add: `wazuh.rule.title`, `url.original`, `file.path` and
+> `file.owner` match no name pattern and their sampled values do not look like
+> IPs/e-mails, so they are missed even though they carry raw usernames,
+> hostnames and paths. On `wazuh-findings-v5-*` the checker reports ~120 open
+> DSGVO fields. Run it per index and treat a "0 to add" result as
+> scope-limited.
+
 ---
 
 ## Contents

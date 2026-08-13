@@ -60,6 +60,22 @@ external model at.
   acknowledged blind spot of the text pass; the structural + aggregation
   passes and the gate's residual scan are the guarantees that matter for the
   reliably detectable classes.
+- **Verified leaks in fields outside the mask list (checked live).** The
+  following fields are **neither** in the configured mask list **nor** covered
+  by the free-text pass (`message` only) **nor** by the residual gate, so their
+  raw values reach the LLM:
+  - `wazuh.rule.title` (findings) — `findings_overview` masks titles with the
+    value-type pass only (IPs/e-mails inside them), not a per-document
+    identity registry; a bare username survives (e.g. `Sudo command executed -
+    marco`) and Rootcheck titles carry raw `/root/...` paths.
+  - `url.original` — raw hostnames, incl. the private domain `moenig.it`.
+  - `file.path` — usernames in paths (e.g. `marco`).
+  - `file.owner` — e.g. `root`.
+  The GDPR checker reports **"0 to add"** for these on events (value-heuristic
+  blind spot: the names match no pattern and the sampled values do not look
+  like IPs/e-mails), while findings carry ~120 open DSGVO fields. Remediation
+  is operator-side: add fields to `mask_fields`/`free_text_fields` where
+  appropriate, or deny report/LLM consumers read access via RBAC.
 - **RAW logging is a personal-data store.** By default only MASKED output is
   persisted. `KLAXON_ANONYMIZATION_LOG_RAW=true` deliberately persists RAW tool
   output; the server warns at startup, and that log file must then be treated
