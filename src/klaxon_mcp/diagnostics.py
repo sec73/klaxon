@@ -21,7 +21,10 @@ from __future__ import annotations
 from typing import Any
 
 from .clients import Response
+from .config import AnonymizationConfig
 from .constants import (
+    EVENTS_PATTERN,
+    FINDINGS_PATTERN,
     LEGACY_4X_PATTERNS,
     SHADOWED_NAMESPACES,
     SUGGESTED_PATTERNS,
@@ -33,6 +36,69 @@ PREAMBLE_HEADER = "=== DIAGNOSTICS (added by Klaxon MCP; not part of the API res
 RAW_HEADER = "=== RAW RESPONSE ==="
 
 SEARCH_SIZE_ENV = "WAZUH_SEARCH_MAX_SIZE"
+
+# The raw Wazuh 5 streams carry unmasked personal data. A query that targets one
+# of these (or a sub-pattern of them) is a RAW STREAM QUERY unless it goes to a
+# masked stream (klaxon-masked-<tenant>-v5-*). Derived from the canonical
+# pattern constants so the two never drift.
+_RAW_STREAM_PREFIXES = tuple(
+    p.removesuffix("-*") for p in (EVENTS_PATTERN, FINDINGS_PATTERN)
+)
+
+
+def _is_raw_stream(index: str) -> bool:
+    """Whether an index pattern targets a raw Wazuh 5 stream (events/findings)."""
+    lowered = index.lower()
+    return any(lowered.startswith(prefix) for prefix in _RAW_STREAM_PREFIXES)
+
+
+def safety_banner(cfg: AnonymizationConfig, index: str) -> list[str]:
+    """Safety lines prepended to every search response when it is not protected.
+
+    Three conditions, each emitting one banner line when it holds:
+
+    1. Masking is off (the feature is disabled, or no fields are configured) —
+       the response is returned unmasked.
+    2. The LLM endpoint is not local (no loopback) and the response gate
+       (residual-PII whitelist) is inactive — residual personal data is not
+       blocked before it reaches an external model.
+    3. The query targeted a raw Wazuh stream (`wazuh-events-v5-*` /
+       `wazuh-findings-v5-*`) instead of a masked stream
+       (`klaxon-masked-<tenant>-v5-*`) — raw personal data may be present.
+
+    The banner is emitted automatically, before any other diagnostics, on EVERY
+    response that meets a condition — including zero-hit, error,
+    aggregation-only and paginated responses — so it cannot be forgotten. It
+    never contains values, tokens, salts or PII: only the condition and a
+    reason.
+    """
+    lines: list[str] = []
+
+    # Condition 1: the masking feature is off, or no fields are configured.
+    if not cfg.enabled or not cfg.mask_fields:
+        lines.append(
+            "[UNMASKED MODE] Anonymization is disabled — personal data in this "
+            "response is returned unmasked."
+        )
+
+    # Condition 2: an external LLM (non-loopback) with the response gate off.
+    if not cfg.llm_is_local and not cfg.whitelist_enabled:
+        lines.append(
+            "[UNMASKED MODE] The LLM endpoint is not local (no loopback) and the "
+            "response gate is inactive — residual personal data is not blocked "
+            "before reaching the external model."
+        )
+
+    # Condition 3: the query targeted a raw Wazuh stream instead of a masked one.
+    if _is_raw_stream(index):
+        masked = ", ".join(cfg.masked_streams) if cfg.masked_streams else "none configured"
+        lines.append(
+            f"[RAW STREAM QUERY] This query targeted {index!r} (raw); the masked "
+            f"stream ({masked}) is not deployed/selected — raw personal data may "
+            "be present in this response."
+        )
+
+    return lines
 
 
 def size_capped_notice(requested: int, effective: int) -> str:
