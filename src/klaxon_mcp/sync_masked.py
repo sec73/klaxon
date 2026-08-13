@@ -12,9 +12,16 @@ Wazuh streams are only ever read; nothing is written to them.
 Commands (wired into `klaxon-mcp`):
   * --sync-masked  --tenant X    periodic reindex of a time window through the
                                  masking pipeline, with a checkpoint + preflight
+                                 and a FAIL-CLOSED backstop: any quarantine doc
+                                 (masking failure) in the window fails the run
+                                 and the checkpoint is NOT advanced
   * --verify-config --tenant X   drift audit: fields.yaml vs config vs pipeline
+                                 (incl. the quarantine on_failure presence)
   * --apply-masked-infra --tenant X  PUT pipeline (real salt), ISM, template,
-                                 data stream
+                                 data stream + quarantine ISM/template
+  * masking migrate --tenant X   ONE-TIME, operator-run migration of legacy
+                                 masking_error docs from the masked stream into
+                                 the quarantine stream (destructive, idempotent)
 """
 
 from __future__ import annotations
@@ -32,15 +39,19 @@ from .masked_stream import (
     DEFAULT_INITIAL_LOOKBACK_HOURS,
     DEFAULT_OVERLAP_HOURS,
     DEFAULT_RETENTION_DAYS,
+    QUARANTINE_RETENTION_DAYS,
     TenantConfig,
     build_index_template,
     build_ism_policy,
+    build_quarantine_index_template,
+    build_quarantine_ism_policy,
     deploy_pipeline,
     effective_mask_fields_from_config,
     fields_yaml_sha256,
     fingerprint_matches,
     load_tenant_config,
     pipeline_field_names,
+    pipeline_has_quarantine_on_failure,
 )
 
 
@@ -103,6 +114,14 @@ def preflight_report(
         problems.append(
             f"deployed pipeline masks {sorted(deployed_fields)} but fields.yaml "
             f"requires {sorted(expected)}."
+        )
+    if not pipeline_has_quarantine_on_failure(deployed):
+        problems.append(
+            f"deployed pipeline {cfg.pipeline_name} lacks the quarantine "
+            "on_failure routing — masking-failure documents would stay in the "
+            "masked stream (fail-open) instead of being rerouted to "
+            f"{cfg.quarantine_stream_pattern}. Redeploy a pipeline generated "
+            "with the quarantine routing before syncing."
         )
     if klaxon != expected:
         problems.append(
@@ -242,6 +261,73 @@ async def _sync(
         print(json.dumps(failed[:5], indent=2)[:2000], file=sys.stderr)
         return 1
 
+    # ---- Fail-closed backstop. Masking failures are rerouted to the quarantine
+    # stream by the pipeline's on_failure; ANY quarantine doc in this window
+    # means masking failed. Do NOT advance the checkpoint and alert, so the
+    # window is retried after the pipeline is fixed. ----
+    quarantine_count, masked_count = await _fail_closed_backstop(
+        client, cfg, window_start, window_end
+    )
+    if quarantine_count is None or masked_count is None:
+        print(
+            f"sync-masked[{cfg.tenant}] FAIL: could not count the "
+            f"{cfg.quarantine_stream_pattern} / {cfg.masked_stream_pattern} "
+            "streams for the window — masking success could not be verified. "
+            "checkpoint NOT advanced.",
+            file=sys.stderr,
+        )
+        return 1
+    if quarantine_count > 0:
+        print(
+            f"sync-masked[{cfg.tenant}] FAIL-CLOSED BACKSTOP: "
+            f"{quarantine_count} masking-failure document(s) routed to "
+            f"{cfg.quarantine_stream_pattern} in window "
+            f"{_iso(window_start)} -> {_iso(window_end)}. checkpoint NOT "
+            "advanced; the window will be re-scanned on the next run.",
+            file=sys.stderr,
+        )
+        print(
+            f"  Investigate the masking failures (klaxon.masking_error / "
+            "klaxon.quarantine.reason in the quarantine stream) and fix the "
+            "pipeline or the documents before re-running.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # ---- Optional reconcile: source(window) == masked(window) + quarantine
+    # (window), to catch silent drops (docs neither masked nor quarantined).
+    # Off by default; KLAXON_SYNC_RECONCILE=true enables it, and
+    # KLAXON_SYNC_RECONCILE_FAIL=true turns a mismatch into a failed run. ----
+    if _env_flag("KLAXON_SYNC_RECONCILE"):
+        source_count = await _count_window_docs(
+            client, cfg.raw_stream, window_start, window_end
+        )
+        if source_count is None:
+            print(
+                f"sync-masked[{cfg.tenant}] reconcile SKIPPED: could not count "
+                f"{cfg.raw_stream} for the window.",
+                file=sys.stderr,
+            )
+        else:
+            expected = masked_count + quarantine_count
+            if source_count != expected:
+                mismatch = (
+                    f"sync-masked[{cfg.tenant}] RECONCILE MISMATCH: source "
+                    f"({source_count}) != masked ({masked_count}) + quarantine "
+                    f"({quarantine_count}) in window "
+                    f"{_iso(window_start)} -> {_iso(window_end)} — silent drop "
+                    "suspected."
+                )
+                if _env_flag("KLAXON_SYNC_RECONCILE_FAIL"):
+                    print(mismatch + " checkpoint NOT advanced.", file=sys.stderr)
+                    return 1
+                print(mismatch, file=sys.stderr)
+            else:
+                print(
+                    f"sync-masked[{cfg.tenant}] reconcile ok: source == masked + "
+                    f"quarantine ({source_count})."
+                )
+
     # Advance the checkpoint only after success.
     written = await _write_checkpoint(client, cfg, window_end)
     if not written.ok:
@@ -259,7 +345,13 @@ async def _sync(
 
 
 async def _report_masking_errors(client: IndexerClient, cfg: TenantConfig) -> None:
-    """Surface documents that were ingested but failed masking (flagged raw)."""
+    """Surface documents that were ingested but failed masking (flagged raw).
+
+    Defense-in-depth only: with the fail-closed quarantine routing in place,
+    masking failures never stay in the masked stream, so this should report 0.
+    It catches a pipeline that predates the quarantine routing (the sync
+    preflight refuses those, but a manual/legacy reindex could still write one).
+    """
     query = {
         "size": 0,
         "query": {"exists": {"field": "klaxon.masking_error"}},
@@ -287,6 +379,70 @@ async def _report_masking_errors(client: IndexerClient, cfg: TenantConfig) -> No
             "klaxon.masking_error`) and fix the pipeline.",
             file=sys.stderr,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Fail-closed backstop: quarantine count + optional reconcile
+# --------------------------------------------------------------------------- #
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _count_window_docs(
+    client: IndexerClient,
+    pattern: str,
+    window_start: datetime,
+    window_end: datetime,
+) -> int | None:
+    """Exact document count of a stream pattern within the sync window.
+
+    Returns None when the count could not be obtained (indexer unreachable /
+    non-2xx). The caller treats None as FAIL-CLOSED (do not advance the
+    checkpoint — the window's masking success could not be verified).
+    """
+    query = {
+        "size": 0,
+        "query": {
+            "range": {"@timestamp": {"gte": _iso(window_start), "lte": _iso(window_end)}}
+        },
+        "track_total_hits": True,
+    }
+    try:
+        resp = await client.post(f"/{pattern}/_search", body=query)
+    except TransportError:
+        return None
+    if not resp.ok:
+        return None
+    parsed = resp.json()
+    total = (parsed.get("hits") or {}).get("total") if isinstance(parsed, dict) else None
+    if isinstance(total, dict):
+        return int(total.get("value", 0))
+    if isinstance(total, int):
+        return total
+    return 0
+
+
+async def _fail_closed_backstop(
+    client: IndexerClient,
+    cfg: TenantConfig,
+    window_start: datetime,
+    window_end: datetime,
+) -> tuple[int | None, int | None]:
+    """Count quarantine docs for the window; return (quarantine_count, masked_count).
+
+    quarantine_count > 0 means masking failed for that many documents in this
+    window — the caller MUST fail the run and not advance the checkpoint. Either
+    count is None when the corresponding stream could not be counted (fail-closed).
+    """
+    quarantine_count = await _count_window_docs(
+        client, cfg.quarantine_stream_pattern, window_start, window_end
+    )
+    masked_count = await _count_window_docs(
+        client, cfg.masked_stream_pattern, window_start, window_end
+    )
+    return quarantine_count, masked_count
 
 
 def sync_command(
@@ -452,6 +608,12 @@ async def _apply_infra(
     pipeline = deploy_pipeline(cfg)
     ism = build_ism_policy(cfg, retention_days)
     template = build_index_template(cfg, mappings)
+    # Quarantine infra: the template's pattern covers the on_failure routing
+    # target (klaxon-quarantine-<tenant>-v5-raw), which auto-creates on first
+    # masking failure. No index.default_pipeline — quarantine docs must never
+    # re-enter the masking pipeline.
+    quarantine_ism = build_quarantine_ism_policy(cfg, QUARANTINE_RETENTION_DAYS)
+    quarantine_template = build_quarantine_index_template(cfg, mappings)
 
     if dry_run:
         print(f"apply-masked-infra[{cfg.tenant}] dry run — would PUT:")
@@ -459,6 +621,9 @@ async def _apply_infra(
         print(f"  ISM       {cfg.ism_policy_name} (retention {retention_days}d)")
         print(f"  template  {cfg.index_template_name}")
         print(f"  data stream {cfg.masked_stream}")
+        print(f"  ISM       {cfg.quarantine_ism_policy_name} (retention "
+              f"{QUARANTINE_RETENTION_DAYS}d, forensics)")
+        print(f"  template  {cfg.quarantine_index_template_name}")
         return 0
 
     try:
@@ -467,6 +632,14 @@ async def _apply_infra(
             ("ISM policy", await client.put(f"/_plugins/_ism/policies/{cfg.ism_policy_name}", body=ism)),
             ("index template", await client.put(f"/_index_template/{cfg.index_template_name}", body=template)),
             ("data stream", await client.put(f"/_data_stream/{cfg.masked_stream}", body={})),
+            ("quarantine ISM policy", await client.put(
+                f"/_plugins/_ism/policies/{cfg.quarantine_ism_policy_name}",
+                body=quarantine_ism,
+            )),
+            ("quarantine index template", await client.put(
+                f"/_index_template/{cfg.quarantine_index_template_name}",
+                body=quarantine_template,
+            )),
         ]
     except TransportError as exc:
         print(f"apply-masked-infra[{cfg.tenant}] transport error: {exc}", file=sys.stderr)
@@ -483,7 +656,9 @@ async def _apply_infra(
 
     print(
         f"apply-masked-infra[{cfg.tenant}] ok: pipeline, ISM ({retention_days}d "
-        f"retention), template and data stream {cfg.masked_stream} in place."
+        f"retention), template and data stream {cfg.masked_stream} in place, plus "
+        f"quarantine ISM ({QUARANTINE_RETENTION_DAYS}d) and quarantine template "
+        f"{cfg.quarantine_index_template_name} (fail-closed on_failure routing)."
     )
     return 0
 
@@ -505,3 +680,145 @@ def apply_infra_command(
     return asyncio.run(
         _apply_infra(client, cfg, retention_days=retention_days, dry_run=dry_run)
     )
+
+
+# --------------------------------------------------------------------------- #
+# migrate-quarantine (ONE-TIME migration of pre-quarantine masking_error docs)
+#
+# Before the fail-closed on_failure existed, masking-failure documents were
+# flagged `klaxon.masking_error` and LEFT in the masked stream. This command
+# migrates them into the quarantine stream and removes them from the masked
+# stream. Operator-run ONLY (never automated): it DELETES documents. Idempotent:
+# after a successful run there are no masking_error docs left, so re-running is
+# a no-op. The reindex does NOT go through the masking pipeline — quarantine
+# documents must never re-enter masking.
+# --------------------------------------------------------------------------- #
+
+
+async def _migrate_quarantine(
+    client: IndexerClient, cfg: TenantConfig, *, dry_run: bool
+) -> int:
+    exists_query = {"query": {"exists": {"field": "klaxon.masking_error"}}}
+
+    count_resp = await client.post(
+        f"/{cfg.masked_stream_pattern}/_search",
+        body={**exists_query, "size": 0, "track_total_hits": True},
+    )
+    if not count_resp.ok:
+        print(
+            f"migrate-quarantine[{cfg.tenant}] could not count masking_error "
+            f"docs in {cfg.masked_stream_pattern} (HTTP "
+            f"{count_resp.status_code})",
+            file=sys.stderr,
+        )
+        return 1
+    parsed = count_resp.json()
+    total = (parsed.get("hits") or {}).get("total") if isinstance(parsed, dict) else None
+    count = total.get("value", 0) if isinstance(total, dict) else int(total or 0)
+    if count == 0:
+        print(
+            f"migrate-quarantine[{cfg.tenant}] no klaxon.masking_error docs in "
+            f"{cfg.masked_stream_pattern} — nothing to migrate."
+        )
+        return 0
+    print(
+        f"migrate-quarantine[{cfg.tenant}] {count} masking_error doc(s) found "
+        f"in {cfg.masked_stream_pattern}."
+    )
+    if dry_run:
+        print(
+            f"  dry run: would reindex them into {cfg.quarantine_routing_index} "
+            "(no masking pipeline) and delete them from the masked stream."
+        )
+        return 0
+
+    # 1. Reindex the flagged docs into the quarantine stream (op_type create +
+    #    conflicts proceed: idempotent, no duplicates). NO dest pipeline — the
+    #    quarantine template carries no index.default_pipeline, and passing the
+    #    masking pipeline here would re-mask (and could re-trigger) the failure.
+    reindex_body = {
+        "source": {"index": cfg.masked_stream_pattern, **exists_query},
+        "dest": {"index": cfg.quarantine_routing_index, "op_type": "create"},
+        "conflicts": "proceed",
+    }
+    try:
+        resp = await client.post("/_reindex", body=reindex_body)
+    except TransportError as exc:
+        print(f"migrate-quarantine[{cfg.tenant}] reindex failed: {exc}", file=sys.stderr)
+        return 1
+    if not resp.ok:
+        print(
+            f"migrate-quarantine[{cfg.tenant}] reindex FAILED (HTTP "
+            f"{resp.status_code}); nothing was deleted.",
+            file=sys.stderr,
+        )
+        print(resp.text[:1000], file=sys.stderr)
+        return 1
+    reindexed = resp.json()
+    if reindexed.get("failures"):
+        print(
+            f"migrate-quarantine[{cfg.tenant}] reindex reported failure(s); "
+            "NOTHING was deleted from the masked stream. Investigate before "
+            "re-running.",
+            file=sys.stderr,
+        )
+        print(json.dumps(reindexed["failures"][:5], indent=2)[:1500], file=sys.stderr)
+        return 1
+    migrated = int(reindexed.get("created", 0))
+
+    # 2. Delete the migrated docs from the masked stream (same query).
+    try:
+        del_resp = await client.post(
+            f"/{cfg.masked_stream_pattern}/_delete_by_query", body=exists_query
+        )
+    except TransportError as exc:
+        print(f"migrate-quarantine[{cfg.tenant}] delete failed: {exc}", file=sys.stderr)
+        return 1
+    if not del_resp.ok:
+        print(
+            f"migrate-quarantine[{cfg.tenant}] delete-by-query FAILED (HTTP "
+            f"{del_resp.status_code}); the docs were COPIED to quarantine but "
+            "still remain in the masked stream — re-run the migration.",
+            file=sys.stderr,
+        )
+        print(del_resp.text[:1000], file=sys.stderr)
+        return 1
+    del_parsed = del_resp.json()
+    deleted = int(del_parsed.get("deleted", 0)) if isinstance(del_parsed, dict) else 0
+
+    print(
+        f"migrate-quarantine[{cfg.tenant}] migrated {migrated} masking_error "
+        f"doc(s) to {cfg.quarantine_routing_index} (no masking pipeline) and "
+        f"deleted {deleted} from {cfg.masked_stream_pattern}."
+    )
+    if migrated != deleted:
+        print(
+            f"  WARNING: migrated ({migrated}) != deleted ({deleted}); re-run "
+            "the migration to converge.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def migrate_quarantine_command(
+    tenant: str, *, dry_run: bool = False
+) -> int:
+    """ONE-TIME, operator-run migration of legacy masking_error docs to quarantine.
+
+    NEVER automated. Finds `klaxon.masking_error` docs in the masked stream,
+    reindexes them into the quarantine stream (op_type create, conflicts
+    proceed, no masking pipeline), then deletes them from the masked stream and
+    logs the count. Idempotent: re-running after success is a no-op.
+    """
+    from . import server
+
+    try:
+        cfg = load_tenant_config(tenant)
+        Config.from_env()
+    except (ConfigError, FileNotFoundError, ValueError) as exc:
+        print(f"migrate-quarantine[{tenant}] error: {exc}", file=sys.stderr)
+        return 2
+
+    client = server.get_indexer()
+    return asyncio.run(_migrate_quarantine(client, cfg, dry_run=dry_run))

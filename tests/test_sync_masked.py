@@ -239,7 +239,12 @@ class FakeIndexer:
         self.checkpoint: str | None = None
         self.reindex_ok = True
         self.reindex_failures: list[Any] | None = None
+        self.reindex_created = 0
         self.masking_error_hits = 0
+        # Fail-closed backstop counts, keyed by stream namespace.
+        self.quarantine_hits = 0
+        self.source_hits = 0
+        self.delete_by_query_deleted = 0
 
     def _resp(self, status: int, payload: Any, path: str) -> Response:
         return Response(
@@ -270,11 +275,30 @@ class FakeIndexer:
         if path.endswith("/_reindex"):
             if not self.reindex_ok:
                 return self._resp(500, {"error": {"type": "boom"}}, path)
-            return self._resp(200, {"took": 1, "failures": self.reindex_failures or []}, path)
-        if path.endswith("/_search"):
             return self._resp(
                 200,
-                {"hits": {"total": {"value": self.masking_error_hits, "relation": "eq"}}},
+                {
+                    "took": 1,
+                    "created": self.reindex_created,
+                    "failures": self.reindex_failures or [],
+                },
+                path,
+            )
+        if path.endswith("/_delete_by_query"):
+            return self._resp(
+                200, {"deleted": self.delete_by_query_deleted}, path
+            )
+        if path.endswith("/_search"):
+            pattern = path.split("/")[1]
+            if pattern.startswith("klaxon-quarantine-"):
+                hits = self.quarantine_hits
+            elif pattern.startswith("wazuh-events"):
+                hits = self.source_hits
+            else:  # the masked stream
+                hits = self.masking_error_hits
+            return self._resp(
+                200,
+                {"hits": {"total": {"value": hits, "relation": "eq"}}},
                 path,
             )
         return self._resp(404, {}, path)
@@ -454,6 +478,167 @@ class TestReportMaskingErrors:
         fake.masking_error_hits = 0
         asyncio.run(sync_masked._report_masking_errors(fake, cfg))
         assert capsys.readouterr().err == ""
+
+
+class TestSyncQuarantineBackstop:
+    """Fail-closed: ANY quarantine doc in the window fails the run; the
+    checkpoint is NOT advanced and an alert is raised."""
+
+    def test_fails_and_does_not_advance_on_quarantine(self, cfg: Any, capsys: Any) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.quarantine_hits = 2
+        assert _run_sync(cfg, fake) == 1
+        assert _checkpoint_puts(fake) == []
+        err = capsys.readouterr().err
+        assert "FAIL-CLOSED BACKSTOP" in err
+        assert "2 masking-failure document(s)" in err
+        assert "checkpoint NOT advanced" in err
+
+    def test_advances_when_quarantine_empty(self, cfg: Any) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.quarantine_hits = 0
+        assert _run_sync(cfg, fake) == 0
+        assert len(_checkpoint_puts(fake)) == 1
+
+
+class TestSyncReconcile:
+    """Optional reconcile: source(window) == masked(window) + quarantine(window).
+
+    NOTE: quarantine_hits must be 0 here — any quarantine doc fails the run in
+    the FAIL-CLOSED backstop BEFORE reconcile runs (that is correct: masking
+    failures are fatal). Reconcile catches silent DROPS (docs that neither made
+    it into the masked stream nor were quarantined).
+    """
+
+    def test_reconcile_ok(self, cfg: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.source_hits = 5
+        fake.masking_error_hits = 5
+        fake.quarantine_hits = 0
+        monkeypatch.setenv("KLAXON_SYNC_RECONCILE", "true")
+        assert _run_sync(cfg, fake) == 0
+        assert len(_checkpoint_puts(fake)) == 1
+
+    def test_reconcile_mismatch_warns_by_default(
+        self, cfg: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.source_hits = 10
+        fake.masking_error_hits = 4
+        fake.quarantine_hits = 0
+        monkeypatch.setenv("KLAXON_SYNC_RECONCILE", "true")
+        assert _run_sync(cfg, fake) == 0  # warn, not fail
+        assert "RECONCILE MISMATCH" in capsys.readouterr().err
+        assert len(_checkpoint_puts(fake)) == 1
+
+    def test_reconcile_mismatch_fails_when_configured(
+        self, cfg: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.source_hits = 10
+        fake.masking_error_hits = 4
+        fake.quarantine_hits = 0
+        monkeypatch.setenv("KLAXON_SYNC_RECONCILE", "true")
+        monkeypatch.setenv("KLAXON_SYNC_RECONCILE_FAIL", "true")
+        assert _run_sync(cfg, fake) == 1
+        assert "checkpoint NOT advanced" in capsys.readouterr().err
+        assert _checkpoint_puts(fake) == []
+
+
+class TestSyncQuarantinePreflight:
+    """The preflight aborts when the deployed pipeline lacks the fail-closed
+    quarantine on_failure (a pre-quarantine pipeline would leak raw docs into
+    the masked stream)."""
+
+    def test_aborts_when_pipeline_lacks_quarantine_on_failure(
+        self, cfg: Any, capsys: Any
+    ) -> None:
+        fake = FakeIndexer()
+        stale = build_pipeline_template(cfg)
+        # Revert to the old fail-open on_failure (masking_error set, no reroute).
+        stale["processors"][0]["script"]["on_failure"] = [
+            {"set": {"field": "klaxon.masking_error", "value": "boom"}}
+        ]
+        fake.deployed_pipeline = stale
+        assert _run_sync(cfg, fake) == 1
+        assert _reindex_call(fake) is None
+        assert "lacks the quarantine on_failure" in capsys.readouterr().err
+
+    def test_pipeline_has_quarantine_on_failure_true_for_generated(
+        self, cfg: Any
+    ) -> None:
+        from klaxon_mcp.masked_stream import pipeline_has_quarantine_on_failure
+
+        assert pipeline_has_quarantine_on_failure(build_pipeline_template(cfg))
+
+
+class TestMigrateQuarantine:
+    """One-time, operator-run migration of legacy masking_error docs."""
+
+    def _run(self, cfg: Any, fake: FakeIndexer, **kwargs: Any) -> int:
+        opts = {"dry_run": False, **kwargs}
+        return asyncio.run(sync_masked._migrate_quarantine(fake, cfg, **opts))
+
+    def test_migrate_copies_then_deletes(
+        self, cfg: Any, capsys: Any
+    ) -> None:
+        fake = FakeIndexer()
+        fake.masking_error_hits = 3
+        fake.reindex_created = 3
+        fake.delete_by_query_deleted = 3
+        assert self._run(cfg, fake) == 0
+        out = capsys.readouterr().out
+        assert "migrated 3" in out
+        assert "deleted 3" in out
+        # Reindex dest is the quarantine routing index, op_type create, and the
+        # source is filtered to masking_error docs.
+        body = _reindex_call(fake)
+        assert body is not None
+        assert body["dest"]["index"] == cfg.quarantine_routing_index
+        assert body["dest"]["op_type"] == "create"
+        assert body["dest"].get("pipeline") is None  # never re-enters masking
+        assert body["source"]["query"] == {"exists": {"field": "klaxon.masking_error"}}
+
+    def test_migrate_noop_when_nothing_flagged(self, cfg: Any, capsys: Any) -> None:
+        fake = FakeIndexer()
+        fake.masking_error_hits = 0
+        assert self._run(cfg, fake) == 0
+        assert _reindex_call(fake) is None
+        assert "nothing to migrate" in capsys.readouterr().out
+
+    def test_migrate_dry_run_sends_nothing(self, cfg: Any, capsys: Any) -> None:
+        fake = FakeIndexer()
+        fake.masking_error_hits = 3
+        assert self._run(cfg, fake, dry_run=True) == 0
+        assert _reindex_call(fake) is None
+        assert "dry run" in capsys.readouterr().out
+
+    def test_migrate_refuses_to_delete_on_reindex_failure(
+        self, cfg: Any, capsys: Any
+    ) -> None:
+        fake = FakeIndexer()
+        fake.masking_error_hits = 3
+        fake.reindex_failures = [{"index": "x", "reason": "boom"}]
+        assert self._run(cfg, fake) == 1
+        assert "NOTHING was deleted" in capsys.readouterr().err
+        # No delete-by-query was sent.
+        assert not any(
+            kind == "post" and p.endswith("/_delete_by_query")
+            for kind, p, _ in fake.calls
+        )
+
+    def test_migrate_flags_count_mismatch(self, cfg: Any, capsys: Any) -> None:
+        fake = FakeIndexer()
+        fake.masking_error_hits = 3
+        fake.reindex_created = 2
+        fake.delete_by_query_deleted = 3
+        assert self._run(cfg, fake) == 1
+        assert "migrated (2) != deleted (3)" in capsys.readouterr().err
 
 
 class TestSaltCheck:
