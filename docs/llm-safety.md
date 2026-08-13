@@ -40,6 +40,13 @@ external model at.
 - **Residual gate.** The masked output is scanned; with the whitelist enabled
   (default), a response that still contains an IP or e-mail is **blocked** —
   you get a `GDPR BLOCKED` notice instead of the data.
+- **Automatic safety banner.** Every response that may carry personal data is
+  prefixed, before the other diagnostics, with `[UNMASKED MODE]` and/or
+  `[RAW STREAM QUERY]` — masking off, an external LLM without the response
+  gate, or a query against a raw stream (`wazuh-events-v5-*` /
+  `wazuh-findings-v5-*`) instead of a masked stream. It is automatic (no
+  opt-in, no separate tool), so an unprotected response says so on its first
+  line; it never contains values, tokens or the salt.
 
 ## What is NOT guaranteed
 
