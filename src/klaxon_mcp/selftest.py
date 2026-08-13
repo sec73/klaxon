@@ -21,8 +21,9 @@ import json
 import os
 from typing import Any
 
+from .hmac_vectors import ALL_HMAC_VECTORS, KLAXON_VECTORS
 from .masked_stream import _FREETEXT_PATTERN_ORDER
-from .tokens import TOKEN_RE
+from .tokens import TOKEN_RE, token
 
 
 class TokenSchemeError(Exception):
@@ -234,6 +235,114 @@ def verify_quarantine_on_failure(on_failure: list[Any]) -> list[str]:
     if "klaxon-quarantine-" not in blob or "-v5-raw" not in blob:
         problems.append(
             "on_failure does not reroute to klaxon-quarantine-<tenant>-v5-raw"
+        )
+    return problems
+
+
+# --------------------------------------------------------------------------- #
+# HMAC edge-case vectors: the pure-Painless HMAC is a hand-rolled SHA-256-based
+# MAC, so the self-test pins the exact places it is most likely to go wrong
+# (RFC 4231 KATs, key-length boundaries, UTF-8, truncation).
+# --------------------------------------------------------------------------- #
+
+
+def pure_painless_hmac(key: bytes, msg: bytes) -> str:
+    """Byte-exact Python port of the pure-Painless `hmacSha256Hex()`.
+
+    Mirrors EXACTLY the algorithm the generator emits into Painless (see
+    `painless._HMAC_FUNCTIONS`): pre-hash the key when longer than the 64-byte
+    block, zero-pad to a 64-byte block, XOR with ipad (0x36) / opad (0x5c),
+    TWO SHA-256 passes (inner then outer), hex output. The underlying SHA-256
+    is Python's `hashlib` — the Painless `sha256(int[])` is pinned byte-
+    identical by the RFC 4231 vectors and the live `_simulate`.
+    """
+    if len(key) > 64:
+        key = hashlib.sha256(key).digest()
+    block = key + b"\x00" * (64 - len(key))
+    inner = hashlib.sha256(bytes(b ^ 0x36 for b in block) + msg).digest()
+    return hashlib.sha256(bytes(b ^ 0x5c for b in block) + inner).hexdigest()
+
+
+def run_hmac_vector_selftest() -> list[str]:
+    """Assert the pure-Painless HMAC port against the authoritative reference.
+
+    * RFC 4231 vectors: the port AND Python's `hmac` module must equal the
+      hardcoded authoritative digest (a disagreement means the implementation
+      or the generator is wrong — never edit the vector to match).
+    * Key-length + Klaxon vectors: the port must equal the `hmac` reference.
+    * Klaxon vectors: the pipeline's `token()` must equal the expected token
+      (first 16 hex of the full digest; empty value passes through unchanged).
+
+    Returns a list of problems (empty = pass). Runs inside every
+    `klaxon masking generate`; on ANY problem generation aborts and emits NO
+    artifacts, printing the failing label + expected + actual.
+    """
+    problems: list[str] = []
+
+    for label, key, msg, expected in ALL_HMAC_VECTORS:
+        actual_port = pure_painless_hmac(key, msg)
+        if actual_port != expected:
+            problems.append(
+                f"  {label}: pure_painless_hmac -> {actual_port} but expected "
+                f"{expected}"
+            )
+        actual_hmac = hmac.new(key, msg, hashlib.sha256).hexdigest()
+        if actual_hmac != expected:
+            problems.append(
+                f"  {label}: Python hmac module -> {actual_hmac} but expected "
+                f"{expected} (reference disagreement — never edit the vector)"
+            )
+
+    for label, salt, family, value, full, expected_token in KLAXON_VECTORS:
+        actual_token = token(family, value, salt)
+        if actual_token != expected_token:
+            problems.append(
+                f"  {label}: token({family!r}, {value!r}, salt) -> "
+                f"{actual_token!r} but expected {expected_token!r}"
+            )
+        # Truncation semantics: the token must be the FIRST 16 hex of the FULL
+        # digest (a naive re-encode of 8 raw digest bytes would diverge).
+        if expected_token and not expected_token.endswith(full[:16] + "]"):
+            problems.append(
+                f"  {label}: expected token is not the first 16 hex of the "
+                f"full digest ({full})"
+            )
+    return problems
+
+
+def verify_hmac_structural(script: str) -> list[str]:
+    """HMAC-structural markers MISSING from the rendered Painless script.
+
+    The token scheme is a hand-rolled pure-Painless HMAC (deliberately NOT
+    `javax.crypto.Mac` — the ingest allowlist has none). These scans (no
+    cluster) pin the construction a single-digest or latin-1 shortcut would
+    silently break: ipad/opad XOR, TWO distinct SHA-256 passes, the key-length
+    branching (hash-if->64, zero-pad-if-<64), UTF-8 byte handling, and the
+    absence of a crypto-class shortcut. Empty result = structurally sound.
+    """
+    problems: list[str] = []
+    if "javax.crypto.Mac" in script or "Mac.getInstance" in script:
+        problems.append(
+            "script references javax.crypto.Mac — the pure-Painless HMAC is "
+            "deliberate (the ingest allowlist has no Mac); do not reintroduce it"
+        )
+    if "kb[i] ^ 54" not in script:  # ipad 0x36
+        problems.append("missing ipad (0x36) XOR in the HMAC inner pass")
+    if "kb[i] ^ 92" not in script:  # opad 0x5c
+        problems.append("missing opad (0x5c) XOR in the HMAC outer pass")
+    if "sha256(innerInput)" not in script or "sha256(outerInput)" not in script:
+        problems.append(
+            "HMAC must perform TWO distinct SHA-256 digest steps (inner then "
+            "outer) — a single-digest shortcut is not a keyed MAC"
+        )
+    if "key.length > 64" not in script:
+        problems.append(
+            "missing the HMAC key pre-hash branch for keys longer than 64 bytes"
+        )
+    if "utf8(String s)" not in script or "65536" not in script:
+        problems.append(
+            "missing/latin-1 UTF-8 byte handling (unicode values must be "
+            "encoded like Python .encode('utf-8'))"
         )
     return problems
 

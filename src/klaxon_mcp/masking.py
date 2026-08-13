@@ -66,6 +66,7 @@ from .artifact_io import (
     write_artifacts,
     write_deployable,
 )
+from .hmac_vectors import ALL_HMAC_VECTORS, KLAXON_VECTORS
 from .masked_stream import (
     DEFAULT_RETENTION_DAYS,
     TenantConfig,
@@ -80,6 +81,8 @@ from .selftest import (
     TokenSchemeError,
     _selftest_salt,
     painless_token_reference,
+    run_hmac_vector_selftest,
+    verify_hmac_structural,
     verify_quarantine_on_failure,
     verify_script_scheme,
     verify_script_structure,
@@ -89,9 +92,11 @@ from .tokens import TOKEN_RE
 # Explicit re-export for mypy strict: these are the names other modules and
 # tests import from klaxon_mcp.masking.
 __all__ = [
+    "ALL_HMAC_VECTORS",
     "CONFIG_FRAGMENT_NAME",
     "INDEX_TEMPLATE_FILE",
     "ISM_POLICY_FILE",
+    "KLAXON_VECTORS",
     "PIPELINE_TEMPLATE_NAME",
     "ROLES_FRAGMENT_FILE",
     "SELF_TEST_VALUES",
@@ -108,9 +113,11 @@ __all__ = [
     "render_artifacts",
     "render_deployable",
     "run_generator_selftest",
+    "run_hmac_vector_selftest",
     "run_token_selftest",
     "selftest_main",
     "tenants_in_repo",
+    "verify_hmac_structural",
     "verify_quarantine_on_failure",
     "verify_script_scheme",
     "verify_script_structure",
@@ -227,6 +234,10 @@ def run_generator_selftest(cfg: TenantConfig, salt: str) -> list[str]:
     MUST abort and emit NO artifacts.
     """
     problems = run_token_selftest(salt)
+    # The pure-Painless HMAC edge-case vectors (RFC 4231 + key-length + UTF-8 +
+    # truncation): a hand-rolled SHA-256-based MAC is exactly where a subtle
+    # bug would silently break tokens — abort before emitting anything.
+    problems.extend(run_hmac_vector_selftest())
     pipeline = build_pipeline(cfg, salt)
     script = pipeline["processors"][0]["script"]
     if script.get("params", {}).get("salt") != salt:
@@ -236,6 +247,7 @@ def run_generator_selftest(cfg: TenantConfig, salt: str) -> list[str]:
         )
     problems.extend(verify_script_scheme(script["source"]))
     problems.extend(verify_script_structure(script["source"]))
+    problems.extend(verify_hmac_structural(script["source"]))
     # Fail-closed routing is part of the scheme: a revert to the fail-open
     # on_failure must abort generation, not ship a pipeline that leaks raw docs
     # into the masked stream.
@@ -448,6 +460,9 @@ def selftest_main(argv: list[str] | None = None) -> int:
         problems.extend(run_generator_selftest(cfg, salt))
     else:
         problems.extend(run_token_selftest(salt))
+        # The HMAC edge-case vectors are salt-independent and cluster-free, so
+        # they also run in the bare `klaxon masking selftest` (no --tenant).
+        problems.extend(run_hmac_vector_selftest())
 
     if problems:
         print(
@@ -461,6 +476,7 @@ def selftest_main(argv: list[str] | None = None) -> int:
     detail = f" (tenant {args.tenant})" if args.tenant else ""
     print(
         f"klaxon masking selftest ok{detail}: {len(SELF_TEST_VALUES)} "
-        "value/family pairs, Painless == derive_token byte-for-byte"
+        "value/family pairs, Painless == derive_token byte-for-byte; HMAC "
+        f"edge-case vectors ok ({len(ALL_HMAC_VECTORS) + len(KLAXON_VECTORS)} checks)"
     )
     return 0
