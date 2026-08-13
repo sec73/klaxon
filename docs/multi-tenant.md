@@ -27,6 +27,10 @@ sync-state doc `klaxon-sync-<tenant>`.
 
 ## The `fields.yaml` schema
 
+Abridged example — the effective list is exactly `tenants/customer-a/fields.yaml`
+(19 fields incl. `event.original` and `related.ip`); copy that file as the
+template for a new tenant.
+
 ```yaml
 # tenants/<tenant>/fields.yaml
 tenant: customer-a
@@ -67,7 +71,12 @@ fields:
     family: HOST
   - field: wazuh.agent.host.hostname
     family: HOST
-  # array: true masks each element of a list field (e.g. related.user)
+  - field: event.original
+    family: USER
+  # array: true masks each element of a list field
+  - field: related.ip
+    family: IP
+    array: true
   - field: related.user
     family: USER
     array: true
@@ -94,7 +103,7 @@ operator's/CI's job). The mandatory token-scheme self-test runs first; on ANY
 failure generation aborts and emits no artifacts.
 
 ```bash
-# build the 4 artifacts from tenants/<tenant>/fields.yaml
+# build the seven artifacts from tenants/<tenant>/fields.yaml
 klaxon masking generate --tenant customer-a
 
 # DEPLOYABLE form (real salt in params.salt) into a directory or stdout
