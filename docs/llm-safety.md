@@ -73,7 +73,7 @@ external model at.
   - `file.owner` — e.g. `root`.
   The GDPR checker reports **"0 to add"** for these on events (value-heuristic
   blind spot: the names match no pattern and the sampled values do not look
-  like IPs/e-mails), while findings carry ~120 open DSGVO fields. Remediation
+  like IPs/e-mails), while findings carry ~120 open GDPR fields. Remediation
   is operator-side: add fields to `mask_fields`/`free_text_fields` where
   appropriate, or deny report/LLM consumers read access via RBAC.
 - **RAW logging is a personal-data store.** By default only MASKED output is
@@ -88,7 +88,7 @@ external model at.
 
 - Add fields to `KLAXON_ANONYMIZATION_MASK_FIELDS` or the `anonymization:`
   block of a YAML config (`KLAXON_CONFIG`; precedence env > YAML > default).
-- Use the DSGVO checker ([gdpr-checker.md](gdpr-checker.md)) to discover fields
+- Use the GDPR checker ([gdpr-checker.md](gdpr-checker.md)) to discover fields
   that should be configured.
 - Watch the audit log (`llm_prompts.log`) for `BLOCKED` lines — each is a
   masking gap, not a prompt that can be reworded.

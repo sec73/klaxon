@@ -452,7 +452,7 @@ Two properties of the design are load-bearing:
 
 ---
 
-## The DSGVO plausibility checker
+## The GDPR plausibility checker
 
 The anonymization layer masks what is *configured*; the checker (see
 `src/klaxon_mcp/gdpr.py`) answers what *should* be configured. It is the 

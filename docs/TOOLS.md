@@ -360,7 +360,7 @@ klaxon-mcp --anonymization-export [OUTFILE]   # RAW lines dropped
 
 ## `gdpr_check`
 
-The DSGVO plausibility checker: find the sensitive fields an index actually
+The GDPR plausibility checker: find the sensitive fields an index actually
 carries and merge them into the anonymization list.
 
 | Parameter | Type | |

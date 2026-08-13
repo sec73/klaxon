@@ -51,7 +51,7 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   leak fields (`wazuh.rule.title` in findings, `url.original`, `file.path`,
   `file.owner`) documented as Known limitations in `docs/llm-safety.md`; the
   GDPR-checker coverage is now index-scoped (events "0 to add" is a
-  value-heuristic blind spot; findings ~120 open DSGVO fields); Option B
+  value-heuristic blind spot; findings ~120 open GDPR fields); Option B
   carries an explicit "implemented, not deployed" status badge; the
   pure-Painless HMAC is marked as a deliberate design decision, not a
   workaround; generator artifact count fixed to seven everywhere. No code or
@@ -97,9 +97,8 @@ rotated as part of this change.
 - **Docs**: new `docs/salt-rotation-runbook.md` (no scheduled rotation; only on
   suspicion; response-layer + masked-stream paths incl. reindex vs two-salt
   window; correlation-break stated) and `docs/security-concept.md`
-  (Pseudonymisierungs-Risiko: Brute-Force-Re-Identifikation — risk,
-  mitigations, residual risk). `docs/security-model.md`,
-  `docs/option-b-masked-stream.md`, README updated (both layers now use the
+  (pseudonymization risk: brute-force re-identification — risk,
+  mitigations, residual risk). `docs/security-model.md`,  `docs/option-b-masked-stream.md`, README updated (both layers now use the
   same keyed HMAC).
 - Version bumped 0.1.8 → 0.1.9; artifacts + golden regenerated.
 
@@ -444,7 +443,7 @@ Verified against a live OpenSearch 3.6.0 indexer.
   which adds `pyyaml` as a runtime dependency and `types-PyYAML` to the dev
   extras. Custom rules are added by extending `mask_fields`.
 
-- **DSGVO plausibility checker.** A new `gdpr_check` tool (plus
+- **GDPR plausibility checker.** A new `gdpr_check` tool (plus
   `klaxon-mcp --gdpr-check`, `--check-gdpr-on-startup` and the standalone
   `klaxon_check_gdpr` script) finds sensitive fields in an index and merges
   them into the anonymization list. Classification is three-layered: custom

@@ -1,4 +1,4 @@
-# DSGVO/GDPR plausibility checker
+# GDPR plausibility checker
 
 Anonymization masks what is *configured*; the checker is the other half — it
 asks "what *should* be configured". It reads an index's mappings, samples a few
@@ -16,7 +16,7 @@ The same logic is shared by the MCP tool (`gdpr_check`), the CLI
 > `file.owner` match no name pattern and their sampled values do not look like
 > IPs/e-mails, so they are missed even though they carry raw usernames,
 > hostnames and paths. On `wazuh-findings-v5-*` the checker reports ~120 open
-> DSGVO fields. Run it per index and treat a "0 to add" result as
+> GDPR fields. Run it per index and treat a "0 to add" result as
 > scope-limited.
 
 ---
