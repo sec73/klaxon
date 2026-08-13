@@ -148,6 +148,8 @@ The deep material lives in dedicated docs — linked, not duplicated:
 - **Multi-tenant setup** (`fields.yaml`, `klaxon masking generate`, salt, namespacing) → [`docs/multi-tenant.md`](docs/multi-tenant.md)
 - **Drift prevention & CI** (pre-commit drift hook, provenance fingerprints, fail-closed startup, sync preflight, `--verify-config`) → [`docs/drift-prevention.md`](docs/drift-prevention.md)
 - **Token scheme & security model** (HMAC, salt, self-test, why 16 hex) → [`docs/security-model.md`](docs/security-model.md)
+- **Security concept: brute-force re-identification risk** (pseudonymization vs anonymization, salt as secret) → [`docs/security-concept.md`](docs/security-concept.md)
+- **Salt rotation runbook** (no scheduled rotation; only on suspicion; response-layer + masked-stream paths) → [`docs/salt-rotation-runbook.md`](docs/salt-rotation-runbook.md)
 - **LLM-safety guarantees & limits** (pseudonymization caveat, residual gate) → [`docs/llm-safety.md`](docs/llm-safety.md)
 - **Running it on another machine** (HTTP transport, auth, TLS, CORS) → [`docs/TOOLS.md`](docs/TOOLS.md#transport-options), [`ARCHITECTURE.md`](ARCHITECTURE.md)
 
@@ -184,6 +186,8 @@ Release history: [`CHANGELOG.md`](CHANGELOG.md).
 - [`docs/multi-tenant.md`](docs/multi-tenant.md) — multi-tenant setup
 - [`docs/drift-prevention.md`](docs/drift-prevention.md) — drift prevention & CI
 - [`docs/security-model.md`](docs/security-model.md) — token scheme & security model
+- [`docs/security-concept.md`](docs/security-concept.md) — pseudonymization / brute-force re-identification risk
+- [`docs/salt-rotation-runbook.md`](docs/salt-rotation-runbook.md) — salt rotation runbook (only on suspicion)
 - [`docs/llm-safety.md`](docs/llm-safety.md) — masking guarantees & limits
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — design rationale
 - [`CHANGELOG.md`](CHANGELOG.md) — release history

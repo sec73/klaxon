@@ -191,13 +191,20 @@ document never passes through the masking pipeline again.
 
 ### Token scheme (pipeline) vs (response layer)
 
-The pipeline produces tokens as `SHA-256(family + ":" + value + ":" + salt)`
-truncated to 16 hex characters, displayed as `[FAMILY_<16 hex>]`. The response
-layer uses HMAC-SHA256 with the same display shape. The two are **not** the
-same token for the same value — but that is inert: masked-stream values are
-already tokens, and the response layer's idempotent passthrough (`[FAMILY_<16
-hex>]` is never re-masked) leaves them byte-identical. What matters is that
-**within one stream** the tokens are deterministic and family-scoped.
+Both layers use the **same keyed construction**:
+`HMAC-SHA256(key = salt, message = "<family>:<value>")` truncated to 16 hex
+characters, displayed as `[FAMILY_<16 hex>]`. The pipeline implements it in pure
+Painless (the ingest allowlist has no `javax.crypto.Mac`; a manual HMAC over an
+`int[]` byte sequence is byte-identical to Python's `hmac` and proven by the
+generator self-test + the live `_simulate`). For the same `value`/`family`/
+`salt` both layers produce the **same** token — and a masked-stream value is
+already a token, so the response layer's idempotent passthrough
+(`[FAMILY_<16 hex>]` is never re-masked) leaves it byte-identical. What matters
+is that **within one stream** the tokens are deterministic and family-scoped.
+The salt is the HMAC key: keep it ≥ 256 bits, restrict who can read it, and do
+**not** rotate on a schedule — see
+[`docs/salt-rotation-runbook.md`](salt-rotation-runbook.md) and
+[`docs/security-concept.md`](security-concept.md).
 
 ## Quarantine stream (fail-closed)
 
