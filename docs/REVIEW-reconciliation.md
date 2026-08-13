@@ -37,6 +37,9 @@ Status vocabulary used below (and in the corrected docs):
 | R15 | docs/option-b-masked-stream.md | title/intro | no explicit deployment status | status badge: **implemented & live-verified, NOT deployed** (0 shards) | implemented, not deployed | `docs(status)` |
 | R16 | docs/security-model.md | pipeline HMAC section | pure-Painless HMAC described but not labelled as deliberate | explicit: a **documented design decision** (no `javax.crypto.Mac` in the ingest allowlist), not a workaround bug | implemented & verified | `docs(status)` |
 | R17 | docs/TOOLS.md | "Default masked fields" | list presented without a count/scope | 18 = built-in default; the per-tenant effective list is generated from `fields.yaml` (customer-a: **19**) | implemented & verified | `docs(fields)` |
+| R18 | docs/salt-rotation-runbook.md | — | schema-change case (token construction change with unchanged salt) not covered | new section "Token-Schema-Wechsel bei unverändertem Salt": same operational consequence as rotation for the masked stream (reindex-or-two-window, shared with Pfad 2, not duplicated), response layer = no reindex (tokens ephemeral), concrete 0.1.8 → 0.1.9 HMAC example, applies to ANY derivation change, status "must-fix before first productive deploy" (Option B not deployed) | implemented, not deployed | `docs(runbook)` |
+| R19 | ARCHITECTURE.md | "Deliberately not built → No caller identity" | no per-tenant roles mentioned | caller identity still not modeled at the MCP layer, but role-based separation is enforced at the indexer level per tenant via the generated security-plugin roles: `klaxon_llm_report_<tenant>` (masked only), `klaxon_ops_<tenant>` (quarantine + raw), `klaxon_sync_<tenant>` (sync service account) — names verified against `build_roles_fragment` + `tenants/customer-a/generated/roles-customer-a.yaml`; links to option-b Access control | implemented & verified | `docs(roles)` |
+| R20 | docs/option-b-masked-stream.md, docs/multi-tenant.md | roles fragment filename | `roles-klaxon-<tenant>.yaml` | the generator emits **`roles-<tenant>.yaml`** (`artifact_io.ROLES_FRAGMENT_FILE`); corrected in both docs | implemented & verified | `docs(roles)` |
 
 ## Checked and found correct (no change)
 
@@ -73,3 +76,12 @@ The GDPR checker reports **"0 to add"** for these on events despite the leak
 `file.owner` match no name pattern and their sampled values do not look like
 IPs/e-mails); on **findings** it reports ~120 open DSGVO fields. Numbers are
 only meaningful with the scope (events vs. findings) attached.
+
+## Observations (out of scope for docs-only)
+
+- `tests/golden/capture.py` stores the roles fragment under the stale key
+  `artifacts/roles-klaxon-customer-a.yaml`, while the generator emits
+  `roles-<tenant>.yaml`. `tests/golden/verify.py` does not cross-check filenames
+  against the generator, so the golden test stays green; the capture key should
+  be renamed to `roles-customer-a.yaml` and the golden regenerated in a future
+  test change (not a doc issue — recorded here for tracking).

@@ -161,7 +161,7 @@ and an index-pattern component.
 | `index-template-klaxon-masked-<tenant>.json` | `PUT /_index_template/klaxon-masked-<tenant>` |
 | `ism-klaxon-quarantine-retention-<tenant>.json` | `PUT /_plugins/_ism/policies/klaxon-quarantine-retention-<tenant>` (quarantine, 90d) |
 | `index-template-klaxon-quarantine-<tenant>.json` | `PUT /_index_template/klaxon-quarantine-<tenant>` (no `index.default_pipeline`) |
-| `roles-klaxon-<tenant>.yaml` | OpenSearch security-plugin roles fragment (LLM/ops/sync) |
+| `roles-<tenant>.yaml` | OpenSearch security-plugin roles fragment (LLM/ops/sync) |
 
 The committed (checked-in) form carries `params.salt = "__SALT__"` and is
 secret-free; the deployable form (`--out`/`--stdout`) carries the real salt.

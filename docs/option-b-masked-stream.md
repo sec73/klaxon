@@ -88,7 +88,7 @@ artifacts from it:
   `index_patterns: [klaxon-quarantine-<tenant>-v5*]`, priority 200,
   `data_stream: {}`, and settings **without** `index.default_pipeline` —
   quarantine documents must never re-enter the masking pipeline.
-* `tenants/<tenant>/generated/roles-klaxon-<tenant>.yaml` — the OpenSearch
+* `tenants/<tenant>/generated/roles-<tenant>.yaml` — the OpenSearch
   security-plugin **roles fragment** (LLM/report, ops, sync service user) —
   see [Access control](#access-control).
 
@@ -425,7 +425,7 @@ patterns `...-v5-*`. Wazuh streams are untouched.
 
 ## Access control
 
-The roles fragment `tenants/<tenant>/generated/roles-klaxon-<tenant>.yaml`
+The roles fragment `tenants/<tenant>/generated/roles-<tenant>.yaml`
 defines three OpenSearch security-plugin roles (apply via the security API or
 merge into `roles.yml` — the operator's/CI's job; Klaxon never writes to the
 cluster):

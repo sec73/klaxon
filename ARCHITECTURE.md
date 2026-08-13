@@ -508,9 +508,17 @@ file alone takes effect.
 - **No 4.x compatibility layer.** No translation of 4.x field names, no
   emulation of `wazuh-alerts-*`.
 - **No write access.** Read-only throughout.
-- **No caller identity.** Every request runs with the credentials from the
-  environment. Authorisation belongs in the indexer — run Klaxon as
-  `wazuh-readonly`, not `admin`.
+- **No caller identity at the MCP/API layer.** Klaxon does not model *who* is
+  calling at the tool layer — every request runs with the credentials from the
+  environment (run Klaxon as `wazuh-readonly`, not `admin`). Role-based
+  separation is enforced at the **indexer level**, per tenant, via the
+  OpenSearch security-plugin roles fragment emitted by `klaxon masking
+  generate` (see [Access
+  control](docs/option-b-masked-stream.md#access-control)):
+  `klaxon_llm_report_<tenant>` (reads the masked stream only),
+  `klaxon_ops_<tenant>` (reads the quarantine + raw streams) and
+  `klaxon_sync_<tenant>` (the sync-job service account: reads the raw stream,
+  writes the masked + quarantine streams).
 
 ---
 
