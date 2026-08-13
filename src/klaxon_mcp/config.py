@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import secrets
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
@@ -45,6 +46,7 @@ __all__ = [
     "GdprConfig",
     "Transport",
     "TransportConfig",
+    "quarantine_pattern_overlap",
 ]
 
 logger = logging.getLogger("klaxon_mcp.config")
@@ -107,6 +109,54 @@ def _resolve_salt(config_file: str) -> str:
         path,
     )
     return generated
+
+
+# --------------------------------------------------------------------------- #
+# Quarantine / masked_streams fail-closed guard
+#
+# The Option B quarantine stream (klaxon-quarantine-<tenant>-v5-*) holds RAW
+# masking-failure documents. `masked_streams` is the LLM allowlist: the response
+# layer passes those streams' values through unchanged, trusting them to be
+# pre-masked. If a masked_streams pattern could ever match the quarantine
+# namespace, an LLM query would read RAW data through Klaxon — refuse to start.
+# Quarantine is NEVER generated into masked_streams (see build_config_fragment);
+# this guard catches a hand-edit or env override that adds it back.
+# --------------------------------------------------------------------------- #
+
+# Representative quarantine index names across tenant shapes. A masked_streams
+# pattern overlapping the quarantine namespace matches at least one of these
+# (tenant-specific patterns AND broad patterns like `klaxon-*`).
+_QUARANTINE_PROBE_NAMES = (
+    "klaxon-quarantine-a-v5-000001",
+    "klaxon-quarantine-customer-a-v5-000001",
+    "klaxon-quarantine-customer-a-v5-raw",
+    "klaxon-quarantine-z-v5-000001",
+    "klaxon-quarantine-other-b-v5-000001",
+)
+
+
+def _index_pattern_regex(pattern: str) -> re.Pattern[str]:
+    """Translate an index pattern glob (`*`/`?`) into an anchored regex."""
+    out = ["^"]
+    for ch in pattern:
+        if ch == "*":
+            out.append(".*")
+        elif ch == "?":
+            out.append(".")
+        else:
+            out.append(re.escape(ch))
+    out.append("$")
+    return re.compile("".join(out))
+
+
+def quarantine_pattern_overlap(pattern: str) -> bool:
+    """Whether an index pattern could match the klaxon-quarantine-* namespace.
+
+    Used to refuse startup when a `masked_streams` entry would let an LLM query
+    read quarantine (raw) data through Klaxon. Also exported for tests.
+    """
+    rx = _index_pattern_regex(pattern)
+    return any(rx.match(name) is not None for name in _QUARANTINE_PROBE_NAMES)
 
 
 # The default anonymization mask list lives in field_kinds — the single home
@@ -258,6 +308,21 @@ class AnonymizationConfig:
             masked_streams = tuple(
                 s.strip() for s in raw_streams.split(",") if s.strip()
             )
+
+        # Fail-closed: `masked_streams` is the LLM allowlist. If any pattern
+        # could match the quarantine stream (raw masking-failure documents), an
+        # LLM query would read RAW data through Klaxon — refuse to start/serve.
+        # Quarantine is NEVER generated into masked_streams; this catches a
+        # hand-edit or env override that adds it back.
+        for stream in masked_streams:
+            if quarantine_pattern_overlap(stream):
+                raise ConfigError(
+                    f"masked_streams pattern {stream!r} could match the "
+                    "quarantine stream (klaxon-quarantine-<tenant>-v5-*), which "
+                    "holds RAW masking-failure documents and must never reach an "
+                    "LLM through Klaxon. Remove the pattern — quarantine is never "
+                    "added to masked_streams (see docs/option-b-masked-stream.md)."
+                )
 
         log_max_len = _env_int(
             "KLAXON_ANONYMIZATION_LOG_MAX_LEN",

@@ -16,7 +16,9 @@ generation aborts and emits NO artifacts. Also exposed as
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+from typing import Any
 
 from .masked_stream import _FREETEXT_PATTERN_ORDER
 from .tokens import TOKEN_RE
@@ -186,6 +188,38 @@ def verify_script_structure(script: str) -> list[str]:
                 "references them by name and the script would fail to compile."
             )
 
+    return problems
+
+
+def verify_quarantine_on_failure(on_failure: list[Any]) -> list[str]:
+    """Fail-closed on_failure markers MISSING from a pipeline's on_failure block.
+
+    The on_failure MUST reroute a masking-failure document OUT of the masked
+    stream into the quarantine stream (`klaxon-quarantine-<tenant>-v5-raw`),
+    preserving the original destination + failure reason. Empty result = the
+    routing is present. Runs inside every `klaxon masking generate` (via
+    `run_generator_selftest`), so a regression that reverts to the old fail-open
+    on_failure (`set klaxon.masking_error`, doc stays in the masked stream)
+    aborts generation and emits NO artifacts.
+    """
+    problems: list[str] = []
+    if not on_failure:
+        problems.append("pipeline has no on_failure block (masking failures "
+                        "would be dropped, not quarantined)")
+        return problems
+    blob = json.dumps(on_failure)
+    if "{{ _ingest.on_failure_message }}" not in blob:
+        problems.append(
+            "on_failure lacks the {{ _ingest.on_failure_message }} capture "
+            "(the failure reason would be lost)"
+        )
+    for marker in ("original_index", "masking_error", "quarantine", "ctx['_index']"):
+        if marker not in blob:
+            problems.append(f"on_failure rerouting script missing marker {marker!r}")
+    if "klaxon-quarantine-" not in blob or "-v5-raw" not in blob:
+        problems.append(
+            "on_failure does not reroute to klaxon-quarantine-<tenant>-v5-raw"
+        )
     return problems
 
 

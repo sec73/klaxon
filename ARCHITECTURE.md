@@ -435,9 +435,11 @@ Two properties of the design are load-bearing:
   `derive_token(value, family, salt)` for representative values per family; on
   any mismatch it aborts and emits no artifacts. Changing the scheme in
   `derive_token` breaks generation, not the deployed pipeline.
-* **Drift is fail-closed.** Every artifact carries provenance (`_meta` source,
-  sha256 of `fields.yaml`, tenant, `generator_version`; the config fragment
-  carries a `# generated from ...` comment), and the sync-job preflight /
+* **Drift is fail-closed.** Every artifact carries provenance — on the
+  committed templates as `_meta` (source, sha256 of `fields.yaml`, tenant,
+  `generator_version`) and on the deployed pipeline JSON-encoded in its
+  `description` (OpenSearch rejects `_meta` in ingest pipelines); the config
+  fragment carries a `# generated from ...` comment. The sync-job preflight /
   `verify-config` / CI / pre-commit all refuse to proceed when the deployed or
   committed artifacts no longer match `fields.yaml`. The salt is read from the
   same environment variable as the response layer; a deploy-time

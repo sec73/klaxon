@@ -86,7 +86,7 @@ See [security-model.md](security-model.md) for how the tokens work and
 | `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS` | `true` | Mask aggregation bucket keys (terms/composite/…) with the same tokens as `_source`. ON by default (fail-closed); `false` restores raw keys |
 | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS` | `true` | Mask usernames inside free-text fields using known identities + context patterns |
 | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS` | empty | Extra free-text fields that get the free-text username pass (beyond the built-in hint pattern) |
-| `KLAXON_ANONYMIZATION_MASKED_STREAMS` | empty | Data streams already masked at ingest (Option B); their values pass through unchanged (idempotent) |
+| `KLAXON_ANONYMIZATION_MASKED_STREAMS` | empty | Data streams already masked at ingest (Option B); their values pass through unchanged (idempotent). A pattern that could match the quarantine stream (`klaxon-quarantine-<tenant>-v5-*`, RAW masking failures) is refused — Klaxon fails to start |
 | `KLAXON_ANONYMIZATION_WHITELIST_ENABLED` | `true` | `true` ⇒ a residual IP/e-mail **blocks** the response; `false` ⇒ logs a warning and returns the masked response |
 | `KLAXON_ANONYMIZATION_LOG` | `llm_prompts.log` | Prompt/audit log path (MASKED output only) |
 | `KLAXON_ANONYMIZATION_LOG_RAW` | `false` | `true` ⇒ also persist RAW output (the log becomes a personal-data store; the server warns) |

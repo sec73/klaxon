@@ -356,6 +356,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Env var name for the salt (default: salt_env from fields.yaml).",
     )
+
+    migrate_parser = masking_sub.add_parser(
+        "migrate",
+        help="ONE-TIME, operator-run migration of legacy klaxon.masking_error "
+        "docs from the masked stream into the quarantine stream. Destructive "
+        "(deletes from the masked stream) — never automated. Idempotent.",
+    )
+    migrate_parser.add_argument(
+        "--tenant",
+        metavar="TENANT",
+        required=True,
+        help="Tenant whose masked stream is migrated.",
+    )
+    migrate_parser.add_argument(
+        "--root", type=Path, default=None, help="Repo root (default: auto)."
+    )
+    migrate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be migrated without reindexing or deleting.",
+    )
     return parser.parse_args(argv)
 
 
@@ -740,8 +761,20 @@ def main(argv: list[str] | None = None) -> int:
             if args.salt_env:
                 argv += ["--salt-env", args.salt_env]
             return live_test.test_main(argv)
+        if args.masking_command == "migrate":
+            if not args.tenant:
+                print(
+                    "--tenant is required for `masking migrate`",
+                    file=sys.stderr,
+                )
+                return 2
+            from . import sync_masked
+
+            return sync_masked.migrate_quarantine_command(
+                args.tenant, dry_run=args.dry_run
+            )
         print(
-            "masking: missing subcommand (generate|selftest|salt-check)",
+            "masking: missing subcommand (generate|selftest|salt-check|test|migrate)",
             file=sys.stderr,
         )
         return 2

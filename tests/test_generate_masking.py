@@ -24,16 +24,26 @@ import yaml
 
 from klaxon_mcp import masking
 from klaxon_mcp.masked_stream import (
+    PROVENANCE_DESCRIPTION_MARKER,
+    QUARANTINE_RETENTION_DAYS,
     TEMPLATE_PRIORITY,
     build_config_fragment,
     build_index_template,
     build_ism_policy,
     build_pipeline,
     build_pipeline_template,
+    build_quarantine_index_template,
+    build_quarantine_ism_policy,
+    build_roles_fragment,
     deploy_pipeline,
     derive_token,
+    effective_mask_fields_from_config,
     fields_yaml_sha256,
+    fingerprint_matches,
     load_tenant_config,
+    pipeline_field_names,
+    pipeline_has_quarantine_on_failure,
+    pipeline_provenance,
     token,
 )
 from klaxon_mcp.masking import (
@@ -41,6 +51,7 @@ from klaxon_mcp.masking import (
     INDEX_TEMPLATE_FILE,
     ISM_POLICY_FILE,
     PIPELINE_TEMPLATE_NAME,
+    ROLES_FRAGMENT_FILE,
     SELF_TEST_VALUES,
     check_artifacts,
     check_deployed_salt,
@@ -54,6 +65,7 @@ from klaxon_mcp.masking import (
     run_token_selftest,
     selftest_main,
     tenants_in_repo,
+    verify_quarantine_on_failure,
     verify_script_scheme,
     verify_script_structure,
 )
@@ -368,12 +380,51 @@ def test_pipeline_meta_carries_provenance(cfg: Any) -> None:
 
 
 def test_pipeline_has_on_failure_flag(cfg: Any) -> None:
+    """The on_failure block is FAIL-CLOSED: it reroutes a masking-failure doc
+    OUT of the masked stream into the quarantine stream, preserving the original
+    destination + failure reason (see `check_quarantine_routing` in the live
+    test for the behavioural proof)."""
     pipeline = build_pipeline_template(cfg)
     script = pipeline["processors"][0]["script"]
     assert script["lang"] == "painless"
-    assert script["on_failure"] == [
-        {"set": {"field": "klaxon.masking_error", "value": "{{ _ingest.on_failure_message }}"}}
-    ]
+    on_failure = script["on_failure"]
+    # Two handlers: capture {{ _ingest.on_failure_message }} (the only way
+    # OpenSearch 3.x exposes it — not a script variable), then reroute.
+    assert len(on_failure) == 2
+    assert on_failure[0] == {
+        "set": {
+            "field": "klaxon.quarantine.reason",
+            "value": "{{ _ingest.on_failure_message }}",
+            "ignore_failure": True,
+        }
+    }
+    assert on_failure[1]["script"]["lang"] == "painless"
+    source = on_failure[1]["script"]["source"]
+    assert "original_index" in source
+    assert "masking_error" in source
+    assert "ctx['_index']" in source
+    assert cfg.quarantine_routing_index in source
+    # FAIL-CLOSED marker: the doc is routed to quarantine, never left in the
+    # masked stream (the old fail-open `set klaxon.masking_error` is gone).
+    assert not any(
+        h.get("set", {}).get("field") == "klaxon.masking_error" for h in on_failure
+    )
+    assert pipeline_has_quarantine_on_failure(pipeline)
+
+
+def test_pipeline_quarantine_self_test(cfg: Any) -> None:
+    """The mandatory self-test accepts the quarantine on_failure and REJECTS a
+    revert to the old fail-open form (generation must abort)."""
+    pipeline = build_pipeline_template(cfg)
+    on_failure = pipeline["processors"][0]["script"]["on_failure"]
+    assert verify_quarantine_on_failure(on_failure) == []
+    assert run_generator_selftest(cfg, "salt") == []
+    # Revert to fail-open: only flag masking_error, doc stays in the masked
+    # stream -> the self-test must flag it.
+    fail_open = [{"set": {"field": "klaxon.masking_error", "value": "boom"}}]
+    problems = verify_quarantine_on_failure(fail_open)
+    assert problems, "a fail-open on_failure must be rejected by the self-test"
+    assert any("quarantine" in p for p in problems)
 
 
 def test_pipeline_template_uses_salt_placeholder_in_params(cfg: Any) -> None:
@@ -393,6 +444,26 @@ def test_deployed_pipeline_bakes_real_salt_in_params(
     script = deploy_pipeline(cfg)["processors"][0]["script"]
     assert script["params"] == {"salt": "real-secret"}
     assert "real-secret" not in script["source"]
+
+
+def test_deploy_pipeline_omits_meta_and_embeds_provenance(
+    cfg: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OpenSearch rejects `_meta` in ingest pipelines (HTTP 400), so the body
+    PUT to the indexer must NOT carry `_meta`; provenance rides in `description`
+    instead, and the drift checks must still fingerprint the deployed form."""
+    monkeypatch.setenv("KLAXON_ANONYMIZATION_SALT", "real-secret")
+    deployed = deploy_pipeline(cfg)
+    assert "_meta" not in deployed
+    assert PROVENANCE_DESCRIPTION_MARKER in deployed["description"]
+    meta = pipeline_provenance(deployed)
+    assert meta["tenant"] == "test-a"
+    assert meta["sha256"] == fields_yaml_sha256(cfg)
+    assert meta["generator_version"]
+    assert fingerprint_matches(deployed, cfg)
+    assert pipeline_field_names(deployed) == effective_mask_fields_from_config(cfg)
+    # The committed template keeps `_meta` for CI drift.
+    assert "_meta" in build_pipeline_template(cfg)
 
 
 def test_pipeline_never_masks_related_hash(cfg: Any) -> None:
@@ -415,12 +486,17 @@ def test_ism_policy_retention_and_priority(cfg: Any) -> None:
 
 def test_index_template_targets_only_masked_stream(cfg: Any) -> None:
     template = build_index_template(cfg, {"properties": {}})
-    assert template["index_patterns"] == ["klaxon-masked-test-a-v5-*"]
+    # The pattern must match the DATA STREAM NAME (klaxon-masked-test-a-v5, no
+    # trailing dash) for OpenSearch to create the stream; it also covers the
+    # ...-v5-000001 backing indices. Wazuh streams are never matched.
+    assert template["index_patterns"] == ["klaxon-masked-test-a-v5*"]
     assert template["priority"] == TEMPLATE_PRIORITY
     assert template["data_stream"] == {}
     settings = template["template"]["settings"]
     assert settings["index.default_pipeline"] == "klaxon-mask-test-a"
-    assert settings["index.lifecycle.name"] == "klaxon-masked-retention-test-a"
+    # `index.lifecycle.name` is an Elasticsearch ILM setting that OpenSearch
+    # rejects in index templates; the ISM policy attaches via its `ism_template`.
+    assert "index.lifecycle.name" not in settings
     assert template["template"]["mappings"] == {"properties": {}}
 
 
@@ -431,6 +507,78 @@ def test_index_template_omits_mappings_when_none(cfg: Any) -> None:
     assert "mappings" not in template["template"]
     assert template["priority"] == TEMPLATE_PRIORITY
     assert template["data_stream"] == {}
+
+
+# --------------------------------------------------------------------------- #
+# Quarantine artifacts (fail-closed masking-error routing)
+# --------------------------------------------------------------------------- #
+
+
+def test_quarantine_ism_retention_longer_than_masked(cfg: Any) -> None:
+    ism = build_quarantine_ism_policy(cfg)
+    policy = ism["policy"]
+    hot = policy["states"][0]
+    assert hot["name"] == "hot"
+    assert policy["states"][1]["name"] == "delete"
+    # Forensics: quarantine outlives the masked stream (90d default vs 30d).
+    assert hot["transitions"][0]["conditions"]["min_index_age"] == "90d"
+    assert QUARANTINE_RETENTION_DAYS == 90
+    assert ism["policy"]["ism_template"]["priority"] == 100
+    assert ism["policy"]["ism_template"]["index_patterns"] == [
+        "klaxon-quarantine-test-a-v5-*"
+    ]
+
+
+def test_quarantine_ism_respects_override(cfg: Any) -> None:
+    ism = build_quarantine_ism_policy(cfg, retention_days=180)
+    assert ism["policy"]["states"][0]["transitions"][0]["conditions"][
+        "min_index_age"
+    ] == "180d"
+
+
+def test_quarantine_index_template_targets_only_quarantine(cfg: Any) -> None:
+    template = build_quarantine_index_template(cfg, {"properties": {}})
+    # Own namespace: can never overlap the masked-stream LLM allowlist.
+    assert template["index_patterns"] == ["klaxon-quarantine-test-a-v5*"]
+    assert template["priority"] == TEMPLATE_PRIORITY
+    assert template["data_stream"] == {}
+    assert template["template"]["mappings"] == {"properties": {}}
+    settings = template["template"]["settings"]
+    # NO index.default_pipeline — quarantine docs must never re-enter masking.
+    assert "index.default_pipeline" not in settings
+
+
+def test_quarantine_index_template_omits_mappings_when_none(cfg: Any) -> None:
+    template = build_quarantine_index_template(cfg)
+    assert "mappings" not in template["template"]
+    assert "index.default_pipeline" not in template["template"]["settings"]
+
+
+def test_roles_fragment_least_privilege(cfg: Any) -> None:
+    roles = build_roles_fragment(cfg)
+    # LLM/report role: read on the MASKED stream ONLY.
+    llm = "klaxon_llm_report_test-a:"
+    assert llm in roles
+    llm_block = roles.split(llm, 1)[1].split("\n\n")[0]
+    assert cfg.masked_stream_pattern in llm_block
+    assert cfg.quarantine_stream_pattern not in llm_block
+    assert "klaxon-quarantine" not in llm_block
+    # Ops/security role: read on quarantine + raw events, no LLM mapping.
+    ops = "klaxon_ops_test-a:"
+    assert ops in roles
+    ops_block = roles.split(ops, 1)[1].split("\n\n")[0]
+    assert cfg.quarantine_stream_pattern in ops_block
+    assert cfg.raw_stream in ops_block
+    # Sync service user: write on masked + quarantine (the quarantine write is
+    # the fail-closed backstop for the on_failure reroute).
+    sync = "klaxon_sync_test-a:"
+    assert sync in roles
+    sync_block = roles.split(sync, 1)[1]
+    assert "write" in sync_block
+    assert cfg.quarantine_stream_pattern in sync_block
+    # Provenance header rides in a comment.
+    assert fields_yaml_sha256(cfg) in roles
+    assert cfg.source_rel in roles
 
 
 def test_pipeline_has_no_hardcoded_field_logic(cfg: Any) -> None:
@@ -505,13 +653,19 @@ def test_config_fragment_has_provenance_comment(cfg: Any) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_generated_paths_are_four_artifacts(cfg: Any) -> None:
+def test_generated_paths_are_seven_artifacts(cfg: Any) -> None:
     paths = generated_paths(cfg)
-    assert len(paths) == 4
+    assert len(paths) == 7
     assert paths[0].name == CONFIG_FRAGMENT_NAME
     assert paths[1].name == PIPELINE_TEMPLATE_NAME.format(pipeline=cfg.pipeline_name)
     assert paths[2].name == ISM_POLICY_FILE.format(policy=cfg.ism_policy_name)
     assert paths[3].name == INDEX_TEMPLATE_FILE.format(template=cfg.index_template_name)
+    # New fail-closed artifacts.
+    assert paths[4].name == ISM_POLICY_FILE.format(policy=cfg.quarantine_ism_policy_name)
+    assert paths[5].name == INDEX_TEMPLATE_FILE.format(
+        template=cfg.quarantine_index_template_name
+    )
+    assert paths[6].name == ROLES_FRAGMENT_FILE.format(tenant=cfg.tenant)
 
 
 def test_render_is_deterministic() -> None:
@@ -536,13 +690,26 @@ def test_render_artifacts_are_template_form(cfg: Any) -> None:
     template = json.loads(contents[str(generated_paths(cfg)[3])])
     assert template["data_stream"] == {}
     assert "generated from tenants/test-a/fields.yaml" in contents[str(generated_paths(cfg)[0])]
+    # Quarantine artifacts are part of the committed set too.
+    quarantine_ism = json.loads(contents[str(generated_paths(cfg)[4])])
+    assert quarantine_ism["policy"]["states"][0]["name"] == "hot"
+    quarantine_template = json.loads(contents[str(generated_paths(cfg)[5])])
+    assert quarantine_template["data_stream"] == {}
+    assert "klaxon-quarantine-test-a-v5*" in quarantine_template["index_patterns"]
+    roles = contents[str(generated_paths(cfg)[6])]
+    assert "klaxon_llm_report_test-a" in roles
+    assert "klaxon_ops_test-a" in roles
+    assert "klaxon_sync_test-a" in roles
 
 
 def test_render_deployable_has_real_salt(cfg: Any) -> None:
     deployable = render_deployable(cfg, "real-secret")
     pipeline = json.loads(deployable[PIPELINE_TEMPLATE_NAME.format(pipeline=cfg.pipeline_name)])
     assert pipeline["processors"][0]["script"]["params"] == {"salt": "real-secret"}
-    assert pipeline["_meta"]["generator_version"]
+    # The deployable form carries NO `_meta` (OpenSearch rejects it); the
+    # provenance rides in `description` so the deployed pipeline stays drift-checked.
+    assert "_meta" not in pipeline
+    assert pipeline_provenance(pipeline)["generator_version"]
     # The committed form must differ only in the salt slot.
     committed = render_artifacts(cfg)
     committed_pipeline = json.loads(
@@ -551,6 +718,9 @@ def test_render_deployable_has_real_salt(cfg: Any) -> None:
     assert committed_pipeline["processors"][0]["script"]["params"] != {
         "salt": "real-secret"
     }
+    # The deployable set also carries the quarantine + roles artifacts.
+    assert cfg.quarantine_ism_policy_name + ".json" in "".join(deployable)
+    assert ROLES_FRAGMENT_FILE.format(tenant=cfg.tenant) in deployable
 
 
 def test_committed_artifacts_match_regeneration() -> None:
@@ -562,7 +732,7 @@ def test_committed_artifacts_match_regeneration() -> None:
 def test_check_artifacts_detects_drift(cfg: Any) -> None:
     # Nothing committed for the temp tenant -> every artifact is reported MISSING.
     drift = check_artifacts(cfg)
-    assert len(drift) == 4
+    assert len(drift) == 7
     assert all("MISSING" in line for line in drift)
 
 
@@ -647,13 +817,23 @@ def test_generate_writes_deployable_to_out(cfg: Any, tmp_path: Any) -> None:
     )
     assert rc == 0
     files = sorted(p.name for p in out_dir.iterdir())
-    assert len(files) == 4
+    assert len(files) == 7
     pipeline = json.loads(
         (out_dir / PIPELINE_TEMPLATE_NAME.format(pipeline=cfg.pipeline_name)).read_text(
             encoding="utf-8"
         )
     )
     assert pipeline["processors"][0]["script"]["params"] == {"salt": "x"}
+    # The quarantine + roles artifacts are emitted to the deployable dir too.
+    assert (out_dir / ROLES_FRAGMENT_FILE.format(tenant=cfg.tenant)).exists()
+    assert (
+        out_dir
+        / ISM_POLICY_FILE.format(policy=cfg.quarantine_ism_policy_name)
+    ).exists()
+    assert (
+        out_dir
+        / INDEX_TEMPLATE_FILE.format(template=cfg.quarantine_index_template_name)
+    ).exists()
 
 
 def test_generate_stdout_prints_deployable_artifacts(cfg: Any, tmp_path: Any, capsys: Any) -> None:

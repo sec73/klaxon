@@ -56,6 +56,7 @@ from .artifact_io import (
     INDEX_TEMPLATE_FILE,
     ISM_POLICY_FILE,
     PIPELINE_TEMPLATE_NAME,
+    ROLES_FRAGMENT_FILE,
     check_artifacts,
     generated_dir,
     generated_paths,
@@ -79,6 +80,7 @@ from .selftest import (
     TokenSchemeError,
     _selftest_salt,
     painless_token_reference,
+    verify_quarantine_on_failure,
     verify_script_scheme,
     verify_script_structure,
 )
@@ -91,6 +93,7 @@ __all__ = [
     "INDEX_TEMPLATE_FILE",
     "ISM_POLICY_FILE",
     "PIPELINE_TEMPLATE_NAME",
+    "ROLES_FRAGMENT_FILE",
     "SELF_TEST_VALUES",
     "TOKEN_RE",
     "TokenSchemeError",
@@ -108,6 +111,7 @@ __all__ = [
     "run_token_selftest",
     "selftest_main",
     "tenants_in_repo",
+    "verify_quarantine_on_failure",
     "verify_script_scheme",
     "verify_script_structure",
     "write_artifacts",
@@ -223,7 +227,8 @@ def run_generator_selftest(cfg: TenantConfig, salt: str) -> list[str]:
     MUST abort and emit NO artifacts.
     """
     problems = run_token_selftest(salt)
-    script = build_pipeline(cfg, salt)["processors"][0]["script"]
+    pipeline = build_pipeline(cfg, salt)
+    script = pipeline["processors"][0]["script"]
     if script.get("params", {}).get("salt") != salt:
         problems.append(
             f"  pipeline params.salt mismatch: expected {salt!r}, got "
@@ -231,6 +236,10 @@ def run_generator_selftest(cfg: TenantConfig, salt: str) -> list[str]:
         )
     problems.extend(verify_script_scheme(script["source"]))
     problems.extend(verify_script_structure(script["source"]))
+    # Fail-closed routing is part of the scheme: a revert to the fail-open
+    # on_failure must abort generation, not ship a pipeline that leaks raw docs
+    # into the masked stream.
+    problems.extend(verify_quarantine_on_failure(script.get("on_failure") or []))
     return problems
 
 

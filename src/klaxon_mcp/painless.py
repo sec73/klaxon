@@ -22,6 +22,7 @@ functions from the main logic.
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from .tenants import TenantConfig
 
@@ -289,6 +290,93 @@ _MASK_FAMILY = {
     "SSH_PUBKEY": "USER",
     "UID_PAREN": "USER",
 }
+
+
+# --------------------------------------------------------------------------- #
+# Quarantine on_failure (fail-closed masking-error routing)
+#
+# Verified against OpenSearch 3.6.0 (see docs/option-b-masked-stream.md):
+#   * `_ingest` is NOT a resolvable Painless variable in on_failure scripts
+#     (`cannot resolve symbol [_ingest.on_failure_message]`) — the failure
+#     message is only exposed through the `{{ _ingest.on_failure_message }}`
+#     value-template of a `set` processor.
+#   * A `set` with an unresolvable template does NOT throw: it sets the field
+#     to "" — so the script's empty-check falls back to 'unknown' on clusters
+#     that only log the message (the "handle both" requirement).
+#   * `ignore_failure: true` on that `set` is defense-in-depth for the
+#     (hypothetical) case a cluster DOES throw on an unresolvable template:
+#     the script then runs with no reason field and defaults to 'unknown'.
+#   * The rerouting script must run as a separate processor AFTER the `set`
+#     (there is no way to read the message inside the same script on 3.6.0).
+#     Order within the script matters: original_index is captured BEFORE
+#     `_index` is rewritten.
+# --------------------------------------------------------------------------- #
+
+# Field the `set` processor captures the failure message into (dotted field,
+# so it lands NESTED as klaxon.quarantine.reason — the script reads it there).
+QUARANTINE_REASON_FIELD = "klaxon.quarantine.reason"
+# The on_failure_message template, only resolvable in a `set` value within an
+# on_failure block on OpenSearch 3.x.
+_ON_FAILURE_MESSAGE_TEMPLATE = "{{ _ingest.on_failure_message }}"
+
+
+def _quarantine_on_failure_script(cfg: TenantConfig) -> str:
+    """The Painless source of the on_failure rerouting script.
+
+    FAIL-CLOSED: a document whose masking threw is routed OUT of the masked
+    stream into the quarantine stream — it never stays in
+    `klaxon-masked-<tenant>-v5-*`. Same `ctx`-context pattern as the masking
+    script (in an ingest script processor `ctx` IS the document; there is no
+    nested `_source`).
+    """
+    return f"""// Fail-closed: a masking-failure document is rerouted OUT of the masked
+// stream into the quarantine stream — it never stays in {cfg.masked_stream_pattern}.
+// In an ingest script processor `ctx` IS the document (no nested _source).
+
+// 1. Preserve the original destination BEFORE rerouting (order matters).
+ctx.klaxon.quarantine.original_index = ctx['_index'];
+// 2. The failure reason was captured by the preceding `set` processor from the
+//    _ingest.on_failure_message template (the only way OpenSearch exposes it to
+//    on_failure; clusters that only log it yield an empty field). Fall back to
+//    'unknown' so the field is always present and searchable.
+if (!ctx['klaxon']['quarantine'].containsKey('reason')
+    || ctx['klaxon']['quarantine']['reason'] == null
+    || ctx['klaxon']['quarantine']['reason'].toString().isEmpty()) {{
+    ctx['klaxon']['quarantine']['reason'] = 'unknown';
+}}
+// 3. Flag the document (the consumer-side filter is now defense-in-depth only).
+ctx.klaxon.masking_error = true;
+// 4. Reroute into the quarantine stream (matches the quarantine index template,
+//    so the target is auto-created and ISM-retained; never re-enters masking).
+ctx['_index'] = '{cfg.quarantine_routing_index}';
+"""
+
+
+def _quarantine_on_failure_processors(cfg: TenantConfig) -> list[dict[str, Any]]:
+    """The full on_failure block: capture the message, then reroute.
+
+    Two processors because OpenSearch 3.6.0 exposes `_ingest.on_failure_message`
+    ONLY through a `set` value-template — a Painless script cannot read it. The
+    script (which preserves original_index, sets the flag and rewrites `_index`)
+    runs afterwards; `ignore_failure` on the `set` means an unresolvable
+    template (logs-only clusters) degrades to `reason: 'unknown'` instead of
+    failing the whole on_failure chain.
+    """
+    return [
+        {
+            "set": {
+                "field": QUARANTINE_REASON_FIELD,
+                "value": _ON_FAILURE_MESSAGE_TEMPLATE,
+                "ignore_failure": True,
+            }
+        },
+        {
+            "script": {
+                "lang": "painless",
+                "source": _quarantine_on_failure_script(cfg),
+            }
+        },
+    ]
 
 
 def _painless_regex(name: str) -> str:

@@ -80,6 +80,7 @@ __all__ = [
     "LiveTestError",
     "_env_bool",
     "_url_has_embedded_credentials",
+    "check_quarantine_routing",
     "check_simulated",
     "find_env_file",
     "live_salt",
@@ -90,6 +91,7 @@ __all__ = [
     "safe_url",
     "stage_a_ingest_allowlist",
     "stage_b_simulate",
+    "stage_b_simulate_failure",
     "test_main",
 ]
 
@@ -344,6 +346,80 @@ async def stage_b_simulate(
     return sources, errors
 
 
+def _pipeline_with_forced_failure(pipeline: dict[str, Any]) -> dict[str, Any]:
+    """A copy of the pipeline whose masking script ALWAYS throws, on_failure kept.
+
+    Used by Stage C to prove the on_failure routing deterministically: a real
+    masking failure on a correctly-configured cluster is rare and environment
+    dependent (e.g. the regex-limit guard), so the test forces the script
+    processor to throw while keeping the REAL generated on_failure block — the
+    doc must then be rerouted to the quarantine stream. `_meta`/`version` are
+    stripped (the simulate endpoint rejects them)."""
+    inline = {k: v for k, v in pipeline.items() if k not in ("_meta", "version")}
+    processors: list[Any] = []
+    for proc in inline.get("processors") or []:
+        if isinstance(proc, dict) and isinstance(proc.get("script"), dict):
+            script = dict(proc["script"])
+            script["source"] = (
+                'throw new RuntimeException("klaxon forced masking error for '
+                'quarantine test");'
+            )
+            processors.append({**proc, "script": script})
+        else:
+            processors.append(proc)
+    inline["processors"] = processors
+    return inline
+
+
+async def stage_b_simulate_failure(
+    client: httpx.AsyncClient,
+    pipeline: dict[str, Any],
+    docs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Simulate the pipeline with a FORCED masking failure (Stage C).
+
+    Returns `(sources, indexes, errors)`: the rerouted documents' `_source` and
+    `_index` after the on_failure block ran, plus per-doc error strings. The
+    routing assertions (`original_index`, `reason`, `masking_error`, quarantine
+    `_index`) live in `check_quarantine_routing`.
+    """
+    inline = _pipeline_with_forced_failure(pipeline)
+    resp = await client.post(
+        "/_ingest/pipeline/_simulate", json={"pipeline": inline, "docs": docs}
+    )
+    if not resp.is_success:
+        raise LiveTestError(
+            "POST /_ingest/pipeline/_simulate (forced failure) failed "
+            f"(HTTP {resp.status_code}): {_error_detail(resp)}"
+        )
+    payload = resp.json() if resp.content else {}
+    if not isinstance(payload, dict):
+        raise LiveTestError(
+            "POST /_ingest/pipeline/_simulate (forced failure) returned a "
+            "non-JSON body."
+        )
+    sources: list[dict[str, Any]] = []
+    indexes: list[str] = []
+    errors: list[str] = []
+    for entry in payload.get("docs") or []:
+        if not isinstance(entry, dict):
+            errors.append("malformed doc result in simulate response")
+            sources.append({})
+            indexes.append("")
+            continue
+        if entry.get("error"):
+            errors.append(str(entry["error"])[:500])
+            sources.append({})
+            indexes.append("")
+            continue
+        doc = entry.get("doc") or {}
+        src = doc.get("_source")
+        sources.append(src if isinstance(src, dict) else {})
+        idx = doc.get("_index")
+        indexes.append(str(idx) if idx is not None else "")
+    return sources, indexes, errors
+
+
 # --------------------------------------------------------------------------- #
 # Behaviour assertions on the simulated documents (offline-testable)
 # --------------------------------------------------------------------------- #
@@ -472,6 +548,66 @@ def check_simulated(
     return problems
 
 
+def check_quarantine_routing(
+    sources: list[dict[str, Any]],
+    indexes: list[str],
+    cfg: Any,
+) -> list[str]:
+    """Assertions on the Stage-C forced-failure simulate (the on_failure block).
+
+    FAIL-CLOSED guarantee: a masking-failure document is rerouted OUT of the
+    masked stream to `klaxon-quarantine-<tenant>-v5-raw`, preserving the
+    original destination + failure reason and flagging `klaxon.masking_error`.
+    Empty list = the routing is correct. Pure function (runs from the CLI and
+    the pytest without a cluster).
+    """
+    problems: list[str] = []
+    if len(sources) != 1:
+        problems.append(f"expected 1 forced-failure doc, got {len(sources)}")
+        return problems
+
+    idx = indexes[0] if indexes else ""
+    if idx != cfg.quarantine_routing_index:
+        problems.append(
+            f"failure doc routed to {idx!r}, expected "
+            f"{cfg.quarantine_routing_index!r} (it must NOT stay in "
+            f"{cfg.masked_stream_pattern})"
+        )
+
+    src = sources[0]
+    if not isinstance(src, dict):
+        problems.append("routed doc carried no _source")
+        return problems
+    klaxon = src.get("klaxon")
+    if not isinstance(klaxon, dict) or not klaxon.get("masking_error"):
+        problems.append("routed doc missing klaxon.masking_error=true")
+    quarantine = klaxon.get("quarantine") if isinstance(klaxon, dict) else None
+    if not isinstance(quarantine, dict):
+        problems.append("routed doc missing klaxon.quarantine.*")
+    else:
+        original_index = quarantine.get("original_index")
+        if not isinstance(original_index, str) or not original_index:
+            problems.append(
+                "routed doc missing klaxon.quarantine.original_index (the "
+                "pre-reroute destination must be preserved)"
+            )
+        reason = quarantine.get("reason")
+        if not isinstance(reason, str) or not reason:
+            problems.append(
+                "routed doc missing klaxon.quarantine.reason (failure message "
+                "or 'unknown')"
+            )
+    # The original raw source must be preserved in quarantine (that is what
+    # makes it forensically useful and is the reason it is NOT in the LLM
+    # allowlist).
+    if "message" not in src and "user.name" not in src:
+        problems.append(
+            "routed doc did not preserve the original source fields (quarantine "
+            "keeps the RAW document)"
+        )
+    return problems
+
+
 # --------------------------------------------------------------------------- #
 # Orchestration + CLI
 # --------------------------------------------------------------------------- #
@@ -554,7 +690,41 @@ async def _run_live_test(
         lines.append(
             "ok: pipeline compiles and masks correctly on the live indexer "
             "(same token for user.name and uid=, arrays element-wise, "
-            "event.original single token, related.hash untouched, idempotent)."
+            "event.original single token, related.hash untouched, idempotent, "
+            "no masking_error)."
+        )
+
+        # Stage C — quarantine on_failure routing (fail-closed). Force the
+        # masking script to throw (on_failure kept intact) and assert the doc is
+        # rerouted OUT of the masked stream to the quarantine stream with the
+        # original destination + failure reason preserved. A real masking
+        # failure on a correctly-configured cluster is rare and environment
+        # dependent (e.g. the regex-limit guard), so the test exercises the
+        # on_failure block directly — this is the change that closes the
+        # fail-open gap.
+        try:
+            f_sources, f_indexes, f_errors = await stage_b_simulate_failure(
+                client, pipeline, [live_test_docs()[0]]
+            )
+        except LiveTestError as exc:
+            lines.append("Stage C — quarantine on_failure routing: FAIL")
+            lines.append(f"  {exc}")
+            return "\n".join(lines), False
+        lines.append(
+            "Stage C — quarantine on_failure routing (forced masking failure): "
+            f"{len(f_errors)} failure(s)"
+        )
+        for err in f_errors:
+            lines.append(f"  {err}")
+        routing_problems = check_quarantine_routing(f_sources, f_indexes, cfg)
+        if routing_problems:
+            lines.append("Stage C — quarantine routing behaviour: FAIL")
+            lines.extend(f"  {p}" for p in routing_problems)
+            return "\n".join(lines), False
+        lines.append(
+            "  ok: failure doc rerouted to "
+            f"{cfg.quarantine_routing_index} with original_index + reason + "
+            "masking_error; nothing masking-failed stays in the masked stream."
         )
         return "\n".join(lines), True
 

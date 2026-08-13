@@ -144,7 +144,7 @@ The keys a normal user changes day to day. Full reference: [`docs/configuration.
 The deep material lives in dedicated docs — linked, not duplicated:
 
 - **DSGVO/GDPR plausibility checker** (classification layers, custom rules, sampling, reports) → [`docs/gdpr-checker.md`](docs/gdpr-checker.md)
-- **Ingest masking / Option B masked stream** (pipeline, ISM, index template, sync job) → [`docs/option-b-masked-stream.md`](docs/option-b-masked-stream.md)
+- **Ingest masking / Option B masked stream** (pipeline, ISM, index templates, quarantine for masking failures, sync job) → [`docs/option-b-masked-stream.md`](docs/option-b-masked-stream.md)
 - **Multi-tenant setup** (`fields.yaml`, `klaxon masking generate`, salt, namespacing) → [`docs/multi-tenant.md`](docs/multi-tenant.md)
 - **Drift prevention & CI** (pre-commit drift hook, provenance fingerprints, fail-closed startup, sync preflight, `--verify-config`) → [`docs/drift-prevention.md`](docs/drift-prevention.md)
 - **Token scheme & security model** (HMAC, salt, self-test, why 16 hex) → [`docs/security-model.md`](docs/security-model.md)

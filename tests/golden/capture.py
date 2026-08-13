@@ -217,13 +217,18 @@ def capture() -> dict[str, str]:
     # --- Option B artifact builders (deployable form, real salt) ------------ #
     from klaxon_mcp.masked_stream import (
         build_config_fragment,
+        build_deployable_pipeline,
         build_index_template,
         build_ism_policy,
-        build_pipeline,
+        build_quarantine_index_template,
+        build_quarantine_ism_policy,
+        build_roles_fragment,
     )
 
+    # The deployable pipeline is what an operator PUTs to OpenSearch: real salt,
+    # NO `_meta` (OpenSearch rejects it) — provenance rides in `description`.
     out["artifacts/pipeline-klaxon-mask-customer-a.json"] = (
-        json.dumps(build_pipeline(cfg, GOLDEN_SALT), indent=2) + "\n"
+        json.dumps(build_deployable_pipeline(cfg, GOLDEN_SALT), indent=2) + "\n"
     )
     out["artifacts/ism-klaxon-masked-retention-customer-a.json"] = (
         json.dumps(build_ism_policy(cfg, 30), indent=2) + "\n"
@@ -232,6 +237,14 @@ def capture() -> dict[str, str]:
         json.dumps(build_index_template(cfg), indent=2) + "\n"
     )
     out["artifacts/klaxon-config.yaml"] = build_config_fragment(cfg)
+    # Fail-closed quarantine artifacts (masking-failure routing).
+    out["artifacts/ism-klaxon-quarantine-retention-customer-a.json"] = (
+        json.dumps(build_quarantine_ism_policy(cfg), indent=2) + "\n"
+    )
+    out["artifacts/index-template-klaxon-quarantine-customer-a.json"] = (
+        json.dumps(build_quarantine_index_template(cfg), indent=2) + "\n"
+    )
+    out["artifacts/roles-klaxon-customer-a.yaml"] = build_roles_fragment(cfg)
 
     # --- Committed artifact set (render_artifacts, salt-free __SALT__) ------ #
     from klaxon_mcp.masking import render_artifacts

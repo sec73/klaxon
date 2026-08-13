@@ -12,8 +12,15 @@
         "on_failure": [
           {
             "set": {
-              "field": "klaxon.masking_error",
-              "value": "{{ _ingest.on_failure_message }}"
+              "field": "klaxon.quarantine.reason",
+              "value": "{{ _ingest.on_failure_message }}",
+              "ignore_failure": true
+            }
+          },
+          {
+            "script": {
+              "lang": "painless",
+              "source": "// Fail-closed: a masking-failure document is rerouted OUT of the masked\n// stream into the quarantine stream \u2014 it never stays in klaxon-masked-customer-a-v5-*.\n// In an ingest script processor `ctx` IS the document (no nested _source).\n\n// 1. Preserve the original destination BEFORE rerouting (order matters).\nctx.klaxon.quarantine.original_index = ctx['_index'];\n// 2. The failure reason was captured by the preceding `set` processor from the\n//    _ingest.on_failure_message template (the only way OpenSearch exposes it to\n//    on_failure; clusters that only log it yield an empty field). Fall back to\n//    'unknown' so the field is always present and searchable.\nif (!ctx['klaxon']['quarantine'].containsKey('reason')\n    || ctx['klaxon']['quarantine']['reason'] == null\n    || ctx['klaxon']['quarantine']['reason'].toString().isEmpty()) {\n    ctx['klaxon']['quarantine']['reason'] = 'unknown';\n}\n// 3. Flag the document (the consumer-side filter is now defense-in-depth only).\nctx.klaxon.masking_error = true;\n// 4. Reroute into the quarantine stream (matches the quarantine index template,\n//    so the target is auto-created and ISM-retained; never re-enters masking).\nctx['_index'] = 'klaxon-quarantine-customer-a-v5-raw';\n"
             }
           }
         ]
@@ -22,9 +29,9 @@
   ],
   "_meta": {
     "source": "tenants/customer-a/fields.yaml",
-    "sha256": "00111554153d094cb7f5f004040b3c2f9f5a8251e44593a7400420dfd1c078f4",
+    "sha256": "57779b1435c6f56b08a399efc85fce103a78457a86fbe29b8d72f2670900408f",
     "tenant": "customer-a",
-    "generator_version": "0.1.7",
+    "generator_version": "0.1.8",
     "generated_by": "klaxon masking generate",
     "fields": [
       "destination.ip",

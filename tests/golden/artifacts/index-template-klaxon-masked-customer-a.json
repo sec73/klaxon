@@ -1,12 +1,11 @@
 {
   "index_patterns": [
-    "klaxon-masked-customer-a-v5-*"
+    "klaxon-masked-customer-a-v5*"
   ],
   "priority": 200,
   "template": {
     "settings": {
       "index.default_pipeline": "klaxon-mask-customer-a",
-      "index.lifecycle.name": "klaxon-masked-retention-customer-a",
       "number_of_shards": 1,
       "number_of_replicas": 1
     }

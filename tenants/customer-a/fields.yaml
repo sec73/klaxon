@@ -6,12 +6,13 @@
 # Everything else is GENERATED from this file:
 #   klaxon masking generate --tenant customer-a
 # produces tenants/customer-a/generated/klaxon-config.yaml (Klaxon config
-# fragment), the pipeline template, the ISM policy and the index template. CI
+# fragment), the pipeline template, the ISM policies, the index templates and
+# the security-plugin roles fragment. CI
 # (`verify-masking-config`), the pre-commit hook and `verify-config` fail on any
 # hand-edit of those generated files that is not reflected here. The deployable
 # pipeline (with the real salt in `params.salt`) is produced by
 # `klaxon masking generate --tenant customer-a --out DIR` (or
-# `klaxon-mcp apply-masked-infra --tenant customer-a`) from the salt in
+# `klaxon-mcp --apply-masked-infra --tenant customer-a`) from the salt in
 # KLAXON_ANONYMIZATION_SALT — the salt is never committed.
 
 tenant: customer-a

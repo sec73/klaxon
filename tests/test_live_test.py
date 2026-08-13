@@ -255,3 +255,70 @@ def test_check_simulated_detects_masked_hash(cfg: Any) -> None:
     sources[0]["related.hash"] = [token("USER", "sha256:aa11", "salt")]
     problems = live_test.check_simulated(sources, cfg, "salt")
     assert any("related.hash" in p for p in problems)
+
+
+# --------------------------------------------------------------------------- #
+# Stage C — quarantine on_failure routing (fail-closed)
+# --------------------------------------------------------------------------- #
+
+
+def _rerouted_source() -> dict[str, Any]:
+    return {
+        "message": "sudo: pam_unix(sudo:session): session opened for user alice",
+        "klaxon": {
+            "quarantine": {
+                "original_index": "klaxon-masked-test-live-v5-000001",
+                "reason": "boom-test",
+            },
+            "masking_error": True,
+        },
+    }
+
+
+def test_check_quarantine_routing_passes_on_expected_reroute(cfg: Any) -> None:
+    sources = [_rerouted_source()]
+    indexes = [cfg.quarantine_routing_index]
+    assert live_test.check_quarantine_routing(sources, indexes, cfg) == []
+
+
+def test_check_quarantine_routing_flags_wrong_index(cfg: Any) -> None:
+    sources = [_rerouted_source()]
+    indexes = [cfg.masked_stream_pattern.replace("-*", "-000001")]
+    problems = live_test.check_quarantine_routing(sources, indexes, cfg)
+    assert any(cfg.quarantine_routing_index in p for p in problems)
+
+
+def test_check_quarantine_routing_flags_missing_reason(cfg: Any) -> None:
+    src = _rerouted_source()
+    del src["klaxon"]["quarantine"]["reason"]
+    problems = live_test.check_quarantine_routing([src], [cfg.quarantine_routing_index], cfg)
+    assert any("reason" in p for p in problems)
+
+
+def test_check_quarantine_routing_flags_missing_original_index(cfg: Any) -> None:
+    src = _rerouted_source()
+    del src["klaxon"]["quarantine"]["original_index"]
+    problems = live_test.check_quarantine_routing([src], [cfg.quarantine_routing_index], cfg)
+    assert any("original_index" in p for p in problems)
+
+
+def test_check_quarantine_routing_flags_missing_masking_error(cfg: Any) -> None:
+    src = _rerouted_source()
+    del src["klaxon"]["masking_error"]
+    problems = live_test.check_quarantine_routing([src], [cfg.quarantine_routing_index], cfg)
+    assert any("masking_error" in p for p in problems)
+
+
+def test_pipeline_with_forced_failure_keeps_on_failure(cfg: Any) -> None:
+    from klaxon_mcp.masked_stream import build_pipeline
+
+    pipeline = build_pipeline(cfg, "salt")
+    original_on_failure = pipeline["processors"][0]["script"]["on_failure"]
+    variant = live_test._pipeline_with_forced_failure(pipeline)
+    # _meta/version stripped (simulate rejects them), source replaced with a
+    # throw, on_failure preserved verbatim.
+    assert "_meta" not in variant and "version" not in variant
+    script = variant["processors"][0]["script"]
+    assert script["on_failure"] == original_on_failure
+    assert "throw new RuntimeException" in script["source"]
+    assert "masking_error" in script["source"].lower() or "original_index" not in script["source"]

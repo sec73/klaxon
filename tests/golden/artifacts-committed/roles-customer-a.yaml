@@ -1,0 +1,59 @@
+# generated from tenants/customer-a/fields.yaml (sha256: 57779b1435c6f56b08a399efc85fce103a78457a86fbe29b8d72f2670900408f) — do not edit by hand.
+# klaxon-mask-customer-a: OpenSearch security-plugin roles fragment.
+# Apply via the security API / merge into roles.yml (operator/CI job).
+# klaxon-provenance: {"generated_by":"klaxon masking generate","generator_version":"0.1.8","sha256":"57779b1435c6f56b08a399efc85fce103a78457a86fbe29b8d72f2670900408f","source":"tenants/customer-a/fields.yaml","tenant":"customer-a"}
+#
+# Fail-closed access model:
+#   * LLM/report role reads ONLY klaxon-masked-customer-a-v5-* — it can never
+#     read the quarantine stream (no klaxon-quarantine- pattern).
+#   * Ops/security role reads the quarantine stream + raw wazuh-events-v5-*.
+#   * Sync-job service user additionally WRITES the quarantine stream; without
+#     that write the security plugin rejects the on_failure reroute and the
+#     masking-failure document is dropped (a useful fail-closed backstop).
+# Map the sync user to klaxon_sync_customer-a ONLY — never to the LLM/report role.
+
+klaxon_llm_report_customer-a:
+  reserved: false
+  hidden: false
+  static: false
+  cluster_permissions: []
+  index_permissions:
+    - index_patterns:
+        - "klaxon-masked-customer-a-v5-*"
+      allowed_actions:
+        - "read"
+  tenant_permissions: []
+
+klaxon_ops_customer-a:
+  reserved: false
+  hidden: false
+  static: false
+  cluster_permissions: []
+  index_permissions:
+    - index_patterns:
+        - "klaxon-quarantine-customer-a-v5-*"
+        - "wazuh-events-v5-*"
+      allowed_actions:
+        - "read"
+  tenant_permissions: []
+
+klaxon_sync_customer-a:
+  reserved: false
+  hidden: false
+  static: false
+  cluster_permissions: []
+  index_permissions:
+    - index_patterns:
+        - "klaxon-masked-customer-a-v5-*"
+        - "klaxon-quarantine-customer-a-v5-*"
+      allowed_actions:
+        - "write"
+    - index_patterns:
+        - "wazuh-events-v5-*"
+      allowed_actions:
+        - "read"
+    - index_patterns:
+        - "klaxon-sync-state"
+      allowed_actions:
+        - "crud"
+  tenant_permissions: []

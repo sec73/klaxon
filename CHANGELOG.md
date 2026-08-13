@@ -23,6 +23,76 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   previously relied on starlette arriving transitively via `mcp`.
 
 
+## 0.1.8 – 2026-08-13
+
+### Added (Option B — quarantine index for masking errors, FAIL-CLOSED)
+
+The generated pipeline's `on_failure` was FAIL-OPEN: it flagged
+`klaxon.masking_error` and left the (unmasked) raw document **in the masked
+stream**, so protection depended on every consumer filtering
+`NOT exists klaxon.masking_error` — an organizational guarantee, not a
+technical one. Masking-failure documents are now routed to a **quarantine
+stream** `klaxon-quarantine-<tenant>-v5-*` (deliberately not `klaxon-masked-*`,
+so it can never overlap the LLM allowlist) and never stay in the masked stream.
+Verified against a live OpenSearch 3.6.0 indexer.
+
+- **Generator: FAIL-CLOSED `on_failure`** (commit: "generator: fail-closed
+  quarantine on_failure"). The emitted `klaxon-mask-<tenant>` `on_failure` now
+  preserves `klaxon.quarantine.original_index` (before rerouting) and
+  `klaxon.quarantine.reason` (from `{{ _ingest.on_failure_message }}`, the only
+  way OpenSearch 3.x exposes it — `_ingest` is not a script variable; falls
+  back to `'unknown'` via an `ignore_failure` `set` + script), flags
+  `klaxon.masking_error`, and reroutes `_index` to
+  `klaxon-quarantine-<tenant>-v5-raw`. Same `ctx`-context pattern as the
+  Teil-6 fix (no `ctx['_source']`).
+- **Generator: three new artifacts** (quarantine ISM `...-quarantine-retention-
+  <tenant>` with 90d retention, quarantine index template with NO
+  `index.default_pipeline`, and a security-plugin roles fragment), with the
+  same provenance fingerprint (`sha256` + source + `generator_version`) and
+  drift checks; `generate --check` / `verify-config` / the pre-commit hook now
+  compare **seven** artifacts. The mandatory self-test rejects a fail-open
+  `on_failure`.
+- **Sync backstop (fail-closed)** (commit: "sync: fail-closed backstop"). After
+  each reindex window, `--sync-masked` counts quarantine docs; `> 0` FAILS the
+  run — checkpoint NOT advanced, window + count logged, non-zero exit (alert).
+  Optional reconcile `source == masked + quarantine` via
+  `KLAXON_SYNC_RECONCILE` (warn) / `KLAXON_SYNC_RECONCILE_FAIL` (fail). The
+  preflight additionally aborts on a deployed pipeline lacking the quarantine
+  `on_failure`.
+- **Startup fail-closed check** (commit: "config: refuse quarantine in
+  masked_streams"). If any `masked_streams` pattern could match
+  `klaxon-quarantine-<tenant>-v5-*`, `Config.from_env()` raises `ConfigError` —
+  the LLM allowlist can never read quarantine (raw) data. The generated config
+  fragment never adds the quarantine stream.
+- **Access control** (roles fragment): LLM/report role reads
+  `klaxon-masked-<tenant>-v5-*` ONLY; ops role reads quarantine + raw events;
+  the sync service user additionally WRITES the quarantine stream (without it,
+  the security plugin rejects the on_failure reroute — a fail-closed backstop).
+- **Live test Stage C** (`klaxon masking test`): a forced masking failure is
+  asserted to reroute to `klaxon-quarantine-<tenant>-v5-raw` with
+  `original_index` + `reason` + `masking_error`; normal docs still mask, no
+  masking_error doc remains in the masked-stream simulate result. `--apply-
+  masked-infra` now also deploys the quarantine template + ISM.
+- **One-time migration** (`klaxon masking migrate --tenant X`, destructive,
+  never automated, idempotent): reindex legacy `klaxon.masking_error` docs from
+  the masked stream into the quarantine stream (op_type create, conflicts
+  proceed, no masking pipeline) and delete them from the masked stream; logs
+  the count and refuses to delete when the reindex reports failures.
+- Docs: `docs/option-b-masked-stream.md` (quarantine purpose, retention,
+  on_failure semantics, access control, alerting, migration, defense-in-depth
+  filter note), `docs/drift-prevention.md`, `docs/multi-tenant.md`,
+  `.env.example`. Version bumped to 0.1.8 (`generator_version` forces artifact
+  regeneration).
+
+### Changed
+
+- `masked_stream.py` / `painless.py` / `artifact_io.py` / `selftest.py` /
+  `masking.py` / `sync_masked.py` / `live_test.py` / `config.py` /
+  `tenants.py` / `__main__.py` — see the commit log for the atomic breakdown.
+  Full suite 764 tests green (incl. 3 live), mypy strict clean, golden master
+  byte-identical, `generate --check` OK.
+
+
 ## 0.1.7 – 2026-08-11
 
 ### Fixed (Option B masked-stream generator — verified against a live indexer)

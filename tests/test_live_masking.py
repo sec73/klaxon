@@ -98,3 +98,23 @@ async def test_live_stage_b_simulate_masks_correctly(
     assert errors == [], f"simulate reported failures: {errors}"
     problems = live_test.check_simulated(sources, cfg, salt)
     assert problems == [], "masking behaviour problems:\n" + "\n".join(problems)
+
+
+async def test_live_stage_c_quarantine_routing(
+    live_config: tuple[live_test.LiveIndexerConfig, Any],
+) -> None:
+    """FAIL-CLOSED: a masking failure is rerouted OUT of the masked stream to
+    the quarantine stream with the original destination + failure reason +
+    masking_error preserved. A real masking failure on a correctly-configured
+    cluster is rare/environment-dependent, so the test forces the masking script
+    to throw while keeping the REAL generated on_failure block."""
+    live, cfg = live_config
+    salt = live_test.live_salt(cfg)
+
+    async with _client(live) as client:
+        sources, indexes, errors = await live_test.stage_b_simulate_failure(
+            client, build_pipeline(cfg, salt), live_test.live_test_docs()[:1]
+        )
+    assert errors == [], f"forced-failure simulate reported errors: {errors}"
+    problems = live_test.check_quarantine_routing(sources, indexes, cfg)
+    assert problems == [], "quarantine routing problems:\n" + "\n".join(problems)
