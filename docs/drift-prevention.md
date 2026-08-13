@@ -26,8 +26,9 @@ of silently weakening masking.
 
 `tenants/<tenant>/fields.yaml` is the single source of truth (see
 [multi-tenant.md](multi-tenant.md)). Everything else is generated from it: the
-Klaxon config fragment, the ingest pipeline (Painless script), the ISM policy,
-the index template. Source paths in generated artifacts are
+Klaxon config fragment, the ingest pipeline (Painless script), the ISM policies
+(masked + quarantine), the index templates (masked + quarantine) and the
+security-plugin roles fragment. Source paths in generated artifacts are
 repo-root-relative (`tenants/<tenant>/fields.yaml`), so regeneration is
 byte-identical across machines.
 
@@ -79,11 +80,18 @@ on it, run the same `python -m klaxon_mcp masking generate --check` plus
 ## Fail-closed startup
 
 The response layer refuses to start when it would silently bypass the
-generated config: if both `KLAXON_ANONYMIZATION_MASK_FIELDS` (env) and the YAML
-`mask_fields` are set and differ, `Config.from_env()` raises `ConfigError`
-instead of letting the environment override the file. The environment is the
-known silent-bypass vector against the Option B config. (Precedence is still
-env > YAML when they agree; the guard only fires on a *conflict*.)
+generated config:
+
+* if both `KLAXON_ANONYMIZATION_MASK_FIELDS` (env) and the YAML `mask_fields`
+  are set and differ, `Config.from_env()` raises `ConfigError` instead of
+  letting the environment override the file (the env is the known
+  silent-bypass vector against the Option B config; precedence is still
+  env > YAML when they agree — the guard only fires on a *conflict*);
+* if any `masked_streams` pattern could match the quarantine stream
+  (`klaxon-quarantine-<tenant>-v5-*` — raw masking-failure documents),
+  `Config.from_env()` raises `ConfigError` — the LLM allowlist must never
+  overlap the quarantine namespace, and the generated config fragment never
+  adds it (a hand-edit or broad pattern like `klaxon-*` is caught).
 
 Security-critical boolean switches (`KLAXON_ANONYMIZE_EXTERNAL_LLM`,
 `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS`,
@@ -97,7 +105,10 @@ silently disable masking.
 Before every sync, `--sync-masked` fetches the deployed pipeline and compares
 its fingerprint (sha256 of `fields.yaml` + field lists, carried in the deployed
 pipeline's `description` — OpenSearch rejects `_meta`) against the current
-`fields.yaml` and the effective Klaxon config. Any drift aborts the sync
+`fields.yaml` and the effective Klaxon config. It additionally verifies the
+deployed pipeline's `on_failure` actually contains the fail-closed quarantine
+routing (a pre-quarantine pipeline would leave masking-failure documents in the
+masked stream). Any drift aborts the sync
 (`PREFLIGHT FAILED — not syncing`) rather than writing masked data with a stale
 pipeline.
 
@@ -105,8 +116,11 @@ pipeline.
 `klaxon-mcp --verify-config --tenant X` (or `klaxon --verify-config --tenant X`)
 runs the same checks as the sync preflight as a standalone drift audit (needs
 the indexer): the deployed pipeline must match `fields.yaml` and the effective
-Klaxon config, and the deployed salt must match the current environment salt
-(`klaxon masking salt-check`).
+Klaxon config and carry the quarantine `on_failure`, and the deployed salt must
+match the current environment salt (`klaxon masking salt-check`). The
+`klaxon masking generate --check` artifact comparison (over all seven
+committed artifacts, including the quarantine ISM/template and the roles
+fragment) runs without an indexer.
 
 ## The `generator_version` stamping gotcha
 
