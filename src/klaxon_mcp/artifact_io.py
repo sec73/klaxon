@@ -19,12 +19,16 @@ from pathlib import Path
 
 from .masked_stream import (
     DEFAULT_RETENTION_DAYS,
+    QUARANTINE_RETENTION_DAYS,
     TenantConfig,
     build_config_fragment,
     build_deployable_pipeline,
     build_index_template,
     build_ism_policy,
     build_pipeline,
+    build_quarantine_index_template,
+    build_quarantine_ism_policy,
+    build_roles_fragment,
 )
 
 CONFIG_FRAGMENT_NAME = "klaxon-config.yaml"
@@ -33,6 +37,7 @@ CONFIG_FRAGMENT_NAME = "klaxon-config.yaml"
 PIPELINE_TEMPLATE_NAME = "pipeline-{pipeline}.json"
 ISM_POLICY_FILE = "ism-{policy}.json"
 INDEX_TEMPLATE_FILE = "index-template-{template}.json"
+ROLES_FRAGMENT_FILE = "roles-{tenant}.yaml"
 
 
 # --------------------------------------------------------------------------- #
@@ -48,7 +53,9 @@ def _artifact_contents(
     `deployable=True` renders the pipeline body actually PUT to OpenSearch
     (`build_deployable_pipeline`: real salt, NO `_meta` — OpenSearch rejects it
     — provenance embedded in `description`). `deployable=False` (default) is the
-    committed template form with `_meta` intact, which CI drift-checks.
+    committed template form with `_meta` intact, which CI drift-checks. The
+    quarantine artifacts (ISM, index template, roles fragment) are identical in
+    both forms — they carry no salt and no `_meta`.
     """
     pipeline_builder = build_deployable_pipeline if deployable else build_pipeline
     return {
@@ -65,6 +72,16 @@ def _artifact_contents(
             build_index_template(cfg), indent=2
         )
         + "\n",
+        # Quarantine artifacts (fail-closed masking-error routing).
+        ISM_POLICY_FILE.format(policy=cfg.quarantine_ism_policy_name): json.dumps(
+            build_quarantine_ism_policy(cfg, QUARANTINE_RETENTION_DAYS), indent=2
+        )
+        + "\n",
+        INDEX_TEMPLATE_FILE.format(
+            template=cfg.quarantine_index_template_name
+        ): json.dumps(build_quarantine_index_template(cfg), indent=2)
+        + "\n",
+        ROLES_FRAGMENT_FILE.format(tenant=cfg.tenant): build_roles_fragment(cfg),
     }
 
 
@@ -75,14 +92,19 @@ def generated_dir(cfg: TenantConfig) -> Path:
     return Path(cfg.source_path).resolve().parent / "generated"
 
 
-def generated_paths(cfg: TenantConfig) -> tuple[Path, Path, Path, Path]:
-    """The four committed artifact paths under tenants/<tenant>/generated/."""
+def generated_paths(cfg: TenantConfig) -> tuple[Path, ...]:
+    """The committed artifact paths under tenants/<tenant>/generated/."""
     d = generated_dir(cfg)
     return (
         d / CONFIG_FRAGMENT_NAME,
         d / PIPELINE_TEMPLATE_NAME.format(pipeline=cfg.pipeline_name),
         d / ISM_POLICY_FILE.format(policy=cfg.ism_policy_name),
         d / INDEX_TEMPLATE_FILE.format(template=cfg.index_template_name),
+        d / ISM_POLICY_FILE.format(policy=cfg.quarantine_ism_policy_name),
+        d / INDEX_TEMPLATE_FILE.format(
+            template=cfg.quarantine_index_template_name
+        ),
+        d / ROLES_FRAGMENT_FILE.format(tenant=cfg.tenant),
     )
 
 

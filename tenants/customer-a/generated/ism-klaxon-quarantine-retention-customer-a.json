@@ -1,0 +1,42 @@
+{
+  "policy": {
+    "description": "Longer forensic retention for the quarantine stream klaxon-quarantine-customer-a-v5-* (masking failures).",
+    "default_state": "hot",
+    "states": [
+      {
+        "name": "hot",
+        "actions": [
+          {
+            "rollover": {
+              "min_size": "50gb",
+              "min_index_age": "1d"
+            }
+          }
+        ],
+        "transitions": [
+          {
+            "state_name": "delete",
+            "conditions": {
+              "min_index_age": "90d"
+            }
+          }
+        ]
+      },
+      {
+        "name": "delete",
+        "actions": [
+          {
+            "delete": {}
+          }
+        ],
+        "transitions": []
+      }
+    ],
+    "ism_template": {
+      "index_patterns": [
+        "klaxon-quarantine-customer-a-v5-*"
+      ],
+      "priority": 100
+    }
+  }
+}

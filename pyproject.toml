@@ -1,6 +1,6 @@
 [project]
 name = "klaxon-mcp"
-version = "0.1.7"
+version = "0.1.8"
 description = "MCP server for Wazuh 5.x. Query any events or findings datastream, discover which schema fields are actually populated, run logtest. Generic tools instead of fifty narrow ones. 5.x only — no 4.x compatibility layer."
 readme = "README.md"
 requires-python = ">=3.11"

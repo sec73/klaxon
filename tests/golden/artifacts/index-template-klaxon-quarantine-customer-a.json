@@ -1,0 +1,13 @@
+{
+  "index_patterns": [
+    "klaxon-quarantine-customer-a-v5*"
+  ],
+  "priority": 200,
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 1
+    }
+  },
+  "data_stream": {}
+}

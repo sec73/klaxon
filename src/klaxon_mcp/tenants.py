@@ -78,6 +78,38 @@ class TenantConfig:
         return f"{self.masked_stream}-*"
 
     @property
+    def quarantine_index_template_name(self) -> str:
+        return f"klaxon-quarantine-{self.tenant}"
+
+    @property
+    def quarantine_stream(self) -> str:
+        return f"klaxon-quarantine-{self.tenant}-v5"
+
+    @property
+    def quarantine_stream_pattern(self) -> str:
+        """Query/ISM pattern for the quarantine data stream.
+
+        Deliberately NOT `klaxon-masked-<tenant>-v5-*` — the quarantine stream
+        lives in its OWN `klaxon-quarantine-` namespace so it can never overlap
+        the LLM allowlist `klaxon-masked-<tenant>-v5-*`.
+        """
+        return f"{self.quarantine_stream}-*"
+
+    @property
+    def quarantine_routing_index(self) -> str:
+        """The concrete index the pipeline's on_failure reroutes failed docs to.
+
+        It matches the quarantine index template (`klaxon-quarantine-<tenant>
+        -v5*`), so it is auto-created (as a data stream) on first write and is
+        covered by the quarantine ISM retention.
+        """
+        return f"klaxon-quarantine-{self.tenant}-v5-raw"
+
+    @property
+    def quarantine_ism_policy_name(self) -> str:
+        return f"klaxon-quarantine-retention-{self.tenant}"
+
+    @property
     def raw_stream(self) -> str:
         return "wazuh-events-v5-*"
 

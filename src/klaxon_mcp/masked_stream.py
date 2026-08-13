@@ -26,11 +26,18 @@ Security notes (read before deploying):
     administrators; do NOT give report/LLM consumers that permission. The
     committed pipeline *template* carries a `__SALT__` placeholder so the secret
     never enters version control.
-  * A masking failure never drops a document: the `on_failure` processor sets
-    `klaxon.masking_error` and the (unmodified, raw) document is still indexed
-    so the failure is visible. Consumers MUST filter on `NOT exists
-    klaxon.masking_error`; the sync job and `verify-config` surface any flagged
-    documents.
+  * A masking failure is FAIL-CLOSED: the `on_failure` processor preserves the
+    original destination + failure reason, flags `klaxon.masking_error`, and
+    REROUTES the (unmodified, raw) document to the quarantine stream
+    `klaxon-quarantine-<tenant>-v5-*` — it never stays in the masked stream
+    (verified against OpenSearch 3.6.0: the failure message is exposed via the
+    `{{ _ingest.on_failure_message }}` template, not a script variable, so the
+    on_failure block captures it with a `set` processor and reroutes in a
+    script). The consumer-side `NOT exists klaxon.masking_error` filter is
+    defense-in-depth only, not the guarantee. The sync job FAILS any run whose
+    window produced a quarantine document (checkpoint not advanced), and
+    `verify-config` aborts when the deployed pipeline lacks the quarantine
+    routing. See docs/option-b-masked-stream.md.
   * `related.hash` is intentionally NOT masked (file hashes are security IOCs,
     not personal data). The pipeline table never contains it.
 """
@@ -54,6 +61,7 @@ from .painless import (
     _PATTERNS,
     _active_free_text_patterns,
     _painless_script,
+    _quarantine_on_failure_processors,
 )
 from .tenants import (
     FieldSpec,
@@ -82,6 +90,7 @@ __all__ = [
     "DEFAULT_INITIAL_LOOKBACK_HOURS",
     "DEFAULT_OVERLAP_HOURS",
     "DEFAULT_RETENTION_DAYS",
+    "QUARANTINE_RETENTION_DAYS",
     "TEMPLATE_PRIORITY",
     "TOKEN_RE",
     "_FREETEXT_PATTERN_ORDER",
@@ -93,6 +102,9 @@ __all__ = [
     "build_ism_policy",
     "build_pipeline",
     "build_pipeline_template",
+    "build_quarantine_index_template",
+    "build_quarantine_ism_policy",
+    "build_roles_fragment",
     "deploy_pipeline",
     "derive_token",
     "effective_mask_fields_from_config",
@@ -103,6 +115,7 @@ __all__ = [
     "generator_version",
     "load_tenant_config",
     "pipeline_field_names",
+    "pipeline_has_quarantine_on_failure",
     "pipeline_mask_doc",
     "pipeline_provenance",
     "resolve_salt",
@@ -114,6 +127,9 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 
 DEFAULT_RETENTION_DAYS = 30
+# The quarantine stream keeps masking-failure documents LONGER than the masked
+# stream (forensics): hot -> delete after this many days.
+QUARANTINE_RETENTION_DAYS = 90
 HOT_ROLLOVER_MIN_SIZE = "50gb"
 HOT_ROLLOVER_MIN_AGE = "1d"
 TEMPLATE_PRIORITY = 200
@@ -209,14 +225,12 @@ def build_pipeline(cfg: TenantConfig, salt: str) -> dict[str, Any]:
                     "lang": "painless",
                     "source": _painless_script(cfg),
                     "params": {"salt": salt},
-                    "on_failure": [
-                        {
-                            "set": {
-                                "field": "klaxon.masking_error",
-                                "value": "{{ _ingest.on_failure_message }}",
-                            }
-                        }
-                    ],
+                    # FAIL-CLOSED on_failure: a masking-failure document is
+                    # rerouted OUT of the masked stream into the quarantine
+                    # stream (klaxon-quarantine-<tenant>-v5-raw), preserving the
+                    # original destination + failure reason. It NEVER stays in
+                    # the masked stream (see _quarantine_on_failure_processors).
+                    "on_failure": _quarantine_on_failure_processors(cfg),
                 }
             }
         ],
@@ -340,6 +354,215 @@ def build_index_template(
         "template": template,
         "data_stream": {},
     }
+
+
+def build_quarantine_ism_policy(
+    cfg: TenantConfig, retention_days: int = QUARANTINE_RETENTION_DAYS
+) -> dict[str, Any]:
+    """The ISM policy for the quarantine data stream.
+
+    Same shape as the masked stream's policy, but with a LONGER retention
+    (default 90 days) — quarantine documents are forensics, kept after the
+    masked copies are gone. Attached the OpenSearch-native way via the policy's
+    `ism_template`, matching the quarantine backing-index pattern.
+    """
+    return {
+        "policy": {
+            "description": (
+                f"Longer forensic retention for the quarantine stream "
+                f"{cfg.quarantine_stream_pattern} (masking failures)."
+            ),
+            "default_state": "hot",
+            "states": [
+                {
+                    "name": "hot",
+                    "actions": [
+                        {
+                            "rollover": {
+                                "min_size": HOT_ROLLOVER_MIN_SIZE,
+                                "min_index_age": HOT_ROLLOVER_MIN_AGE,
+                            }
+                        }
+                    ],
+                    "transitions": [
+                        {
+                            "state_name": "delete",
+                            "conditions": {"min_index_age": f"{retention_days}d"},
+                        }
+                    ],
+                },
+                {"name": "delete", "actions": [{"delete": {}}], "transitions": []},
+            ],
+            "ism_template": {
+                "index_patterns": [cfg.quarantine_stream_pattern],
+                "priority": ISM_PRIORITY,
+            },
+        }
+    }
+
+
+def build_quarantine_index_template(
+    cfg: TenantConfig, mappings: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The composable index template for the quarantine data stream.
+
+    Deliberately in the `klaxon-quarantine-` namespace (NOT `klaxon-masked-`):
+    the pattern `klaxon-quarantine-<tenant>-v5*` can never overlap the LLM
+    allowlist `klaxon-masked-<tenant>-v5-*`, so an LLM query can never read
+    quarantine data through Klaxon.
+
+    The settings carry NO `index.default_pipeline` — quarantine documents must
+    NEVER re-enter the masking pipeline (their values are already raw, and
+    re-masking could drop the quarantine evidence or re-trigger the failure).
+    `mappings` is copied from the Wazuh events stream like the masked stream
+    (omitted in the offline generator, merged by `--apply-masked-infra`).
+    """
+    template: dict[str, Any] = {
+        "settings": {
+            "number_of_shards": 1,
+            "number_of_replicas": 1,
+            # Intentionally NO index.default_pipeline — see docstring.
+        }
+    }
+    if mappings is not None:
+        template["mappings"] = mappings
+    return {
+        "index_patterns": [f"{cfg.quarantine_stream}*"],
+        "priority": TEMPLATE_PRIORITY,
+        "template": template,
+        "data_stream": {},
+    }
+
+
+def build_roles_fragment(cfg: TenantConfig) -> str:
+    """The OpenSearch security-plugin roles fragment for one tenant (YAML).
+
+    Applied by the operator/CI (merge into `roles.yml` or the security API).
+    Least privilege per the fail-closed access model:
+
+      * `klaxon_llm_report_<tenant>` — read on the MASKED stream ONLY. It can
+        never read the quarantine stream (no `klaxon-quarantine-` pattern).
+      * `klaxon_ops_<tenant>` — read on the QUARANTINE stream + the raw
+        `wazuh-events-v5-*` (forensics). No LLM mapping.
+      * `klaxon_sync_<tenant>` — the sync-job service user: read the raw stream
+        (reindex source), write the masked + quarantine streams (reindex dest;
+        the quarantine write is what makes the fail-closed on_failure routing
+        succeed at the security plugin), and `crud` on the checkpoint index.
+        WITHOUT the quarantine write, the security plugin REJECTS the on_failure
+        `_index` reroute and the masking-failure document is dropped entirely —
+        a useful fail-closed backstop.
+
+    The provenance fingerprint rides in the header comment (the security plugin
+    has no `description` field on roles, and `roles.yml` is a file, not JSON).
+    """
+    llm_role = f"klaxon_llm_report_{cfg.tenant}"
+    ops_role = f"klaxon_ops_{cfg.tenant}"
+    sync_role = f"klaxon_sync_{cfg.tenant}"
+    sha = fields_yaml_sha256(cfg)
+    provenance = json.dumps(
+        {
+            "source": cfg.source_rel,
+            "sha256": sha,
+            "tenant": cfg.tenant,
+            "generator_version": generator_version(),
+            "generated_by": "klaxon masking generate",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"""# generated from {cfg.source_rel} (sha256: {sha}) — do not edit by hand.
+# klaxon-mask-{cfg.tenant}: OpenSearch security-plugin roles fragment.
+# Apply via the security API / merge into roles.yml (operator/CI job).
+# klaxon-provenance: {provenance}
+#
+# Fail-closed access model:
+#   * LLM/report role reads ONLY klaxon-masked-{cfg.tenant}-v5-* — it can never
+#     read the quarantine stream (no klaxon-quarantine- pattern).
+#   * Ops/security role reads the quarantine stream + raw wazuh-events-v5-*.
+#   * Sync-job service user additionally WRITES the quarantine stream; without
+#     that write the security plugin rejects the on_failure reroute and the
+#     masking-failure document is dropped (a useful fail-closed backstop).
+# Map the sync user to {sync_role} ONLY — never to the LLM/report role.
+
+{llm_role}:
+  reserved: false
+  hidden: false
+  static: false
+  cluster_permissions: []
+  index_permissions:
+    - index_patterns:
+        - "{cfg.masked_stream_pattern}"
+      allowed_actions:
+        - "read"
+  tenant_permissions: []
+
+{ops_role}:
+  reserved: false
+  hidden: false
+  static: false
+  cluster_permissions: []
+  index_permissions:
+    - index_patterns:
+        - "{cfg.quarantine_stream_pattern}"
+        - "{cfg.raw_stream}"
+      allowed_actions:
+        - "read"
+  tenant_permissions: []
+
+{sync_role}:
+  reserved: false
+  hidden: false
+  static: false
+  cluster_permissions: []
+  index_permissions:
+    - index_patterns:
+        - "{cfg.masked_stream_pattern}"
+        - "{cfg.quarantine_stream_pattern}"
+      allowed_actions:
+        - "write"
+    - index_patterns:
+        - "{cfg.raw_stream}"
+      allowed_actions:
+        - "read"
+    - index_patterns:
+        - "{cfg.sync_state_index}"
+      allowed_actions:
+        - "crud"
+  tenant_permissions: []
+"""
+
+
+def pipeline_has_quarantine_on_failure(pipeline: dict[str, Any]) -> bool:
+    """Whether a deployed pipeline's on_failure does the fail-closed routing.
+
+    The sync-job preflight and `verify-config` abort when a deployed pipeline
+    predates the quarantine routing (or was hand-edited to remove it): without
+    it, masking failures would stay in the masked stream.
+    """
+    for proc in pipeline.get("processors") or []:
+        if not isinstance(proc, dict):
+            continue
+        script = proc.get("script")
+        if not isinstance(script, dict):
+            continue
+        on_failure = script.get("on_failure")
+        if not isinstance(on_failure, list):
+            continue
+        for handler in on_failure:
+            if not isinstance(handler, dict):
+                continue
+            handler_script = handler.get("script")
+            if not isinstance(handler_script, dict):
+                continue
+            source = handler_script.get("source")
+            if isinstance(source, str) and (
+                "original_index" in source
+                and "masking_error" in source
+                and "_index" in source
+                and "quarantine" in source
+            ):
+                return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
