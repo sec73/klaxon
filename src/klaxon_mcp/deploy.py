@@ -647,6 +647,14 @@ async def _run(
     rollback: bool,
 ) -> int:
     lines: list[str] = []
+    if not live.verify_ssl:
+        print(
+            f"deploy[{cfg.tenant}] WARNING: KLAXON_INDEXER_VERIFY_SSL=false — "
+            "TLS verification is DISABLED. Use it only against a self-signed "
+            "lab cluster; for anything else trust the cluster CA "
+            "(SSL_CERT_FILE / system trust store) instead.",
+            file=sys.stderr,
+        )
     async with httpx.AsyncClient(
         base_url=live.url,
         auth=(live.user, live.password),

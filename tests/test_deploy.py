@@ -262,6 +262,15 @@ class TestPreflight:
         rc = deploy.deploy_main(["--tenant", "customer-a", "--dry-run", "--force"])
         assert rc == 1
 
+    def test_verify_ssl_false_warns(self, env: None, run_deploy: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+        # Parity with `klaxon masking test`: disabling TLS verification on a
+        # write command must print a loud warning.
+        monkeypatch.setenv("KLAXON_INDEXER_VERIFY_SSL", "false")
+        run_deploy()
+        rc = deploy.deploy_main(["--tenant", "customer-a", "--dry-run", "--force"])
+        assert rc == 0
+        assert "TLS verification is DISABLED" in capsys.readouterr().err
+
 
 class TestDeploy:
     def test_dry_run_writes_nothing(self, env: None, run_deploy: Any) -> None:
