@@ -11,11 +11,12 @@ writing anything to the cluster:
 
   Stage A — Ingest allowlist preflight: `GET /_scripts/painless/_context`
             (context=ingest) verifies the cluster's ingest Painless allowlist
-            has every API the generated script needs (`String.sha256()`,
-            `Pattern`/`Matcher`, `StringBuilder`, collections). `_execute`
-            cannot compile an ingest script — its painless_test context lacks
-            the ingest-only `sha256` augmentation — so Stage B's `_simulate` is
-            the authoritative compile check.
+            has every API the generated script needs (`Pattern`/`Matcher`,
+            `StringBuilder`, String/collection methods). The token scheme is a
+            pure-Painless HMAC-SHA256 over `int[]` arrays, so no crypto class
+            is required. `_execute` cannot compile an ingest script — its
+            painless_test context lacks the ingest allowlist — so Stage B's
+            `_simulate` is the authoritative compile check.
   Stage B — Pipeline simulate:       `POST /_ingest/pipeline/_simulate`
             runs the generated pipeline (inline, so nothing is deployed) over
             representative documents and asserts the masking behaviour.
@@ -99,20 +100,21 @@ _TIMEOUT = 60.0
 
 #
 # `_scripts/painless/_execute` only supports the painless_test/filter/score
-# contexts, which do NOT carry the ingest-context allowlist (e.g. the
-# `String.sha256()` augmentation the generated script hashes with) — so it can
-# never compile an ingest script on a restricted cluster. The authoritative
-# compile check is therefore Stage B's `_simulate`, which compiles in the
-# ingest context. Stage A instead VERIFIES the cluster's ingest allowlist
-# actually contains every API the generated script needs (this is the "Painless
-# needs cluster verification of the MessageDigest/Pattern whitelist" caveat
-# from docs/option-b-masked-stream.md, made explicit and machine-checked).
+# contexts, which do NOT carry the ingest-context allowlist — so it can never
+# compile an ingest script on a restricted cluster. The authoritative compile
+# check is therefore Stage B's `_simulate`, which compiles in the ingest
+# context. Stage A instead VERIFIES the cluster's ingest allowlist actually
+# contains every API the generated script needs (this is the "Painless needs
+# cluster verification of the whitelist" caveat from
+# docs/option-b-masked-stream.md, made explicit and machine-checked). The token
+# scheme is a pure-Painless HMAC-SHA256 over `int[]` byte arrays (no
+# javax.crypto.Mac / MessageDigest / String.sha256() needed), so only plain
+# String/collection types and regex literals are required.
 
 
 # (label, class name, kind, member) — the ingest-context members the script
 # relies on. `kind` is "method" (instance method) or "type" (class exists).
 _REQUIRED_INGEST_MEMBERS: tuple[tuple[str, str, str, str], ...] = (
-    ("String.sha256() — the SHA-256 augmentation the token scheme hashes with", "java.lang.String", "method", "sha256"),
     ("String.isEmpty()", "java.lang.String", "method", "isEmpty"),
     ("String.substring()", "java.lang.String", "method", "substring"),
     ("String.charAt()", "java.lang.String", "method", "charAt"),
@@ -185,7 +187,8 @@ async def stage_a_ingest_allowlist(
     return (
         True,
         "ingest Painless allowlist has every API the generated script needs "
-        "(String.sha256, Pattern/Matcher, StringBuilder, collections).",
+        "(Pattern/Matcher, StringBuilder, String/collection methods — the HMAC "
+        "token scheme is pure Painless and needs no crypto class).",
     )
 
 
@@ -236,7 +239,10 @@ def live_test_docs() -> list[dict[str, Any]]:
     token without a bare-username registry hit. Doc 3 is a no-op document (no
     personal data) with a HOST field. Doc 4 is a dot/digit-heavy free-text line
     with no e-mail, sized to pass on a default `script.painless.regex.limit-factor`
-    cluster (longer lines need that setting raised — the test reports it).
+    cluster (longer lines need that setting raised — the test reports it). Doc 5
+    is a unicode username: proves the keyed HMAC tokenises UTF-8 values (umlauts)
+    and that the free-text registry reuses the exact structured token for the
+    unicode name (the pure-Painless `utf8()` correctness on the live cluster).
     """
     return [
         {
@@ -291,6 +297,18 @@ def live_test_docs() -> list[dict[str, Any]]:
                     "packet from 10.0.0.1 to 10.0.0.2 via 192.168.1.10 "
                     "and 203.0.113.5"
                 ),
+            },
+        },
+        {
+            # Doc 5 — a unicode username (umlaut): proves the keyed HMAC tokenises
+            # UTF-8 values AND that the free-text registry reuses the exact
+            # structured token for the unicode name (the pure-Painless utf8() is
+            # byte-correct on the live cluster).
+            "_index": "klaxon-masked-customer-a-v5-000001",
+            "_id": "5",
+            "_source": {
+                "user.name": "müller",
+                "message": "session opened for user müller from 10.20.30.50",
             },
         },
     ]
@@ -544,6 +562,33 @@ def check_simulated(
         for ip in ips:
             if tok("IP", ip) not in msg4 or ip in msg4:
                 problems.append(f"doc 4 did not mask IP {ip!r}")
+
+    # ---- Doc 5: unicode username — structured + free-text share the HMAC token
+    # over UTF-8 (proves the pure-Painless utf8()/HMAC on the live cluster) ----
+    d5 = sources[4]
+    note5 = _error_note(d5)
+    if note5:
+        problems.append(f"doc 5 rejected: {note5}")
+    if d5.get("user.name") != tok("USER", "müller"):
+        problems.append(
+            f"doc 5 user.name -> {d5.get('user.name')!r} (expected "
+            f"{tok('USER', 'müller')!r})"
+        )
+    msg5 = d5.get("message")
+    if not isinstance(msg5, str):
+        problems.append("doc 5 message missing after simulate")
+    else:
+        muller_tok = tok("USER", "müller")
+        if muller_tok not in msg5:
+            problems.append(
+                "doc 5: unicode username 'müller' in free text did not reuse the "
+                f"structured token ({muller_tok!r} not in message)"
+            )
+        if "müller" in msg5:
+            problems.append("doc 5 message still contains raw 'müller'")
+        ip_tok = tok("IP", "10.20.30.50")
+        if ip_tok not in msg5 or "10.20.30.50" in msg5:
+            problems.append("doc 5 did not mask 10.20.30.50")
 
     return problems
 

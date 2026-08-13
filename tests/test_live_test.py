@@ -210,15 +210,23 @@ def test_missing_ingest_members_empty_when_complete() -> None:
     assert live_test.missing_ingest_members({"classes": _FULL_CLASSES}) == []
 
 
-def test_missing_ingest_members_flags_missing_sha256() -> None:
+def test_missing_ingest_members_flags_missing_substring() -> None:
+    """A missing member the script DOES use (String.substring) is flagged."""
     classes = [
-        {**c, "methods": [m for m in c.get("methods", []) if m["name"] != "sha256"]}
+        {**c, "methods": [m for m in c.get("methods", []) if m["name"] != "substring"]}
         if c["name"] == "java.lang.String"
         else c
         for c in _FULL_CLASSES
     ]
     missing = live_test.missing_ingest_members({"classes": classes})
-    assert any("sha256" in m for m in missing)
+    assert any("substring" in m for m in missing)
+
+
+def test_missing_ingest_members_does_not_require_sha256() -> None:
+    """The token scheme is a pure-Painless HMAC over int[] arrays — it does NOT
+    need the String.sha256() ingest augmentation (or any crypto class), so a
+    cluster without it must not be flagged."""
+    assert live_test.missing_ingest_members({"classes": _FULL_CLASSES}) == []
 
 
 def test_missing_ingest_members_flags_missing_type() -> None:

@@ -69,6 +69,192 @@ def _active_free_text_patterns(cfg: TenantConfig) -> tuple[str, ...]:
 
 
 # --------------------------------------------------------------------------- #
+# HMAC-SHA256 in pure Painless (the stream token scheme)
+#
+# The Option-B token is HMAC-SHA256(key = salt, message = "family:value"),
+# first 16 hex chars. The restricted ingest Painless allowlist (verified against
+# OpenSearch 3.6.0) has NO javax.crypto.Mac / MessageDigest, and the
+# `String.sha256()` augmentation can only hash UTF-8 text (chars >= 0x80 become
+# two bytes — it cannot hash the raw 32-byte inner digest of HMAC), so a byte-
+# exact HMAC cannot be built on those. Instead SHA-256 is reimplemented here
+# over an int[] byte sequence (all primitives are whitelisted), giving the full
+# keyed HMAC construction with zero cluster-config dependency. Byte-identical
+# to Python's `hmac.new(salt, "family:value", sha256)` — proven by the
+# generator self-test (painless_token_reference) and the live `_simulate`
+# (Stage B/C of `klaxon masking test`).
+# --------------------------------------------------------------------------- #
+
+# SHA-256 initial hash values and round constants as SIGNED decimal ints
+# (Painless rejects unsigned hex constants like 0xffffffff / values >= 2^31).
+_SHA256_H_SIGNED = (
+    1779033703, -1150833019, 1013904242, -1521486534,
+    1359893119, -1694144372, 528734635, 1541459225,
+)
+_SHA256_K_SIGNED = (
+    1116352408, 1899447441, -1245643825, -373957723, 961987163, 1508970993,
+    -1841331548, -1424204075, -670586216, 310598401, 607225278, 1426881987,
+    1925078388, -2132889090, -1680079193, -1046744716, -459576895, -272742522,
+    264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+    -1740746414, -1473132947, -1341970488, -1084653625, -958395405, -710438585,
+    113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291,
+    1695183700, 1986661051, -2117940946, -1838011259, -1564481375, -1474664885,
+    -1035236496, -949202525, -778901479, -694614492, -200395387, 275423344,
+    430227734, 506948616, 659060556, 883997877, 958139571, 1322822218,
+    1537002063, 1747873779, 1955562222, 2024104815, -2067236844, -1933114872,
+    -1866530822, -1538233109, -1090935817, -965641998,
+)
+
+# The Painless source block emitted before `token()`: functions first, every
+# function only reading params/locals/other functions (Painless rules). All
+# constants are signed decimals. `sha256` returns the 8 32-bit hash words;
+# `wordsToBytes`/`wordsToHex` convert for the HMAC composition.
+_HMAC_FUNCTIONS = (
+    r"""int[] sha256(int[] data) {
+    // SHA-256 over a byte sequence (each element 0..255); returns the 8
+    // 32-bit hash words. Signed-int arithmetic wraps mod 2^32 exactly like the
+    // Java/Python reference. No MessageDigest / javax.crypto needed.
+    int origLen = data.length;
+    int padLen = ((origLen + 8) / 64 + 1) * 64;
+    int[] msg = new int[padLen];
+    for (int i = 0; i < origLen; i++) { msg[i] = data[i]; }
+    msg[origLen] = 128;
+    long bits = (long) origLen * 8;
+    for (int i = 0; i < 8; i++) {
+        msg[padLen - 1 - i] = (int) ((bits >>> (8 * i)) & 255);
+    }
+"""
+    + "".join(f"    int h{i} = {_SHA256_H_SIGNED[i]};\n" for i in range(8))
+    + r"""    int[] K = new int[] {
+"""
+    + ",\n        ".join(str(v) for v in _SHA256_K_SIGNED)
+    + r"""
+    };
+    int[] w = new int[64];
+    for (int block = 0; block < padLen; block += 64) {
+        for (int t = 0; t < 16; t++) {
+            int o = block + t * 4;
+            w[t] = (msg[o] << 24) | (msg[o + 1] << 16) | (msg[o + 2] << 8) | msg[o + 3];
+        }
+        for (int t = 16; t < 64; t++) {
+            int s0 = ror(w[t - 15], 7) ^ ror(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+            int s1 = ror(w[t - 2], 17) ^ ror(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+            w[t] = w[t - 16] + s0 + w[t - 7] + s1;
+        }
+        int a = h0; int b = h1; int c = h2; int d = h3;
+        int e = h4; int f = h5; int g = h6; int h = h7;
+        for (int t = 0; t < 64; t++) {
+            int S1 = ror(e, 6) ^ ror(e, 11) ^ ror(e, 25);
+            int ch = (e & f) ^ ((~e) & g);
+            int temp1 = h + S1 + ch + K[t] + w[t];
+            int S0 = ror(a, 2) ^ ror(a, 13) ^ ror(a, 22);
+            int maj = (a & b) ^ (a & c) ^ (b & c);
+            int temp2 = S0 + maj;
+            h = g; g = f; f = e; e = d + temp1; d = c; c = b; b = a; a = temp1 + temp2;
+        }
+        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e; h5 += f; h6 += g; h7 += h;
+    }
+    return new int[] { h0, h1, h2, h3, h4, h5, h6, h7 };
+}
+
+int ror(int x, int n) {
+    return (x >>> n) | (x << (32 - n));
+}
+
+int[] utf8(String s) {
+    // UTF-8 byte sequence of a String as int[] (0..255 each), matching
+    // Python's .encode("utf-8") including surrogate pairs.
+    int len = s.length();
+    int n = 0;
+    for (int i = 0; i < len; i++) {
+        int c = s.charAt(i);
+        if (c >= 55296 && c <= 56319 && i + 1 < len) {
+            int lo = s.charAt(i + 1);
+            if (lo >= 56320 && lo <= 57343) { n += 4; i++; }
+            else { n += 3; }
+        } else if (c >= 2048) { n += 3; }
+        else if (c >= 128) { n += 2; }
+        else { n += 1; }
+    }
+    int[] out = new int[n];
+    int p = 0;
+    for (int i = 0; i < len; i++) {
+        int c = s.charAt(i);
+        if (c >= 55296 && c <= 56319 && i + 1 < len) {
+            int lo = s.charAt(i + 1);
+            if (lo >= 56320 && lo <= 57343) {
+                int cp = 65536 + ((c - 55296) << 10) + (lo - 56320);
+                out[p++] = 240 | (cp >>> 18);
+                out[p++] = 128 | ((cp >>> 12) & 63);
+                out[p++] = 128 | ((cp >>> 6) & 63);
+                out[p++] = 128 | (cp & 63);
+                i++;
+                continue;
+            }
+        }
+        if (c >= 2048) {
+            out[p++] = 224 | (c >>> 12);
+            out[p++] = 128 | ((c >>> 6) & 63);
+            out[p++] = 128 | (c & 63);
+        } else if (c >= 128) {
+            out[p++] = 192 | (c >>> 6);
+            out[p++] = 128 | (c & 63);
+        } else {
+            out[p++] = c;
+        }
+    }
+    return out;
+}
+
+int[] wordsToBytes(int[] words) {
+    // 8 32-bit words -> 32 bytes, big-endian (the raw SHA-256 digest).
+    int[] out = new int[32];
+    for (int i = 0; i < 8; i++) {
+        int w = words[i];
+        out[i * 4] = (w >>> 24) & 255;
+        out[i * 4 + 1] = (w >>> 16) & 255;
+        out[i * 4 + 2] = (w >>> 8) & 255;
+        out[i * 4 + 3] = w & 255;
+    }
+    return out;
+}
+
+String wordsToHex(int[] words) {
+    String hex = "0123456789abcdef";
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < words.length; i++) {
+        int w = words[i];
+        for (int j = 7; j >= 0; j--) {
+            sb.append(hex.charAt((w >>> (4 * j)) & 15));
+        }
+    }
+    return sb.toString();
+}
+
+String hmacSha256Hex(String salt, String message) {
+    // HMAC-SHA256(key = salt, msg = message): a keyed MAC, NOT a
+    // concatenation hash. ipad = 0x36, opad = 0x5c; keys longer than the
+    // 64-byte block are pre-hashed with SHA-256 (standard HMAC).
+    int[] key = utf8(salt);
+    int[] kd;
+    if (key.length > 64) { kd = wordsToBytes(sha256(key)); }
+    else { kd = key; }
+    int[] kb = new int[64];
+    for (int i = 0; i < 64; i++) { kb[i] = (i < kd.length) ? kd[i] : 0; }
+    int[] msg = utf8(message);
+    int[] innerInput = new int[64 + msg.length];
+    for (int i = 0; i < 64; i++) { innerInput[i] = kb[i] ^ 54; }
+    for (int i = 0; i < msg.length; i++) { innerInput[64 + i] = msg[i]; }
+    int[] innerBytes = wordsToBytes(sha256(innerInput));
+    int[] outerInput = new int[64 + 32];
+    for (int i = 0; i < 64; i++) { outerInput[i] = kb[i] ^ 92; }
+    for (int i = 0; i < 32; i++) { outerInput[64 + i] = innerBytes[i]; }
+    return wordsToHex(sha256(outerInput));
+}
+"""
+)
+
+
+# --------------------------------------------------------------------------- #
 # Ingest pipeline (Painless)
 # --------------------------------------------------------------------------- #
 
@@ -87,13 +273,16 @@ def _painless_script(cfg: TenantConfig) -> str:
     top-level statement, AND functions can only read their parameters, local
     variables and other functions (NOT `params`, NOT top-level `def`s) — so all
     shared data (the salt, the field table) is threaded into the functions from
-    the main logic. The hash uses the ingest-context `String.sha256()`
-    augmentation (byte-identical to `MessageDigest "SHA-256"`), the free-text
-    regexes are regex literals wrapped in `Pattern` functions (the cluster does
-    not whitelist `Pattern.compile`), and the known-identity registry does a
-    manual word-boundary replacement (the cluster's `String.replaceAll` is not
-    usable and `Pattern.compile` is unavailable for a per-value dynamic regex).
-    `ctx` IS the ingest document (no nested `_source`).
+    the main logic. Tokens are a KEYED HMAC-SHA256 (key = salt, message =
+    `family:value`) implemented in pure Painless (the ingest allowlist has no
+    `javax.crypto.Mac`, and `String.sha256()` cannot hash the raw inner digest
+    bytes), byte-identical to Python's `hmac` — see `_HMAC_FUNCTIONS`. The
+    free-text regexes are regex literals wrapped in `Pattern` functions (the
+    cluster does not whitelist `Pattern.compile`), and the known-identity
+    registry does a manual word-boundary replacement (the cluster's
+    `String.replaceAll` is not usable and `Pattern.compile` is unavailable for
+    a per-value dynamic regex). `ctx` IS the ingest document (no nested
+    `_source`).
     """
     field_rows = ",\n    ".join(
         json.dumps(f.to_painless_row()) for f in cfg.fields
@@ -122,17 +311,15 @@ def _painless_script(cfg: TenantConfig) -> str:
 // variables and other functions (NOT `params`, NOT top-level defs) — so all
 // shared data (salt, field table) is threaded in from the main logic. ----
 
-String sha256hex(String input) {{
-    // SHA-256 via the ingest String augmentation; first 16 hex chars of the
-    // digest (byte-identical to MessageDigest "SHA-256").
-    return input.sha256().substring(0, 16);
-}}
+{_HMAC_FUNCTIONS}
 
 String token(String family, String value, String SALT) {{
     if (value == null) return value;
     if (value.isEmpty()) return value;  // empty stays empty, mirrors derive_token
     if (TOKEN_RE().matcher(value).matches()) return value;  // idempotent
-    return "[" + family + "_" + sha256hex(family + ":" + value + ":" + SALT) + "]";
+    // Keyed HMAC-SHA256 (key = SALT) over family:value, first 16 hex chars —
+    // byte-identical to derive_token(value, family, salt).
+    return "[" + family + "_" + hmacSha256Hex(SALT, family + ":" + value).substring(0, 16) + "]";
 }}
 
 Pattern TOKEN_RE() {{

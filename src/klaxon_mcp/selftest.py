@@ -16,6 +16,7 @@ generation aborts and emits NO artifacts. Also exposed as
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 from typing import Any
@@ -51,7 +52,7 @@ SELF_TEST_VALUES: tuple[tuple[str, str], ...] = (
 
 
 def painless_token_reference(family: str, value: str, salt: str) -> str:
-    """Byte-exact Python transcription of the Painless `token()`/`sha256hex()`.
+    """Byte-exact Python transcription of the Painless `token()`/`hmacSha256Hex()`.
 
     Written as a SEPARATE code path from `derive_token()` on purpose: the
     self-test runs both over the representative values and aborts on ANY
@@ -64,19 +65,26 @@ def painless_token_reference(family: str, value: str, salt: str) -> str:
         return value  # empty stays empty — mirrors the script's value.isEmpty()
     if TOKEN_RE.fullmatch(value):
         return value  # idempotent passthrough, mirrors the script
-    # SHA-256 over `family:value:salt`, first 8 digest bytes -> 16 hex chars.
-    digest = hashlib.sha256(f"{family}:{value}:{salt}".encode()).digest()
-    return f"[{family}_{digest[:8].hex()}]"
+    # Keyed HMAC-SHA256(key = salt, msg = `family:value`), first 16 hex chars.
+    digest = hmac.new(
+        salt.encode(), f"{family}:{value}".encode(), hashlib.sha256
+    ).hexdigest()
+    return f"[{family}_{digest[:16]}]"
 
 
 # The token-scheme markers the rendered Painless source MUST contain. If any is
 # missing, the script does not implement the scheme `derive_token` implements.
+# The markers prove the construction is a KEYED HMAC (salt as key, family as
+# context: pre-hash for keys > 64 bytes, ipad 0x36 / opad 0x5c) truncated to 16
+# hex, not a concatenation hash / plain digest.
 _SCHEME_MARKERS: tuple[str, ...] = (
     "def SALT = params.salt;",
     "if (value.isEmpty()) return value;",
-    ".sha256().substring(0, 16)",  # SHA-256, first 16 hex chars
-    'sha256hex(family + ":" + value + ":" + SALT)',
-    '"[" + family + "_" + sha256hex(family + ":" + value + ":" + SALT) + "]"',
+    "String hmacSha256Hex(String salt, String message)",
+    "key.length > 64",  # HMAC pre-hash for keys longer than the 64-byte block
+    "kb[i] ^ 54",  # inner pad ipad (0x36)
+    "kb[i] ^ 92",  # outer pad opad (0x5c)
+    'hmacSha256Hex(SALT, family + ":" + value).substring(0, 16)',  # truncation
     "Pattern TOKEN_RE()",
     r"^\[(?:IP|USER|HOST|AGENT)_[0-9a-f]{16}\]$",  # the idempotency regex literal
 )
@@ -86,21 +94,28 @@ def verify_script_scheme(script: str) -> list[str]:
     """Token-scheme markers MISSING from a rendered Painless script.
 
     Binds the self-test to the actual generated artifact: the script must encode
-    exactly the scheme `derive_token` implements (SHA-256 over
-    `family:value:salt`, UTF-8, first 16 hex chars, `[FAMILY_<hex>]` display,
-    idempotent passthrough, salt injected via `params.salt`). Empty result = the
-    script encodes the scheme.
+    exactly the scheme `derive_token` implements (keyed HMAC-SHA256 over
+    `family:value` with the salt as key, first 16 hex chars, `[FAMILY_<hex>]`
+    display, idempotent passthrough, salt injected via `params.salt`). Empty
+    result = the script encodes the scheme.
     """
     return [marker for marker in _SCHEME_MARKERS if marker not in script]
 
 
 # The function declarations the rendered Painless script MUST define: (name,
-# return type). The free-text regexes are emitted as `Pattern <NAME>()`
-# functions and TOKEN_RE() as a `Pattern` function, matching the live-verified
-# shape (`Pattern.compile`/`MessageDigest` are not whitelisted on restricted
-# clusters; regex literals in functions are).
+# return type). The HMAC/SHA-256 helpers implement the keyed token scheme in
+# pure Painless (no javax.crypto.Mac / String.sha256 on the restricted ingest
+# allowlist). The free-text regexes are emitted as `Pattern <NAME>()` functions
+# and TOKEN_RE() as a `Pattern` function, matching the live-verified shape
+# (`Pattern.compile` is not whitelisted on restricted clusters; regex literals
+# in functions are).
 _PAINLESS_FUNCTIONS: tuple[tuple[str, str], ...] = (
-    ("sha256hex", "String"),
+    ("sha256", "int[]"),
+    ("ror", "int"),
+    ("utf8", "int[]"),
+    ("wordsToBytes", "int[]"),
+    ("wordsToHex", "String"),
+    ("hmacSha256Hex", "String"),
     ("token", "String"),
     ("TOKEN_RE", "Pattern"),
     ("maskPattern", "String"),

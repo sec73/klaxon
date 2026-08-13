@@ -20,7 +20,7 @@
   "log": {
     "logger": "sshd"
   },
-  "message": "user alice logged in [USER_c181a03989488ea5] from [IP_a11346ee93024d5c]; contact [EMAIL_ff6d33ebe4c8578c]",
+  "message": "user alice logged in [USER_48b2ae95c14b03db] from [IP_35fb288370686e3c]; contact [EMAIL_001f07de3c40b09f]",
   "related": {
     "hash": [
       "abc123def456"
