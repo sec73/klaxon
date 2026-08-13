@@ -22,6 +22,24 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `transport.py` imports `CORSMiddleware` directly for the HTTP transport and
   previously relied on starlette arriving transitively via `mcp`.
 
+### Added
+
+- **HMAC edge-case vector suite** in the generator self-test (`klaxon masking
+  generate` / `selftest`): the pure-Painless HMAC (hand-rolled SHA-256;
+  `javax.crypto.Mac` is not in the ingest allowlist) is now pinned against
+  authoritative vectors — RFC 4231 TC1–7, the key-length boundaries
+  64/65/63/0/1/32 bytes, and Klaxon-format vectors covering UTF-8
+  (umlaut/CJK/emoji), `:`-containing and empty values, spaces, and the
+  first-16-hex truncation — plus structural checks on the rendered script
+  (ipad/opad, two distinct SHA-256 steps, the `key.length > 64` hash-first
+  branch). On ANY mismatch generation aborts and emits NO artifacts. New
+  `src/klaxon_mcp/hmac_vectors.py` (single shared vector table) and
+  `pure_painless_hmac`/`run_hmac_vector_selftest`/`verify_hmac_structural` in
+  `selftest.py`; the live `klaxon masking test` gained a "Stage B — HMAC
+  edge-case vectors" `_simulate` stage that feeds one doc per vector through the
+  deployed pipeline. No artifact/token output changed (self-test only), so no
+  version bump or artifact regeneration.
+
 
 ## 0.1.9 – 2026-08-13
 

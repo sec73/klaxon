@@ -112,7 +112,13 @@ Painless token scheme is **byte-identical** to `derive_token(value, family,
 salt)` for a fixed set of representative values per family, and that the
 rendered script compiles the way the live test exercises it (functions before
 statements, no `ctx['_source']`, and the fail-closed quarantine `on_failure`
-routing is present). On ANY mismatch the command aborts and emits NO artifacts —
+routing is present). It also pins the **pure-Painless HMAC** (hand-rolled
+SHA-256; `javax.crypto.Mac` is not in the ingest allowlist) against
+authoritative vectors — RFC 4231 TC1–7, the key-length boundaries
+64/65/63/0/1/32 bytes, UTF-8 umlaut/CJK/emoji, a `:`-containing value, empty
+value/spaces, and the first-16-hex truncation — plus structural checks on the
+rendered script (ipad/opad, two distinct SHA-256 steps, the `key.length > 64`
+hash-first branch). On ANY mismatch the command aborts and emits NO artifacts —
 changing the token scheme in `derive_token` breaks generation, not the deployed
 pipeline. Run it standalone for CI:
 
