@@ -16,7 +16,9 @@ import logging
 from typing import Any
 
 import pytest
+import yaml
 
+from klaxon_mcp import config
 from klaxon_mcp.config import (
     DEFAULT_GDPR_CUSTOM_PATTERNS,
     AnonymizationConfig,
@@ -253,6 +255,56 @@ class TestAnonymizationEnv:
         assert AnonymizationConfig.from_env().masked_streams == (
             "klaxon-masked-a-v5-*",
         )
+
+
+class TestQuarantineMaskedStreamsGuard:
+    """A masked_streams pattern that could match the quarantine stream (RAW
+    masking-failure docs) must refuse startup — the LLM allowlist must never
+    overlap the quarantine namespace."""
+
+    def test_quarantine_pattern_overlap_detects_quarantine(self) -> None:
+        assert config.quarantine_pattern_overlap("klaxon-quarantine-*")
+        assert config.quarantine_pattern_overlap("klaxon-quarantine-customer-a-v5-*")
+        assert config.quarantine_pattern_overlap("klaxon-*")  # too broad
+        assert config.quarantine_pattern_overlap("klaxon-quarantine-a-v5-*")
+
+    def test_quarantine_pattern_overlap_allows_masked(self) -> None:
+        assert not config.quarantine_pattern_overlap("klaxon-masked-customer-a-v5-*")
+        assert not config.quarantine_pattern_overlap("wazuh-events-v5-*")
+        assert not config.quarantine_pattern_overlap("klaxon-masked-*")
+
+    @pytest.mark.parametrize("pattern", [
+        "klaxon-quarantine-customer-a-v5-*",
+        "klaxon-quarantine-*",
+        "klaxon-*",
+    ])
+    def test_from_env_refuses_quarantine_in_masked_streams(
+        self, monkeypatch: pytest.MonkeyPatch, pattern: str
+    ) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_MASKED_STREAMS", pattern)
+        with pytest.raises(ConfigError, match="quarantine"):
+            AnonymizationConfig.from_env()
+
+    def test_from_env_allows_only_masked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "KLAXON_ANONYMIZATION_MASKED_STREAMS",
+            "klaxon-masked-customer-a-v5-*",
+        )
+        assert AnonymizationConfig.from_env().masked_streams == (
+            "klaxon-masked-customer-a-v5-*",
+        )
+
+    def test_generated_config_fragment_never_adds_quarantine(self) -> None:
+        """Quarantine is NEVER generated into masked_streams — the fragment
+        lists only the masked stream, so the guard cannot trip on a fresh
+        tenant's generated config."""
+        from klaxon_mcp.tenants import build_config_fragment, load_tenant_config
+
+        data = yaml.safe_load(build_config_fragment(load_tenant_config("customer-a")))
+        streams = data["anonymization"]["masked_streams"]
+        assert streams == ["klaxon-masked-customer-a-v5-*"]
+        for stream in streams:
+            assert not config.quarantine_pattern_overlap(stream)
 
 
 class TestBooleanFailClosed:
