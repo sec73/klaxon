@@ -7,7 +7,10 @@
 
 The raw Wazuh streams (`wazuh-events-v5-*`, `wazuh-findings-v5-*`) are never
 touched. A periodic sync job reindexes a recent time window from the raw stream
-through a generated ingest pipeline into `klaxon-masked-<tenant>-v5-*`, which
+through a generated ingest pipeline into `klaxon-masked-<tenant>-v5*` (the data
+stream is named `klaxon-masked-<tenant>-v5`; the `*` pattern is what queries
+and the LLM allowlist use — NOT `...-v5-*`, which matches neither the stream
+name nor its backing indices and would silently return 0 documents), which
 carries its own short ISM retention. Report/LLM consumers query only the masked
 stream.
 
@@ -346,13 +349,13 @@ def build_index_template(
     `index_patterns` is `klaxon-masked-<tenant>-v5*` (NOT `...-v5-*`): OpenSearch
     requires the template to match the DATA STREAM NAME
     (`klaxon-masked-<tenant>-v5`, no trailing dash) to create the stream, and
-    the same pattern also covers its `...-v5-000001` backing indices. The `-*`
-    form is only used for query patterns and the ISM `ism_template` (which
-    targets concrete indices). The ISM policy is attached the OpenSearch-native
-    way: the policy's `ism_template` (see `build_ism_policy`) auto-applies it to
-    newly created backing indices. `index.lifecycle.name` is intentionally NOT
-    set — it is an Elasticsearch ILM setting that OpenSearch rejects (HTTP 400
-    "expected [index.lifecycle.name] to be private but it was not").
+    the same pattern also covers its `...-v5-000001` backing indices. The SAME
+    `...-v5*` pattern is used for queries, the LLM allowlist
+    (`masked_streams`), the ISM `ism_template` and the report role — one naming
+    scheme end to end, so a config that says `...-v5-*` can never silently match
+    nothing. `index.lifecycle.name` is intentionally NOT set — it is an
+    Elasticsearch ILM setting that OpenSearch rejects (HTTP 400 "expected
+    [index.lifecycle.name] to be private but it was not").
     """
     template: dict[str, Any] = {
         "settings": {
@@ -423,7 +426,7 @@ def build_quarantine_index_template(
 
     Deliberately in the `klaxon-quarantine-` namespace (NOT `klaxon-masked-`):
     the pattern `klaxon-quarantine-<tenant>-v5*` can never overlap the LLM
-    allowlist `klaxon-masked-<tenant>-v5-*`, so an LLM query can never read
+    allowlist `klaxon-masked-<tenant>-v5*`, so an LLM query can never read
     quarantine data through Klaxon.
 
     The settings carry NO `index.default_pipeline` — quarantine documents must
@@ -491,7 +494,7 @@ def build_roles_fragment(cfg: TenantConfig) -> str:
 # klaxon-provenance: {provenance}
 #
 # Fail-closed access model:
-#   * LLM/report role reads ONLY klaxon-masked-{cfg.tenant}-v5-* — it can never
+#   * LLM/report role reads ONLY klaxon-masked-{cfg.tenant}-v5* — it can never
 #     read the quarantine stream (no klaxon-quarantine- pattern).
 #   * Ops/security role reads the quarantine stream + raw wazuh-events-v5-*.
 #   * Sync-job service user additionally WRITES the quarantine stream; without

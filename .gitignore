@@ -22,6 +22,11 @@ tests/live/.env
 deployable/
 .deploy/
 
+# `klaxon masking deploy` snapshots the CURRENT deployed state (incl. the real
+# deployed salt) under tenants/*/generated/backup/ for `--rollback` — a secret
+# store, never committed.
+tenants/*/generated/backup/
+
 # The anonymization audit log (llm_prompts.log) is a runtime artifact and can
 # contain personal data — never commit it. Its export and the compliance report
 # are generated on demand.

@@ -40,7 +40,7 @@ diagnostics line — with `[UNMASKED MODE]` and/or `[RAW STREAM QUERY]` whenever
 the response may carry personal data: anonymization is disabled, the LLM
 endpoint is not local (no loopback) and the response gate is inactive, or the
 query targeted a raw stream (`wazuh-events-v5-*` / `wazuh-findings-v5-*`)
-instead of a masked stream (`klaxon-masked-<tenant>-v5-*`). It is automatic (no
+instead of a masked stream (`klaxon-masked-<tenant>-v5*`). It is automatic (no
 opt-in, no separate tool) so it cannot be forgotten, fires on every response
 including zero-hit/error/aggregation-only ones, and carries only the condition
 + a one-line reason — never values, tokens or the salt.
@@ -426,6 +426,45 @@ naming sensitive fields present in the hits.
 
 ---
 
+## `klaxon_posture_check`
+
+Read-only security/DSGVO posture check: **facts + gaps, never a verdict.** It
+returns one `check: status — fact` line per item, each traceable to its source
+(config field / CLI check / indexer API). Statuses are `OK` / `WARN` / `unknown`
+only — there is no overall compliance verdict and no legal judgment (the same
+principle as `gdpr_check`: report what can be established, nothing more).
+
+| Parameter | Type | |
+|---|---|---|
+| `tenant` | string | default `customer-a` — whose masked/quarantine streams and RBAC roles are checked |
+| `hours` | int | default `24` — quarantine-backlog window |
+
+The nine checks:
+
+```
+masking: OK — 19 field(s) masked, aggregation keys on, free-text users on (source: config.anonymization.*)
+response_gate: OK — llm_base_url is loopback (local model) (source: config.anonymization.llm_base_url loopback check)
+mode: WARN — response-layer masking only; klaxon-masked-customer-a-v5* is not present on the indexer (Option B not deployed); quarantine stream not present (planned, not implemented) (source: config.anonymization.masked_streams + GET /_data_stream)
+pipeline_drift: OK — fingerprint matches fields.yaml (source: verify-config / fingerprint_matches)
+salt_strength: OK — >= 256 bits (source: KLAXON_ANONYMIZATION_SALT length only; the salt itself is never emitted)
+quarantine_backlog: WARN — 340 doc(s) since 06:00 UTC in the last 24h — investigate cause (source: POST /klaxon-quarantine-customer-a-v5-*/_count)
+rbac: OK — klaxon_llm_report_customer-a present (grants: klaxon-masked-customer-a-v5*); klaxon_ops_customer-a present ... (source: roles-<tenant>.yaml fragment vs GET /_plugins/_security/api/roles)
+retention: OK — masked 30d / quarantine 90d (source: masked_stream.DEFAULT_RETENTION_DAYS / QUARANTINE_RETENTION_DAYS)
+startup_fail_closed: OK — no masked_streams pattern overlaps the quarantine stream (source: Config.from_env() / quarantine_pattern_overlap)
+```
+
+**Hard contract.** The tool is itself callable from chat, so its output must
+never leak what it checks: the salt is never emitted (not even partially, not
+hashed), and no PII, raw values, tokens, hostnames, usernames, IPs or sampled
+values appear — only counts, booleans, statuses, index patterns, durations and
+role names. The GDPR checker may sample values internally; those samples never
+reach this tool's output. If a check cannot be established (e.g. the indexer is
+unreachable), it reports `unknown — <reason>` instead of a guessed value.
+Read-only: nothing is written to the indexer, nothing deployed, no config
+change.
+
+---
+
 ## `klaxon masking` (Option B generator)
 
 Builds the deployable artifacts for the separate masked stream from
@@ -442,10 +481,12 @@ is the operator's/CI's job). `klaxon` and `klaxon-mcp` are the same binary.
 | `masking selftest [--tenant X]` | prove the generated Painless token scheme == `derive_token` byte-for-byte AND that the script is structurally compilable (functions before statements, no `ctx['_source']`, FAIL-CLOSED quarantine `on_failure` present); runs inside every `generate`; a mismatch aborts and emits nothing |
 | `masking test --tenant X` | LIVE integration test: Stage A verifies the ingest Painless allowlist has the APIs the script needs (`GET /_scripts/painless/_context`), Stage B simulates it via `POST /_ingest/pipeline/_simulate` (authoritative compile + behaviour), Stage C forces a masking failure and asserts the doc is rerouted to the quarantine stream (fail-closed) — no writes, nothing deployed (skips cleanly when credentials are missing) |
 | `masking salt-check --tenant X` | compare the DEPLOYED pipeline's `params.salt` with the current env salt (needs the indexer) |
+| `masking deploy --tenant X` | deploy the generated artifacts to the indexer in ONE idempotent, ordered, self-verifying step (pipeline → ISM policies → index templates → masked data stream → security roles), with preflight (drift / credentials / salt-match / running-sync), GET-back verification after every PUT, a final `_simulate` smoke test, `--dry-run` (plan only, no writes), `--force` and `--rollback` (re-deploys the last snapshot). Roles YAML → JSON in code (no `yq`). Needs admin `KLAXON_INDEXER_URL/USER/PASSWORD`; never logs the password, salt, tokens or raw data |
 | `masking migrate --tenant X` | **ONE-TIME, destructive, never automated**: move legacy `klaxon.masking_error` docs from the masked stream into the quarantine stream and delete them from the masked stream (idempotent; `--dry-run` to preview) |
 
 Flags: `--tenant`, `--out`, `--stdout`, `--check`, `--retention-days`, `--root`,
-`--salt`, `--salt-env` (and `--env` for `masking test`, `--dry-run` for
+`--salt`, `--salt-env` (and `--env` for `masking test`/`masking deploy`,
+`--dry-run`/`--force`/`--rollback` for `masking deploy`, `--dry-run` for
 `masking migrate`). The salt is read from
 `KLAXON_ANONYMIZATION_SALT` (or `salt_env` in `fields.yaml`); unset → random
 salt + warning (tokens rotate unless the salt is stable). Tokens are

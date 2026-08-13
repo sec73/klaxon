@@ -114,7 +114,7 @@ def validate_tenant(tenant: str) -> str:
     """Validate a tenant name before it reaches resource names or paths.
 
     Tenants are interpolated into `klaxon-mask-<tenant>`,
-    `klaxon-masked-<tenant>-v5-*`, `klaxon-masked-retention-<tenant>`, the
+    `klaxon-masked-<tenant>-v5*`, `klaxon-masked-retention-<tenant>`, the
     sync-state doc id and the `tenants/<tenant>/` directory. An unguarded tenant
     (containing '/', '..', '*', ',', whitespace, ...) could escape a resource
     name, an index pattern or the tenants directory. The permitted set is what

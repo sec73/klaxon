@@ -219,7 +219,7 @@ class AnonymizationConfig:
     # (message, *.log, raw, ...), that get the free-text username pass.
     mask_free_text_fields: tuple[str, ...] = ()
     # Data streams that are already masked at ingest (Option B, e.g.
-    # klaxon-masked-<tenant>-v5-*). The response layer passes already-tokenized
+    # klaxon-masked-<tenant>-v5*). The response layer passes already-tokenized
     # values through unchanged, so masking is idempotent for these streams.
     masked_streams: tuple[str, ...] = ()
     # Whitelist semantics for this server: only responses that mask cleanly go
@@ -587,6 +587,15 @@ class Config:
     # DSGVO plausibility checker settings; see GdprConfig.
     gdpr: GdprConfig = _DEFAULT_GDPR
 
+    # Option B sync (`klaxon-mcp --sync-masked`). The reindex runs as an async
+    # task (wait_for_completion=false) and is polled, so a proxy/LB closing a
+    # long synchronous connection cannot abort a large window. `sync_reindex_timeout`
+    # is the generous read/write timeout for the reindex POST and each task-poll
+    # GET (the default short `timeout` would kill a long-running reindex);
+    # `sync_task_timeout` is the overall deadline for the async task to complete.
+    sync_reindex_timeout: float = 1800.0  # 30 min, KLAXON_SYNC_REINDEX_TIMEOUT
+    sync_task_timeout: float = 3600.0  # 60 min, KLAXON_SYNC_TASK_TIMEOUT
+
     @classmethod
     def from_env(cls) -> Config:
         indexer_url = os.environ.get("WAZUH_INDEXER_URL", "").strip().rstrip("/")
@@ -635,6 +644,8 @@ class Config:
             engine_url=engine_url,
             verify_ssl=verify_ssl,
             timeout=_env_float("WAZUH_TIMEOUT", 60.0),
+            sync_reindex_timeout=_env_float("KLAXON_SYNC_REINDEX_TIMEOUT", 1800.0),
+            sync_task_timeout=_env_float("KLAXON_SYNC_TASK_TIMEOUT", 3600.0),
             schema_field_limit=_env_int("WAZUH_SCHEMA_FIELD_LIMIT", 200),
             schema_probe_batch=_env_int("WAZUH_SCHEMA_PROBE_BATCH", 100),
             search_max_size=search_max_size,

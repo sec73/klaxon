@@ -29,7 +29,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import coverage, diagnostics, gdpr, overview
+from . import coverage, diagnostics, gdpr, overview, posture
 from .anonymization import AggSpec, Anonymizer, parse_agg_fields
 from .clients import (
     EngineClient,
@@ -62,12 +62,14 @@ from .fields import (
     probe_population,
     sample_source,
 )
+from .tenants import load_tenant_config
 from .validation import (
     ValidationError,
     validate_detector_id,
     validate_index,
     validate_manager_path,
     validate_prefix,
+    validate_tenant,
 )
 
 mcp: MCPServer = MCPServer(
@@ -1736,6 +1738,48 @@ async def gdpr_check(
     parts = [head, "", body, "", "--- summary ---"]
     parts.extend(f"- {line}" for line in summary)
     return _guarded_text("gdpr_check", "\n".join(parts))
+
+
+@mcp.tool()
+async def klaxon_posture_check(
+    tenant: str = "customer-a",
+    hours: int = 24,
+) -> str:
+    """Read-only security/DSGVO posture check: facts + gaps, never a verdict.
+
+    Returns one `check: status — fact` line per item: masking, response gate,
+    mode (response-layer vs Option B masked stream), pipeline drift, salt
+    strength, quarantine backlog, RBAC roles, retention and the startup
+    fail-closed check. Statuses are OK / WARN / unknown only — there is no
+    overall compliance verdict and no legal judgment (the same principle as
+    `gdpr_check`: report what can be established, nothing more).
+
+    The salt is NEVER emitted — not even partially, not hashed. No PII, raw
+    values, tokens, hostnames, usernames, IPs or sampled values appear in the
+    output; only counts, booleans, statuses, index patterns, durations and role
+    names. When the indexer is unreachable a check reports
+    "unknown — <reason>" instead of a guessed value. Read-only: nothing is
+    written to the indexer, nothing deployed, no config change.
+
+    Args:
+        tenant: Tenant whose masked/quarantine streams and RBAC roles are
+            checked (default "customer-a").
+        hours: Quarantine-backlog window in hours (default 24).
+    """
+    hours = _positive("hours", hours)
+    try:
+        validate_tenant(tenant)
+    except ValidationError as exc:
+        raise ToolError(str(exc)) from exc
+    try:
+        cfg = load_tenant_config(tenant)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+    config = get_config()
+    lines = await posture.posture_check(
+        get_indexer(), config, config.anonymization, cfg, hours=hours
+    )
+    return _guarded_text("klaxon_posture_check", "\n".join(lines))
 
 
 # --------------------------------------------------------------------------- #

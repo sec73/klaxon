@@ -512,7 +512,7 @@ def _quarantine_on_failure_script(cfg: TenantConfig) -> str:
 
     FAIL-CLOSED: a document whose masking threw is routed OUT of the masked
     stream into the quarantine stream — it never stays in
-    `klaxon-masked-<tenant>-v5-*`. Same `ctx`-context pattern as the masking
+    `klaxon-masked-<tenant>-v5*`. Same `ctx`-context pattern as the masking
     script (in an ingest script processor `ctx` IS the document; there is no
     nested `_source`).
     """

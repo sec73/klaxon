@@ -8,13 +8,93 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.2.0 – 2026-08-13
+
 ### Fixed
+
+- **The masked-stream pattern is now consistent everywhere
+  (`klaxon-masked-<tenant>-v5*`), fixing queries that silently returned 0
+  documents against a deployed Option B data stream.** The data stream is named
+  `klaxon-masked-<tenant>-v5` (no trailing dash), but every query/config path
+  used `klaxon-masked-<tenant>-v5-*`, which matches neither the stream name nor
+  its `...-v5-000001` backing indices — so `masked_streams`, the report-role
+  allowlist, the sync backstop counts and LLM queries all matched nothing
+  (live: 1.23M correctly-masked docs invisible to consumers). The single source
+  `TenantConfig.masked_stream_pattern` is now `...-v5*`; the generated config
+  fragment (`masked_streams`), the ISM `ism_template`, the roles fragment
+  (`klaxon_llm_report_<tenant>`) and the Painless comments all flow from it.
+  The `[RAW STREAM QUERY]` banner now decides raw-vs-masked against the
+  EFFECTIVE `masked_streams` value (an index covered by a configured masked
+  stream is never flagged raw). The posture check's `mode` now also WARNs when a
+  deployed masked data stream is NOT covered by the configured `masked_streams`
+  (the divergence guard), instead of reporting OK. No reindex, no checkpoint
+  change, no masking/pipeline/quarantine change — only the naming scheme, plus
+  the committed/golden artifacts regenerated from it. New unit test asserts the
+  effective `masked_streams` value glob-matches the actual data stream name
+  (an index pattern ending in `-*` must not be used for a stream without the
+  trailing `-`).
+
+- **`klaxon masking deploy` no longer fails with HTTP 409 when an ISM policy
+  already exists.** ISM policies are versioned documents: updating an existing
+  one requires `?if_seq_no=<seq>&if_primary_term=<term>` taken from a prior
+  GET, and a plain PUT returns 409 "version conflict, document already exists".
+  The ISM deploy step now GETs the policy first (ONE GET, reused): missing
+  (404) -> plain PUT (create); identical (server-managed keys `policy_id` /
+  `last_updated_time` / `schema_version` / `error_notification` are ignored in
+  the fingerprint, so the no-op works against a live cluster) -> `[skip] ISM
+  <id> unchanged`; different -> versioned PUT with the GET's seq/term. A 409
+  (a concurrent change landing between GET and PUT) is retried once with a
+  fresh GET + PUT, then fails with a clear message. The pipeline step now also
+  GET-compares and skips when identical, so a re-run is a full no-op for the
+  pipeline and both ISM policies. The security roles API is verified as
+  200-overwrite (no optimistic concurrency), so roles keep their plain PUT +
+  GET-back verify. In `deploy.py`: `_put_ism_policy`, `_get_ism_policy`,
+  `_verify_after_put`, `_ISM_SERVER_KEYS` / `_normalized_for_compare`; new unit
+  tests simulate missing / identical / different / 409-once / 409-twice against
+  a mocked indexer (`tests/test_deploy.py`). Pipeline/ISM re-run output
+  contract unchanged except the `[skip] ... unchanged` lines for the two
+  idempotent steps.
+
+- **`klaxon masking deploy --rollback` no longer fails with HTTP 409 on the
+  ISM step.** The rollback path re-deployed ISM policies with a plain PUT, which
+  a versioned ISM document rejects with 409 "version conflict, document already
+  exists". Rollback now goes through the SAME shared helper as deploy —
+  `_put_ism_policy` (formerly `_put_ism_verified`) — for both the masked and
+  the quarantine policy: GET-first compare/skip (an unchanged policy is a
+  no-op, so a second `--rollback` writes nothing), versioned PUT
+  (`?if_seq_no&if_primary_term` from a fresh GET, never a stale seq), and one
+  409 retry before failing with a clear message. The duplicated plain-PUT in
+  the rollback path is gone; the rollback output contract is unchanged except
+  the `[skip] rollback ism-* <id> unchanged` no-op line. Unit tests cover all
+  five cases (missing / identical / different / 409-once / 409-twice) for BOTH
+  the deploy and the rollback path, plus the ISM GET `_seq_no`/`_primary_term`
+  shape and an end-to-end rollback/no-op second rollback
+  (`tests/test_deploy.py`).
 
 - `klaxon_mcp.__version__` again matches the packaged version (`0.1.7`) after
   it had drifted from `pyproject.toml`. It is the fallback used when the
   installed-distribution metadata is unavailable (`generator_version()` in
   `masked_stream.py`), so generated artifacts' `generator_version` could have
   been stamped wrong in that path.
+
+- **`klaxon-mcp --sync-masked` no longer dies on a transport-level reindex
+  timeout for a large window.** The reindex is now submitted as an async task
+  (`POST /_reindex?wait_for_completion=false` returns a task id immediately)
+  and polled via `GET /_tasks/<id>`, so a proxy/LB closing a long synchronous
+  connection cannot abort the run. The reindex POST and each task-poll GET use
+  a generous per-request timeout (`KLAXON_SYNC_REINDEX_TIMEOUT`, default 30
+  min) instead of the default short `WAZUH_TIMEOUT`, with an overall task
+  deadline `KLAXON_SYNC_TASK_TIMEOUT` (default 60 min). Transport-level
+  failures (the `httpx.TransportError` family) are retried with exponential
+  backoff for the SAME window (3 attempts: 5s, 15s, 45s) then fail with a clear
+  message; HTTP 4xx/5xx are reported with status + body and never retried
+  blindly. Checkpoint semantics are unchanged and stay fail-closed: the
+  checkpoint advances only after the task completes without failures, the
+  quarantine backstop is empty and (when enabled) the reconcile matches.
+  `IndexerClient.request`/`get`/`post` gained a per-request `timeout` override;
+  new unit tests mock the client for read-timeout-retried, exhausted-retries,
+  HTTP-not-retried, task-completes and task-times-out (no real cluster). See
+  `docs/option-b-masked-stream.md` "Reindex transport".
 
 ### Changed
 
@@ -24,6 +104,43 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`klaxon masking deploy` — operator-friendly Option B deployment.** Deploys
+the masking artifacts to the indexer in ONE idempotent, ordered,
+self-verifying step: pipeline → both ISM policies → both index templates →
+masked data stream (created only if absent; "already exists" is success) →
+security roles (roles `-<tenant>.yaml` converted to JSON in code — no `yq`
+dependency) → role-mapping reminder. Preflight aborts on drift (names the
+file), missing `KLAXON_INDEXER_*` credentials, a salt mismatch between the
+deployed pipeline and the env salt, or a running sync (a documented heuristic;
+`--force` overrides). Every PUT is verified with a GET-back fingerprint check,
+and a final `_simulate` smoke test asserts `user.name` and a free-text `uid=`
+share one token with no `klaxon.masking_error`. `--dry-run` prints the full
+plan with no writes; the previous deployed state is snapshotted under
+`tenants/<tenant>/generated/backup/<ts>/` (gitignored) and `--rollback`
+re-deploys it via the same ordered path. Reuses the live-test indexer client
+and the verify-config drift logic; the running server stays write-incapable
+(this is an explicit operator/CI CLI path). The password, salt, tokens and raw
+data are never logged. New `src/klaxon_mcp/deploy.py`; wired into
+`klaxon masking deploy`. See `docs/option-b-masked-stream.md` (operator
+section) and `docs/TOOLS.md`.
+
+- **`klaxon_posture_check` — on-demand security/DSGVO posture check (facts +
+  gaps, never a verdict).** Read-only MCP tool returning one `check: status —
+  fact` line per item with source attribution: masking, response gate +
+  loopback, mode (response-layer vs Option B masked stream, derived from
+  `masked_streams` config vs which data streams actually exist on the indexer),
+  pipeline drift vs `fields.yaml` (reuses verify-config), salt strength
+  (length-only, via `weak_salt()`), quarantine backlog (count over the last
+  `hours`, default 24), RBAC tenant roles (`klaxon_llm_report_<tenant>` /
+  `klaxon_ops_<tenant>` / `klaxon_sync_<tenant>`, fragment vs the OpenSearch
+  security roles API), retention (masked 30d / quarantine 90d), and the
+  startup fail-closed check. Statuses are OK / WARN / unknown only — no overall
+  compliance verdict, no legal judgment. The salt is never emitted (not even
+  partially, not hashed); no PII, raw values, tokens, hostnames, usernames, IPs
+  or sampled values appear in the output; an unreachable indexer yields
+  "unknown — reason" per check. New `src/klaxon_mcp/posture.py`; tool wired
+  into the MCP server. Read-only: nothing written, nothing deployed.
+
 - **Automatic safety banner in the diagnostics layer** (`[UNMASKED MODE]` /
   `[RAW STREAM QUERY]`). Every search response is prefixed — before any other
   diagnostics line — with a one-line banner per active condition whenever the
@@ -31,7 +148,7 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no fields configured), the LLM endpoint is not local (no loopback) and the
   response gate (`whitelist_enabled`) is inactive, or the query targeted a raw
   stream (`wazuh-events-v5-*` / `wazuh-findings-v5-*`) instead of a masked
-  stream (`klaxon-masked-<tenant>-v5-*`). Automatic (no opt-in, no separate
+  stream (`klaxon-masked-<tenant>-v5*`). Automatic (no opt-in, no separate
   tool), fires on every response including zero-hit/error/aggregation-only
   ones, and never contains values, tokens or the salt. New
   `diagnostics.safety_banner`; wired into `search` and `findings_overview`
@@ -167,7 +284,7 @@ Verified against a live OpenSearch 3.6.0 indexer.
   the LLM allowlist can never read quarantine (raw) data. The generated config
   fragment never adds the quarantine stream.
 - **Access control** (roles fragment): LLM/report role reads
-  `klaxon-masked-<tenant>-v5-*` ONLY; ops role reads quarantine + raw events;
+  `klaxon-masked-<tenant>-v5*` ONLY; ops role reads quarantine + raw events;
   the sync service user additionally WRITES the quarantine stream (without it,
   the security plugin rejects the on_failure reroute — a fail-closed backstop).
 - **Live test Stage C** (`klaxon masking test`): a forced masking failure is

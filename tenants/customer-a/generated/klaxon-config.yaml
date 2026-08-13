@@ -24,7 +24,7 @@ anonymization:
     - related.user
     - related.hosts
   masked_streams:
-    - klaxon-masked-customer-a-v5-*
+    - klaxon-masked-customer-a-v5*
   mask_free_text_fields:
     - message
 gdpr_checker:

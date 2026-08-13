@@ -30,6 +30,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
@@ -172,6 +173,154 @@ async def _write_checkpoint(
 
 
 # --------------------------------------------------------------------------- #
+# Reindex execution: async task submission + polling + transport retry
+#
+# The reindex is submitted with wait_for_completion=false, so the POST returns
+# a task id immediately and the task is then polled via GET /_tasks/<id>. A
+# long synchronous _reindex connection is exactly what proxies/LBs close on
+# long requests — the transport-level failure this code fixes. Transport-level
+# errors (connect/read timeout, connection reset, protocol errors — the
+# httpx.TransportError family) are TRANSIENT and retried with backoff for the
+# SAME window; HTTP 4xx/5xx are reported with status + body and never retried
+# blindly (they will not heal by retrying, and would only amplify load).
+# --------------------------------------------------------------------------- #
+
+SYNC_REINDEX_ATTEMPTS = 3
+SYNC_RETRY_BACKOFF_SECONDS = (5.0, 15.0, 45.0)
+SYNC_TASK_POLL_SECONDS = 5.0
+
+
+async def _submit_reindex_task(
+    client: IndexerClient,
+    cfg: TenantConfig,
+    config: Config,
+    body: dict[str, Any],
+) -> str | None:
+    """POST /_reindex?wait_for_completion=false; return the task id, or None.
+
+    Transport-level errors are retried with backoff (SYNC_REINDEX_ATTEMPTS).
+    On failure the window is NOT reindexed and the checkpoint is NOT advanced —
+    the window is retried on the next run (fail-closed). HTTP errors return
+    None without retrying, with the status + body already reported.
+    """
+    for attempt in range(1, SYNC_REINDEX_ATTEMPTS + 1):
+        try:
+            resp = await client.post(
+                "/_reindex",
+                body=body,
+                params={"wait_for_completion": "false"},
+                timeout=config.sync_reindex_timeout,
+            )
+        except TransportError as exc:
+            if attempt < SYNC_REINDEX_ATTEMPTS:
+                delay = SYNC_RETRY_BACKOFF_SECONDS[attempt - 1]
+                print(
+                    f"sync-masked[{cfg.tenant}] reindex transport error "
+                    f"(attempt {attempt}/{SYNC_REINDEX_ATTEMPTS}): {exc}; "
+                    f"retrying in {delay:.0f}s.",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(delay)
+                continue
+            print(
+                f"sync-masked[{cfg.tenant}] reindex failed at transport level "
+                f"after {SYNC_REINDEX_ATTEMPTS} attempts: {exc}. The window was "
+                "NOT reindexed and the checkpoint was NOT advanced; it will be "
+                "retried on the next run.",
+                file=sys.stderr,
+            )
+            return None
+
+        if not resp.ok:
+            # HTTP error: report status + body; do NOT retry blindly.
+            print(
+                f"sync-masked[{cfg.tenant}] reindex FAILED (HTTP "
+                f"{resp.status_code}); checkpoint NOT advanced. Failed window "
+                "will be retried.",
+                file=sys.stderr,
+            )
+            print(resp.text[:2000], file=sys.stderr)
+            return None
+
+        parsed = resp.json()
+        task_id = parsed.get("task") if isinstance(parsed, dict) else None
+        if not isinstance(task_id, str) or not task_id:
+            print(
+                f"sync-masked[{cfg.tenant}] reindex did not return a task id "
+                f"(response: {resp.text[:500]}); checkpoint NOT advanced.",
+                file=sys.stderr,
+            )
+            return None
+        return task_id
+    return None  # unreachable
+
+
+async def _poll_reindex_task(
+    client: IndexerClient,
+    cfg: TenantConfig,
+    config: Config,
+    task_id: str,
+) -> dict[str, Any] | None:
+    """Poll GET /_tasks/<id> until the reindex task completes.
+
+    Returns the completed task body (the reindex result sits in task.status),
+    or None on failure/timeout with the message already printed. A transport
+    error on a poll is transient and retried; the overall deadline is
+    config.sync_task_timeout (KLAXON_SYNC_TASK_TIMEOUT, default 60 min).
+    """
+    deadline = time.monotonic() + config.sync_task_timeout
+    poll = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(
+                f"sync-masked[{cfg.tenant}] reindex task {task_id} did not "
+                f"complete within {config.sync_task_timeout:.0f}s; checkpoint "
+                "NOT advanced. The window will be retried on the next run.",
+                file=sys.stderr,
+            )
+            return None
+        try:
+            resp = await client.get(
+                f"/_tasks/{task_id}", timeout=config.sync_reindex_timeout
+            )
+        except TransportError as exc:
+            poll += 1
+            print(
+                f"sync-masked[{cfg.tenant}] reindex task poll transport error "
+                f"(poll #{poll}): {exc}; retrying.",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(min(SYNC_TASK_POLL_SECONDS, remaining))
+            continue
+        if not resp.ok:
+            print(
+                f"sync-masked[{cfg.tenant}] reindex task poll FAILED (HTTP "
+                f"{resp.status_code}) for {task_id}; checkpoint NOT advanced.",
+                file=sys.stderr,
+            )
+            print(resp.text[:1000], file=sys.stderr)
+            return None
+        parsed = resp.json()
+        if isinstance(parsed, dict) and parsed.get("completed"):
+            return parsed
+        await asyncio.sleep(min(SYNC_TASK_POLL_SECONDS, remaining))
+
+
+def _reindex_task_result(completed: dict[str, Any]) -> dict[str, Any] | None:
+    """The reindex result of a completed task body, normalised to the top level.
+
+    GET /_tasks/<id> nests the reindex result (failures/created/total/...) under
+    task.status, whereas a synchronous _reindex response carries it at the top
+    level. Returns None when the result cannot be read — the caller treats that
+    as FAIL-CLOSED (success not confirmed, checkpoint not advanced).
+    """
+    task = completed.get("task")
+    status = task.get("status") if isinstance(task, dict) else None
+    return status if isinstance(status, dict) else None
+
+
+# --------------------------------------------------------------------------- #
 # Sync
 # --------------------------------------------------------------------------- #
 
@@ -229,27 +378,31 @@ async def _sync(
         print("dry run: reindex not sent, checkpoint not advanced.")
         return 0
 
-    try:
-        resp = await client.post("/_reindex", body=body)
-    except TransportError as exc:
+    # Submit the reindex as an async task and poll it. wait_for_completion=false
+    # returns a task id immediately, so a proxy/LB closing a long synchronous
+    # connection cannot abort a large window. Transport-level failures are
+    # retried with backoff; the checkpoint advances ONLY after the task completes
+    # without failures (fail-closed).
+    task_id = await _submit_reindex_task(client, cfg, config, body)
+    if task_id is None:
+        # Message already printed; checkpoint NOT advanced.
+        return 1
+
+    completed = await _poll_reindex_task(client, cfg, config, task_id)
+    if completed is None:
+        # Message already printed; checkpoint NOT advanced.
+        return 1
+
+    result = _reindex_task_result(completed)
+    if result is None:
         print(
-            f"sync-masked[{cfg.tenant}] reindex failed at transport level: {exc}",
+            f"sync-masked[{cfg.tenant}] reindex task completed but its result "
+            "could not be read — success is not confirmed. checkpoint NOT "
+            "advanced.",
             file=sys.stderr,
         )
         return 1
-
-    if not resp.ok:
-        # Do NOT advance the checkpoint: the window is retried on the next run.
-        print(
-            f"sync-masked[{cfg.tenant}] reindex FAILED (HTTP {resp.status_code}); "
-            "checkpoint NOT advanced. Failed window will be retried.",
-            file=sys.stderr,
-        )
-        print(resp.text[:2000], file=sys.stderr)
-        return 1
-
-    parsed = resp.json()
-    failed = parsed.get("failures") if isinstance(parsed, dict) else None
+    failed = result.get("failures")
     if failed:
         # conflicts:proceed means create-conflicts are NOT failures; anything
         # listed here is a real error -> do not advance.

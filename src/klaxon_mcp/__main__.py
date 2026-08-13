@@ -377,6 +377,51 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Show what would be migrated without reindexing or deleting.",
     )
+
+    deploy_parser = masking_sub.add_parser(
+        "deploy",
+        help="Deploy the Option B masking artifacts to the indexer in one "
+        "idempotent, ordered, self-verifying step (pipeline, ISM policies, "
+        "index templates, masked data stream, security roles). Needs admin "
+        "indexer credentials (KLAXON_INDEXER_URL/USER/PASSWORD).",
+    )
+    deploy_parser.add_argument(
+        "--tenant", metavar="TENANT", required=True, help="Tenant to deploy."
+    )
+    deploy_parser.add_argument(
+        "--root", type=Path, default=None, help="Repo root (default: auto)."
+    )
+    deploy_parser.add_argument(
+        "--env",
+        metavar="FILE",
+        default=None,
+        help="Local dotenv file with KLAXON_INDEXER_* vars (default: first "
+        "existing of .env.live, tests/live/.env).",
+    )
+    deploy_parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Masked-stream ISM delete-after (default 30; quarantine always 90).",
+    )
+    deploy_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the full plan and preflight result WITHOUT writing anything.",
+    )
+    deploy_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Proceed even if a sync job appears to be running/very recent.",
+    )
+    deploy_parser.add_argument(
+        "--rollback",
+        action="store_true",
+        help="Re-deploy the last snapshot (tenants/<tenant>/generated/backup/"
+        "<ts>/) via the same ordered path. Pipeline rollback is safe: no data "
+        "loss, the sync job can simply re-run.",
+    )
     return parser.parse_args(argv)
 
 
@@ -773,8 +818,32 @@ def main(argv: list[str] | None = None) -> int:
             return sync_masked.migrate_quarantine_command(
                 args.tenant, dry_run=args.dry_run
             )
+        if args.masking_command == "deploy":
+            if not args.tenant:
+                print(
+                    "--tenant is required for `masking deploy`",
+                    file=sys.stderr,
+                )
+                return 2
+            from . import deploy
+
+            argv = ["--tenant", args.tenant]
+            if args.root is not None:
+                argv += ["--root", str(args.root)]
+            if args.env:
+                argv += ["--env", args.env]
+            if args.retention_days is not None:
+                argv += ["--retention-days", str(args.retention_days)]
+            if args.dry_run:
+                argv.append("--dry-run")
+            if args.force:
+                argv.append("--force")
+            if args.rollback:
+                argv.append("--rollback")
+            return deploy.deploy_main(argv)
         print(
-            "masking: missing subcommand (generate|selftest|salt-check|test|migrate)",
+            "masking: missing subcommand "
+            "(generate|selftest|salt-check|test|migrate|deploy)",
             file=sys.stderr,
         )
         return 2

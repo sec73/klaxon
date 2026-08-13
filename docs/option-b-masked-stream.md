@@ -2,7 +2,7 @@
 
 > **Status: implemented & live-verified — NOT deployed.** The generator, the
 > self-test and the live `klaxon masking test` all cover Option B, but no
-> `klaxon-masked-<tenant>-v5-*` data stream exists on the indexer yet (0
+> `klaxon-masked-<tenant>-v5` data stream exists on the indexer yet (0
 > shards). Deploying is the operator's/CI's job — see
 > [Deploying and running](#deploying-and-running).
 
@@ -36,7 +36,7 @@ Hard constraints, enforced in code:
 ```mermaid
 flowchart LR
     RAW[wazuh-events-v5-*<br/>raw, never written] -->|sync job reads a window| SYNC[klaxon-mcp --sync-masked]
-    SYNC -->|"_reindex through<br/>klaxon-mask-<tenant>"| MASKED[klaxon-masked-&lt;tenant&gt;-v5-*]
+    SYNC -->|"_reindex through<br/>klaxon-mask-<tenant>"| MASKED[klaxon-masked-&lt;tenant&gt;-v5*]
     MASKED -->|queries only| R[reports / LLM]
     MASKED -->|ISM 30d| DEL[delete]
     MASKED -. "on_failure reroutes<br/>masking failures" .-> QUAR[klaxon-quarantine-&lt;tenant&gt;-v5-*<br/>raw, forensics]
@@ -55,7 +55,7 @@ artifacts from it:
 * `tenants/<tenant>/generated/klaxon-config.yaml` — the Klaxon config fragment
   (`anonymization.mask_fields`, `masked_streams`, `mask_free_text_users`,
   `mask_free_text_fields`, `gdpr_checker.custom_patterns`). Merge it into the
-  server config. `masked_streams` lists **only** `klaxon-masked-<tenant>-v5-*` —
+  server config. `masked_streams` lists **only** `klaxon-masked-<tenant>-v5*` —
   the quarantine stream is deliberately **never** added (see
   [Startup fail-closed check](#startup-fail-closed-check)).
 * `tenants/<tenant>/generated/pipeline-klaxon-mask-<tenant>.json` — the ingest
@@ -223,7 +223,7 @@ The salt is the HMAC key: keep it ≥ 256 bits, restrict who can read it, and do
 The quarantine stream `klaxon-quarantine-<tenant>-v5-*` holds documents whose
 masking threw (raw, unmasked, with `klaxon.masking_error` and the quarantine
 metadata). It is deliberately **not** named `klaxon-masked-*`, so it can never
-overlap the LLM allowlist `klaxon-masked-<tenant>-v5-*` — an LLM query through
+overlap the LLM allowlist `klaxon-masked-<tenant>-v5*` — an LLM query through
 Klaxon can never read it. It exists to answer the forensic questions a masking
 failure raises: *which document failed, why, and what was its original content?*
 
@@ -263,7 +263,7 @@ klaxon masking migrate --tenant customer-a            # migrate + delete
 klaxon masking migrate --tenant customer-a --dry-run  # show what would happen
 ```
 
-The command finds `klaxon.masking_error` docs in `klaxon-masked-<tenant>-v5-*`,
+The command finds `klaxon.masking_error` docs in `klaxon-masked-<tenant>-v5*`,
 reindexes them into `klaxon-quarantine-<tenant>-v5-raw` (`op_type: create`,
 `conflicts: proceed`, **no masking pipeline** — quarantine never re-enters
 masking), then deletes them from the masked stream (`_delete_by_query`) and
@@ -289,22 +289,37 @@ The generated config fragment never adds the quarantine stream to
 # 1. generate the artifacts (or use the committed ones); selftest runs first
 klaxon masking generate --tenant customer-a
 
-# 2. deploy pipeline (real salt in params.salt), ISM, index template, data
-#    stream + quarantine ISM/template
-klaxon-mcp --apply-masked-infra --tenant customer-a --retention-days 30
-#    (or PUT the deployable set from `klaxon masking generate --out DIR`)
+# 2. deploy everything in one idempotent, ordered, self-verifying step:
+#    pipeline, ISM policies, index templates, masked data stream, security
+#    roles. Preflight aborts on drift / missing credentials / salt mismatch /
+#    a running sync. Roles YAML -> JSON in code (no yq needed).
+klaxon masking deploy --tenant customer-a --retention-days 30
+klaxon masking deploy --tenant customer-a --dry-run   # plan only, no writes
+klaxon masking deploy --tenant customer-a --rollback  # restore last snapshot
 
-# 3. apply the roles fragment (LLM/ops/sync) — see "Access control"
-
-# 4. merge generated/klaxon-config.yaml into the Klaxon config so the response
+# 3. merge generated/klaxon-config.yaml into the Klaxon config so the response
 #    layer passes masked-stream tokens through
 
-# 5. first sync (no checkpoint -> 24h lookback)
+# 4. first sync (no checkpoint -> 24h lookback)
 klaxon-mcp --sync-masked --tenant customer-a
 
-# 6. schedule the sync (e.g. cron/kubernetes CronJob every 5-15 minutes)
+# 5. schedule the sync (e.g. cron/kubernetes CronJob every 5-15 minutes)
 klaxon-mcp --sync-masked --tenant customer-a --overlap-hours 1
 ```
+
+`klaxon masking deploy` reuses the drift check (it aborts naming any generated
+artifact that differs from what `klaxon masking generate` would produce now),
+the deployed-pipeline salt comparison (`params.salt` vs the env salt — a
+mismatch aborts with a warning that stream and response-layer tokens would
+diverge), and a running-sync heuristic (aborts unless `--force`; there is no
+lock in the sync job, so a checkpoint written within the last 5 minutes is the
+best-effort signal). Every PUT is followed by a GET-back fingerprint check, and
+a final `_simulate` smoke test asserts `user.name` and a free-text `uid=` share
+one token with no `klaxon.masking_error`. A snapshot of the previous deployed
+state is kept under `tenants/<tenant>/generated/backup/<ts>/` (gitignored — it
+embeds the real deployed salt) for `--rollback`; pipeline rollback is safe: no
+data loss, the sync job can simply re-run. The running server stays
+write-incapable — this is an explicit operator/CI CLI path.
 
 `--sync-masked` **preflights** before every run and refuses to sync when the
 deployed pipeline's fingerprint or field list no longer matches `fields.yaml`,
@@ -393,6 +408,30 @@ After every reindex, the sync job counts the quarantine stream for the window
 * The preflight (see above) refuses to sync on a deployed pipeline that lacks
   the quarantine `on_failure`.
 
+### Reindex transport: async task + polling + retry
+
+The reindex is submitted with `wait_for_completion=false`, so the `POST /_reindex`
+returns a task id immediately and the job then polls `GET /_tasks/<id>` until the
+task completes. A long synchronous `_reindex` connection is exactly what a proxy
+or load balancer closes on long requests — the transport-level failure that
+killed a large window. Submitting asynchronously and polling short requests
+avoids that whole class of failure.
+
+* The reindex POST and each task-poll GET use a **generous per-request timeout**
+  (`KLAXON_SYNC_REINDEX_TIMEOUT`, seconds, default `1800` = 30 min) instead of
+  the default short `WAZUH_TIMEOUT`; the overall deadline for the task to
+  complete is `KLAXON_SYNC_TASK_TIMEOUT` (seconds, default `3600` = 60 min).
+* **Transport-level failures** (connect/read timeout, connection reset, protocol
+  errors — the `httpx.TransportError` family) are **transient** and retried with
+  exponential backoff for the SAME window (3 attempts: 5s, 15s, 45s), then the
+  run fails with a clear message.
+* **HTTP 4xx/5xx** are reported with status + body and are **not** retried
+  blindly — they will not heal by retrying and would only amplify load on a
+  cluster that already answered.
+* The checkpoint advances **only** after the task completes without failures
+  (and the quarantine backstop is empty) — the fail-closed semantics are
+  unchanged.
+
 ### `klaxon.masking_error` — defense-in-depth filter
 
 Because masking failures are rerouted to the quarantine stream, the masked
@@ -420,8 +459,12 @@ klaxon-mcp --apply-masked-infra --tenant customer-a --retention-days 14
 
 The index templates (`priority` 200) match `klaxon-masked-<tenant>-v5*` /
 `klaxon-quarantine-<tenant>-v5*` (each data stream name plus its backing
-indices); the ISM templates (`priority` 100) match the concrete backing-index
-patterns `...-v5-*`. Wazuh streams are untouched.
+indices). The SAME `...-v5*` pattern is used everywhere for the masked stream —
+queries, the `masked_streams` allowlist, the ISM `ism_template` and the report
+role — because the data stream is named `klaxon-masked-<tenant>-v5` (no
+trailing dash): a `...-v5-*` pattern matches neither the stream name nor its
+backing indices and would silently return 0 documents. Wazuh streams are
+untouched.
 
 ## Access control
 
@@ -432,7 +475,7 @@ cluster):
 
 | Role | Reads | Notes |
 |---|---|---|
-| `klaxon_llm_report_<tenant>` | `klaxon-masked-<tenant>-v5-*` **only** | Can never read the quarantine stream or the raw stream. |
+| `klaxon_llm_report_<tenant>` | `klaxon-masked-<tenant>-v5*` **only** | Can never read the quarantine stream or the raw stream. |
 | `klaxon_ops_<tenant>` | `klaxon-quarantine-<tenant>-v5-*` + `wazuh-events-v5-*` | Forensics. No LLM mapping. |
 | `klaxon_sync_<tenant>` | `wazuh-events-v5-*` (reindex source) | Writes the masked + quarantine streams + `crud` on `klaxon-sync-state`. |
 
@@ -450,7 +493,7 @@ LLM/report role.
 `masked_streams` (env `KLAXON_ANONYMIZATION_MASKED_STREAMS`, or the generated
 config fragment) lists the masked stream patterns. The response layer treats
 those streams' values as already masked and passes tokens through unchanged.
-Reports and LLM tool calls should query `klaxon-masked-<tenant>-v5-*` instead
+Reports and LLM tool calls should query `klaxon-masked-<tenant>-v5*` instead
 of `wazuh-events-v5-*`. **Never** add `klaxon-quarantine-<tenant>-v5-*` to
 `masked_streams` — Klaxon refuses to start if you do (fail-closed).
 

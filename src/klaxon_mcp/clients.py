@@ -83,7 +83,15 @@ class IndexerClient:
         *,
         params: dict[str, Any] | None = None,
         body: Any | None = None,
+        timeout: float | None = None,
     ) -> Response:
+        """Send a request; raise TransportError only when no HTTP response came.
+
+        `timeout` overrides the client-wide timeout for THIS request (httpx
+        per-request override; None uses the client default). The long-running
+        `_reindex` needs a much more generous timeout than the short reads the
+        default is sized for.
+        """
         client = self._ensure()
         try:
             resp = await client.request(
@@ -91,6 +99,7 @@ class IndexerClient:
                 path,
                 params=params,
                 content=json.dumps(body) if body is not None else None,
+                timeout=timeout,
             )
         except httpx.HTTPError as exc:
             raise TransportError(
@@ -98,13 +107,24 @@ class IndexerClient:
             ) from exc
         return Response(resp.status_code, resp.text, str(resp.url))
 
-    async def get(self, path: str, *, params: dict[str, Any] | None = None) -> Response:
-        return await self.request("GET", path, params=params)
+    async def get(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> Response:
+        return await self.request("GET", path, params=params, timeout=timeout)
 
     async def post(
-        self, path: str, *, body: Any | None = None, params: dict[str, Any] | None = None
+        self,
+        path: str,
+        *,
+        body: Any | None = None,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Response:
-        return await self.request("POST", path, params=params, body=body)
+        return await self.request("POST", path, params=params, body=body, timeout=timeout)
 
     async def put(
         self, path: str, *, body: Any | None = None, params: dict[str, Any] | None = None

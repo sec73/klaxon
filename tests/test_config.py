@@ -64,6 +64,8 @@ KLAXON_VARS = (
     "KLAXON_GDPR_CHECK_ON_SEARCH",
     "KLAXON_GDPR_INDEX",
     "KLAXON_CONFIG",
+    "KLAXON_SYNC_REINDEX_TIMEOUT",
+    "KLAXON_SYNC_TASK_TIMEOUT",
 )
 
 
@@ -262,22 +264,48 @@ class TestAnonymizationEnv:
     def test_masked_streams_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(
             "KLAXON_ANONYMIZATION_MASKED_STREAMS",
-            "klaxon-masked-customer-a-v5-*,klaxon-masked-customer-b-v5-*",
+            "klaxon-masked-customer-a-v5*,klaxon-masked-customer-b-v5*",
         )
         assert AnonymizationConfig.from_env().masked_streams == (
-            "klaxon-masked-customer-a-v5-*",
-            "klaxon-masked-customer-b-v5-*",
+            "klaxon-masked-customer-a-v5*",
+            "klaxon-masked-customer-b-v5*",
         )
 
     def test_masked_streams_env_tolerates_whitespace(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(
-            "KLAXON_ANONYMIZATION_MASKED_STREAMS", " klaxon-masked-a-v5-* "
+            "KLAXON_ANONYMIZATION_MASKED_STREAMS", " klaxon-masked-a-v5* "
         )
         assert AnonymizationConfig.from_env().masked_streams == (
-            "klaxon-masked-a-v5-*",
+            "klaxon-masked-a-v5*",
         )
+
+
+class TestSyncTimeouts:
+    """The Option B sync reindex uses a generous per-request timeout and a
+    separate overall task deadline (KLAXON_SYNC_REINDEX_TIMEOUT /
+    KLAXON_SYNC_TASK_TIMEOUT): the default short read timeout is what kills a
+    long-running `_reindex` at the transport level."""
+
+    def test_defaults_are_generous(self) -> None:
+        c = Config.from_env()
+        assert c.sync_reindex_timeout == 1800.0  # 30 min
+        assert c.sync_task_timeout == 3600.0  # 60 min
+
+    def test_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLAXON_SYNC_REINDEX_TIMEOUT", "900")
+        monkeypatch.setenv("KLAXON_SYNC_TASK_TIMEOUT", "7200")
+        c = Config.from_env()
+        assert c.sync_reindex_timeout == 900.0
+        assert c.sync_task_timeout == 7200.0
+
+    def test_a_non_numeric_timeout_is_a_config_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KLAXON_SYNC_REINDEX_TIMEOUT", "soon")
+        with pytest.raises(ConfigError, match="must be a number"):
+            Config.from_env()
 
 
 class TestQuarantineMaskedStreamsGuard:
@@ -292,7 +320,7 @@ class TestQuarantineMaskedStreamsGuard:
         assert config.quarantine_pattern_overlap("klaxon-quarantine-a-v5-*")
 
     def test_quarantine_pattern_overlap_allows_masked(self) -> None:
-        assert not config.quarantine_pattern_overlap("klaxon-masked-customer-a-v5-*")
+        assert not config.quarantine_pattern_overlap("klaxon-masked-customer-a-v5*")
         assert not config.quarantine_pattern_overlap("wazuh-events-v5-*")
         assert not config.quarantine_pattern_overlap("klaxon-masked-*")
 
@@ -311,10 +339,10 @@ class TestQuarantineMaskedStreamsGuard:
     def test_from_env_allows_only_masked(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(
             "KLAXON_ANONYMIZATION_MASKED_STREAMS",
-            "klaxon-masked-customer-a-v5-*",
+            "klaxon-masked-customer-a-v5*",
         )
         assert AnonymizationConfig.from_env().masked_streams == (
-            "klaxon-masked-customer-a-v5-*",
+            "klaxon-masked-customer-a-v5*",
         )
 
     def test_generated_config_fragment_never_adds_quarantine(self) -> None:
@@ -325,7 +353,7 @@ class TestQuarantineMaskedStreamsGuard:
 
         data = yaml.safe_load(build_config_fragment(load_tenant_config("customer-a")))
         streams = data["anonymization"]["masked_streams"]
-        assert streams == ["klaxon-masked-customer-a-v5-*"]
+        assert streams == ["klaxon-masked-customer-a-v5*"]
         for stream in streams:
             assert not config.quarantine_pattern_overlap(stream)
 
@@ -441,12 +469,12 @@ class TestAnonymizationYaml:
     def test_yaml_masked_streams(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         path = tmp_path / "config.yaml"
         path.write_text(
-            "anonymization:\n  masked_streams:\n    - klaxon-masked-customer-a-v5-*\n",
+            "anonymization:\n  masked_streams:\n    - klaxon-masked-customer-a-v5*\n",
             encoding="utf-8",
         )
         monkeypatch.setenv("KLAXON_CONFIG", str(path))
         assert AnonymizationConfig.from_env().masked_streams == (
-            "klaxon-masked-customer-a-v5-*",
+            "klaxon-masked-customer-a-v5*",
         )
 
     def test_env_beats_yaml_masked_streams(
@@ -454,15 +482,15 @@ class TestAnonymizationYaml:
     ) -> None:
         path = tmp_path / "config.yaml"
         path.write_text(
-            "anonymization:\n  masked_streams:\n    - klaxon-masked-a-v5-*\n",
+            "anonymization:\n  masked_streams:\n    - klaxon-masked-a-v5*\n",
             encoding="utf-8",
         )
         monkeypatch.setenv("KLAXON_CONFIG", str(path))
         monkeypatch.setenv(
-            "KLAXON_ANONYMIZATION_MASKED_STREAMS", "klaxon-masked-b-v5-*"
+            "KLAXON_ANONYMIZATION_MASKED_STREAMS", "klaxon-masked-b-v5*"
         )
         assert AnonymizationConfig.from_env().masked_streams == (
-            "klaxon-masked-b-v5-*",
+            "klaxon-masked-b-v5*",
         )
 
     def test_env_and_yaml_mask_fields_conflict_is_fail_closed(

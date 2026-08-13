@@ -18,6 +18,7 @@ the caller still sees exactly what the API said.
 
 from __future__ import annotations
 
+import fnmatch
 from typing import Any
 
 from .clients import Response
@@ -39,15 +40,31 @@ SEARCH_SIZE_ENV = "WAZUH_SEARCH_MAX_SIZE"
 
 # The raw Wazuh 5 streams carry unmasked personal data. A query that targets one
 # of these (or a sub-pattern of them) is a RAW STREAM QUERY unless it goes to a
-# masked stream (klaxon-masked-<tenant>-v5-*). Derived from the canonical
+# masked stream (klaxon-masked-<tenant>-v5*). Derived from the canonical
 # pattern constants so the two never drift.
 _RAW_STREAM_PREFIXES = tuple(
     p.removesuffix("-*") for p in (EVENTS_PATTERN, FINDINGS_PATTERN)
 )
 
 
-def _is_raw_stream(index: str) -> bool:
-    """Whether an index pattern targets a raw Wazuh 5 stream (events/findings)."""
+def _matches_any(index: str, patterns: tuple[str, ...]) -> bool:
+    """Glob-match an index against the configured `masked_streams` allowlist."""
+    lowered = index.lower()
+    return any(fnmatch.fnmatchcase(lowered, p.lower()) for p in patterns)
+
+
+def _is_raw_stream(index: str, masked_streams: tuple[str, ...] = ()) -> bool:
+    """Whether an index pattern targets a raw Wazuh 5 stream (events/findings).
+
+    Raw-vs-masked is decided against the EFFECTIVE `masked_streams` value: an
+    index that matches a configured masked stream is explicitly recognised as
+    masked (never flagged raw) even though the raw namespaces (`wazuh-events-*`,
+    `wazuh-findings-*`) do not currently overlap `klaxon-masked-*`. This keeps
+    the banner aligned with the allowlist, so a query that resolves to the
+    masked data stream never shows `[RAW STREAM QUERY]`.
+    """
+    if _matches_any(index, masked_streams):
+        return False
     lowered = index.lower()
     return any(lowered.startswith(prefix) for prefix in _RAW_STREAM_PREFIXES)
 
@@ -64,7 +81,7 @@ def safety_banner(cfg: AnonymizationConfig, index: str) -> list[str]:
        blocked before it reaches an external model.
     3. The query targeted a raw Wazuh stream (`wazuh-events-v5-*` /
        `wazuh-findings-v5-*`) instead of a masked stream
-       (`klaxon-masked-<tenant>-v5-*`) — raw personal data may be present.
+       (`klaxon-masked-<tenant>-v5*`) — raw personal data may be present.
 
     The banner is emitted automatically, before any other diagnostics, on EVERY
     response that meets a condition — including zero-hit, error,
@@ -90,7 +107,7 @@ def safety_banner(cfg: AnonymizationConfig, index: str) -> list[str]:
         )
 
     # Condition 3: the query targeted a raw Wazuh stream instead of a masked one.
-    if _is_raw_stream(index):
+    if _is_raw_stream(index, cfg.masked_streams):
         masked = ", ".join(cfg.masked_streams) if cfg.masked_streams else "none configured"
         lines.append(
             f"[RAW STREAM QUERY] This query targeted {index!r} (raw); the masked "
