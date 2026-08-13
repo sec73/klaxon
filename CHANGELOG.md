@@ -10,6 +10,27 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`klaxon masking deploy` no longer fails with HTTP 409 when an ISM policy
+  already exists.** ISM policies are versioned documents: updating an existing
+  one requires `?if_seq_no=<seq>&if_primary_term=<term>` taken from a prior
+  GET, and a plain PUT returns 409 "version conflict, document already exists".
+  The ISM deploy step now GETs the policy first (ONE GET, reused): missing
+  (404) -> plain PUT (create); identical (server-managed keys `policy_id` /
+  `last_updated_time` / `schema_version` / `error_notification` are ignored in
+  the fingerprint, so the no-op works against a live cluster) -> `[skip] ISM
+  <id> unchanged`; different -> versioned PUT with the GET's seq/term. A 409
+  (a concurrent change landing between GET and PUT) is retried once with a
+  fresh GET + PUT, then fails with a clear message. The pipeline step now also
+  GET-compares and skips when identical, so a re-run is a full no-op for the
+  pipeline and both ISM policies. The security roles API is verified as
+  200-overwrite (no optimistic concurrency), so roles keep their plain PUT +
+  GET-back verify. In `deploy.py`: `_put_ism_verified`, `_get_ism_policy`,
+  `_verify_after_put`, `_ISM_SERVER_KEYS` / `_normalized_for_compare`; new unit
+  tests simulate missing / identical / different / 409-once / 409-twice against
+  a mocked indexer (`tests/test_deploy.py`). Pipeline/ISM re-run output
+  contract unchanged except the `[skip] ... unchanged` lines for the two
+  idempotent steps.
+
 - `klaxon_mcp.__version__` again matches the packaged version (`0.1.7`) after
   it had drifted from `pyproject.toml`. It is the fallback used when the
   installed-distribution metadata is unavailable (`generator_version()` in

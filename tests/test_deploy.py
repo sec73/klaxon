@@ -23,7 +23,7 @@ import httpx
 import pytest
 
 from klaxon_mcp import deploy
-from klaxon_mcp.masked_stream import load_tenant_config
+from klaxon_mcp.masked_stream import build_ism_policy, load_tenant_config
 from klaxon_mcp.tokens import token
 
 TEST_SALT = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -50,7 +50,15 @@ class FakeResp:
 
 
 class FakeIndexer:
-    """A stub OpenSearch indexer that echoes PUTs and answers the deploy queries."""
+    """A stub OpenSearch indexer that echoes PUTs and answers the deploy queries.
+
+    ISM policies are simulated as versioned documents like the real plugin:
+    GET returns `_seq_no`/`_primary_term` plus the server-managed policy keys,
+    and a versioned PUT fails with 409 when its `if_seq_no`/`if_primary_term`
+    no longer match. `ism_conflict_before_put=N` makes the NEXT N versioned
+    PUTs observe a stale version (a concurrent write landing between GET and
+    PUT) and answer 409.
+    """
 
     def __init__(
         self,
@@ -60,14 +68,22 @@ class FakeIndexer:
         deployed_pipeline: dict[str, Any] | None = None,
         sync_updated: str | None = None,
         reachable: bool = True,
+        ism_conflict_before_put: int = 0,
     ) -> None:
         self.salt = salt
         self.data_stream_present = data_stream_present
         self.deployed_pipeline = deployed_pipeline
         self.sync_updated = sync_updated
         self.reachable = reachable
+        self.ism_conflict_before_put = ism_conflict_before_put
         self.store: dict[str, Any] = {}  # path -> echoed body
-        self.puts: list[tuple[str, str, Any]] = []  # (method, path, body)
+        self.puts: list[tuple[str, str, Any, Any]] = []  # (method, path, body, params)
+        self.ism_meta: dict[str, dict[str, int]] = {}  # policy name -> version state
+        self._seq_counter = 0
+
+    def _next_seq(self) -> int:
+        self._seq_counter += 1
+        return self._seq_counter
 
     # -- helpers the deploy code calls ------------------------------------ #
     async def get(self, path: str) -> FakeResp:
@@ -91,10 +107,30 @@ class FakeIndexer:
         if path.startswith("/_plugins/_ism/policies/"):
             name = path.rsplit("/", 1)[1]
             if name in self.store:
+                meta = self.ism_meta.get(name, {})
                 stored = self.store[name]
-                if isinstance(stored, dict) and "policy" in stored:
-                    return FakeResp(200, {"policy": stored["policy"]})
-                return FakeResp(200, {"policy": stored})
+                policy = (
+                    stored["policy"]
+                    if isinstance(stored, dict) and "policy" in stored
+                    else stored
+                )
+                # Real ISM GET re-serves the policy with server-managed fields
+                # and the version metadata the deploy's versioned PUT needs.
+                served = dict(policy)
+                served.setdefault("policy_id", name)
+                served.setdefault("last_updated_time", 1_577_990_933_044)
+                served.setdefault("schema_version", 1)
+                served.setdefault("error_notification", None)
+                return FakeResp(
+                    200,
+                    {
+                        "_id": name,
+                        "_version": meta.get("version", 1),
+                        "_seq_no": meta.get("seq_no", 1),
+                        "_primary_term": meta.get("primary_term", 1),
+                        "policy": served,
+                    },
+                )
             return FakeResp(404, {"error": {"reason": "no such policy"}})
         if path.startswith("/_index_template/"):
             name = path.rsplit("/", 1)[1]
@@ -117,16 +153,62 @@ class FakeIndexer:
             return FakeResp(404, {})
         return FakeResp(404, {"error": {"reason": f"unexpected GET {path}"}})
 
-    async def put(self, path: str, content: str | None = None) -> FakeResp:
+    async def put(
+        self,
+        path: str,
+        content: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> FakeResp:
         if not self.reachable:
             raise RuntimeError(f"PUT {path} failed at transport level: boom")
-        self.puts.append(("PUT", path, content))
+        self.puts.append(("PUT", path, content, params))
         body = json.loads(content or "{}")
         if path.startswith("/_data_stream/"):
             # Creating a data stream: mark it present (auto-created by template).
             self.data_stream_present = True
             return FakeResp(200, {"acknowledged": True})
+        if path.startswith("/_plugins/_ism/policies/"):
+            return self._ism_put(path.rsplit("/", 1)[1], body, params)
         self.store[path.rsplit("/", 1)[1]] = body
+        return FakeResp(200, {"acknowledged": True})
+
+    def _ism_put(
+        self,
+        name: str,
+        body: dict[str, Any],
+        params: dict[str, Any] | None,
+    ) -> FakeResp:
+        """Simulate the ISM plugin's optimistic-concurrency write."""
+        meta = self.ism_meta.get(name)
+        if meta is None:
+            # Create: plain PUT on a missing policy always succeeds.
+            meta = {"version": 1, "seq_no": self._next_seq(), "primary_term": 1}
+            self.ism_meta[name] = meta
+            self.store[name] = body
+            return FakeResp(200, {"acknowledged": True})
+        if self.ism_conflict_before_put > 0:
+            # A concurrent write lands between the deploy's GET and PUT: bump
+            # the version so the if_seq_no the deploy read becomes stale -> 409.
+            self.ism_conflict_before_put -= 1
+            meta["seq_no"] = self._next_seq()
+        if params and (
+            params.get("if_seq_no") != meta["seq_no"]
+            or params.get("if_primary_term") != meta["primary_term"]
+        ):
+            return FakeResp(
+                409,
+                {
+                    "error": {
+                        "reason": (
+                            "version conflict, document already exists "
+                            f"(current version [{meta['version']}])"
+                        )
+                    }
+                },
+            )
+        meta["version"] += 1
+        meta["seq_no"] = self._next_seq()
+        self.store[name] = body
         return FakeResp(200, {"acknowledged": True})
 
     async def post(self, path: str, content: str | None = None) -> FakeResp:
@@ -283,7 +365,7 @@ class TestDeploy:
         fake = run_deploy()
         rc = deploy.deploy_main(["--tenant", "customer-a", "--force"])
         assert rc == 0
-        put_paths = [p for _, p, _ in fake.puts]
+        put_paths = [p for _, p, _, _ in fake.puts]
         # Fixed order: pipeline, ISM x2, templates x2, data stream, roles x3.
         assert put_paths[0] == "/_ingest/pipeline/klaxon-mask-customer-a"
         assert put_paths[1:3] == [
@@ -306,7 +388,7 @@ class TestDeploy:
         # Second run: a no-op that still verifies; data stream now skipped.
         rc2 = deploy.deploy_main(["--tenant", "customer-a", "--force"])
         assert rc2 == 0
-        assert fake.puts.count(("PUT", "/_data_stream/klaxon-masked-customer-a-v5", "{}")) == 1
+        assert fake.puts.count(("PUT", "/_data_stream/klaxon-masked-customer-a-v5", "{}", None)) == 1
 
     def test_roles_yaml_to_json_in_code(self, env: None, run_deploy: Any) -> None:
         # The roles fragment is YAML; the deploy must PUT JSON role bodies.
@@ -363,13 +445,124 @@ class TestRollback:
         # The snapshot pipeline was PUT back.
         assert any(
             p == "/_ingest/pipeline/klaxon-mask-customer-a" and "old()" in (c or "")
-            for _, p, c in fake.puts
+            for _, p, c, _ in fake.puts
         )
 
     def test_rollback_without_snapshot_fails(self, env: None, run_deploy: Any) -> None:
         run_deploy()
         rc = deploy.deploy_main(["--tenant", "customer-a", "--rollback"])
         assert rc == 1
+
+
+class TestIsmOptimisticConcurrency:
+    """ISM policies are versioned documents: the deploy must GET-first, skip
+    when identical, update with if_seq_no/if_primary_term when different,
+    create with a plain PUT when missing, and retry-once a 409.
+    """
+
+    ISM_PATH = "/_plugins/_ism/policies/klaxon-masked-retention-customer-a"
+    LABEL = "ISM klaxon-masked-retention-customer-a"
+
+    @staticmethod
+    def _policy(retention_days: int = 30) -> dict[str, Any]:
+        return build_ism_policy(load_tenant_config("customer-a"), retention_days)
+
+    def _ism_puts(self, fake: FakeIndexer) -> list[tuple[str, Any]]:
+        return [
+            (p, prm)
+            for m, p, c, prm in fake.puts
+            if p.startswith("/_plugins/_ism/policies/")
+        ]
+
+    async def test_missing_ism_created_with_plain_put(self) -> None:
+        fake = FakeIndexer()
+        lines: list[str] = []
+        ok = await deploy._put_ism_verified(
+            fake, self.LABEL, self.ISM_PATH, self._policy(), lines=lines
+        )
+        assert ok
+        ism_puts = self._ism_puts(fake)
+        assert len(ism_puts) == 1  # one plain PUT
+        assert ism_puts[0][1] is None  # no version params on a create
+        assert lines[0].startswith("[ok] ISM")
+
+    async def test_existing_identical_ism_skips(self) -> None:
+        fake = FakeIndexer()
+        policy = self._policy()
+        await fake.put(self.ISM_PATH, content=json.dumps(policy))
+        lines: list[str] = []
+        ok = await deploy._put_ism_verified(
+            fake, self.LABEL, self.ISM_PATH, policy, lines=lines
+        )
+        assert ok
+        # The pre-create PUT is the only ISM write — the re-deploy skipped.
+        assert len(self._ism_puts(fake)) == 1
+        assert lines == [f"[skip] {self.LABEL} unchanged"]
+
+    async def test_existing_different_ism_uses_versioned_put(self) -> None:
+        fake = FakeIndexer()
+        # Pre-create with a DIFFERENT retention so the artifact differs.
+        await fake.put(
+            self.ISM_PATH, content=json.dumps(self._policy(retention_days=7))
+        )
+        lines: list[str] = []
+        ok = await deploy._put_ism_verified(
+            fake, self.LABEL, self.ISM_PATH, self._policy(), lines=lines
+        )
+        assert ok
+        ism_puts = self._ism_puts(fake)
+        assert len(ism_puts) == 2  # pre-create + versioned update
+        assert ism_puts[1][1] == {"if_seq_no": 1, "if_primary_term": 1}
+        assert lines[0].startswith("[ok] ISM")
+
+    async def test_409_once_retries_and_succeeds(self) -> None:
+        fake = FakeIndexer(ism_conflict_before_put=1)
+        await fake.put(
+            self.ISM_PATH, content=json.dumps(self._policy(retention_days=7))
+        )
+        lines: list[str] = []
+        ok = await deploy._put_ism_verified(
+            fake, self.LABEL, self.ISM_PATH, self._policy(), lines=lines
+        )
+        assert ok
+        ism_puts = self._ism_puts(fake)
+        assert len(ism_puts) == 3  # pre-create + stale PUT (409) + retried PUT
+        assert ism_puts[1][1] == {"if_seq_no": 1, "if_primary_term": 1}  # stale
+        assert ism_puts[2][1] == {"if_seq_no": 2, "if_primary_term": 1}  # fresh
+        assert any(l.startswith("[retry]") for l in lines)
+        assert lines[-1].startswith("[ok] ISM")
+
+    async def test_409_twice_fails_with_clear_message(self) -> None:
+        fake = FakeIndexer(ism_conflict_before_put=2)
+        await fake.put(
+            self.ISM_PATH, content=json.dumps(self._policy(retention_days=7))
+        )
+        lines: list[str] = []
+        ok = await deploy._put_ism_verified(
+            fake, self.LABEL, self.ISM_PATH, self._policy(), lines=lines
+        )
+        assert not ok
+        # pre-create + attempt 1 (stale, 409) + attempt 2 (stale, 409) -> fail.
+        assert len(self._ism_puts(fake)) == 3
+        assert sum(1 for l in lines if l.startswith("[retry]")) == 1
+        assert lines[-1].startswith("[fail]")
+        assert "HTTP 409" in lines[-1]
+        assert "re-run the deploy" in lines[-1]
+
+    def test_end_to_end_rerun_is_a_noop_for_pipeline_and_ism(
+        self, env: None, run_deploy: Any, capsys: Any
+    ) -> None:
+        fake = run_deploy()
+        assert deploy.deploy_main(["--tenant", "customer-a", "--force"]) == 0
+        capsys.readouterr()  # clear run 1 output
+        ism_puts_after_first = len(self._ism_puts(fake))
+        assert deploy.deploy_main(["--tenant", "customer-a", "--force"]) == 0
+        out = capsys.readouterr().out
+        # Run 2 writes no ISM policy (identical -> skip) and skips the pipeline.
+        assert len(self._ism_puts(fake)) == ism_puts_after_first
+        assert "[skip] pipeline klaxon-mask-customer-a unchanged" in out
+        assert "[skip] ISM klaxon-masked-retention-customer-a unchanged" in out
+        assert "[skip] ISM klaxon-quarantine-retention-customer-a unchanged" in out
 
 
 class TestNoSecretOutput:

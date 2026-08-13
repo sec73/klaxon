@@ -23,8 +23,10 @@ artifacts to the indexer in ONE step:
        byte-identical to derive_token)
 
   ordered deployment (each step idempotent, verified after every PUT):
-    1. pipeline            PUT /_ingest/pipeline/klaxon-mask-<tenant>
-    2. ISM policies (both) PUT /_plugins/_ism/policies/...
+    1. pipeline            PUT /_ingest/pipeline/klaxon-mask-<tenant> (skipped
+                           when already identical)
+    2. ISM policies (both) GET-first compare/skip; versioned PUT
+                           (?if_seq_no&if_primary_term, one 409 retry)
     3. index templates (both)  PUT /_index_template/...
     4. masked data stream  create only if absent (already exists == success)
     5. roles               roles-<tenant>.yaml converted to JSON IN CODE (no yq)
@@ -90,6 +92,14 @@ _IGNORED_WRAPPER_KEYS = frozenset(
     {"_id", "_index", "_version", "_seq_no", "_primary_term", "_source", "_meta"}
 )
 
+# Keys the ISM plugin adds when it stores/re-serves a policy: a GET body carries
+# them, the PUT body never does. Dropped before any fingerprint comparison so
+# "identical" means the deployable policy CONTENT matches on a live cluster —
+# otherwise a re-run could neither skip nor verify an ISM policy.
+_ISM_SERVER_KEYS = frozenset(
+    {"policy_id", "last_updated_time", "schema_version", "error_notification"}
+)
+
 
 def _ts() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -117,6 +127,20 @@ def _sent_resource(kind: str, body: Any) -> Any:
     if kind == "ism" and isinstance(body, dict):
         return _drop_wrapper_keys(body.get("policy", body))
     return _drop_wrapper_keys(body)
+
+
+def _normalized_for_compare(kind: str, obj: Any) -> Any:
+    """Normalize a resource body for the fingerprint comparison.
+
+    Drops the OpenSearch wrapper keys around a served resource plus per-kind
+    server-managed fields (the ISM plugin's policy_id / last_updated_time /
+    schema_version / error_notification) that a GET returns but a PUT body
+    never carries.
+    """
+    obj = _drop_wrapper_keys(obj)
+    if kind == "ism" and isinstance(obj, dict):
+        return {k: v for k, v in obj.items() if k not in _ISM_SERVER_KEYS}
+    return obj
 
 
 def _extract_resource(kind: str, path: str, parsed: Any) -> dict[str, Any] | None:
@@ -153,7 +177,7 @@ async def _get_resource(
     return _extract_resource(kind, path, resp.json())
 
 
-async def _put_verified(
+async def _verify_after_put(
     client: httpx.AsyncClient,
     label: str,
     path: str,
@@ -162,23 +186,13 @@ async def _put_verified(
     kind: str,
     lines: list[str],
 ) -> bool:
-    """PUT a resource, then GET it back and assert the fingerprint matches.
-
-    Appends an `[ok]`/`[skip]`/`[fail]` line. Returns success.
-    """
-    resp = await client.put(path, content=json.dumps(body))
-    if not resp.is_success:
-        lines.append(
-            f"[fail] {label}: PUT returned HTTP {resp.status_code} — {_error_detail(resp)}"
-        )
-        return False
-    sent = _sent_resource(kind, body)
+    """GET the resource back and assert the deployed content matches what was sent."""
+    sent = _normalized_for_compare(kind, _sent_resource(kind, body))
     received = await _get_resource(client, kind, path)
     if received is None:
         lines.append(f"[fail] {label}: PUT ok but GET back failed/empty — verify")
         return False
-    received_norm = _drop_wrapper_keys(received)
-    if _fingerprint(received_norm) != _fingerprint(sent):
+    if _fingerprint(_normalized_for_compare(kind, received)) != _fingerprint(sent):
         lines.append(
             f"[fail] {label}: deployed resource does not match what was sent "
             "(verify) — fingerprint differs"
@@ -186,6 +200,145 @@ async def _put_verified(
         return False
     lines.append(f"[ok] {label} (verified)")
     return True
+
+
+async def _put_verified(
+    client: httpx.AsyncClient,
+    label: str,
+    path: str,
+    body: Any,
+    *,
+    kind: str,
+    lines: list[str],
+    skip_if_identical: bool = False,
+) -> bool:
+    """PUT a resource, then GET it back and assert the fingerprint matches.
+
+    With `skip_if_identical=True` the current resource is GET first and the PUT
+    is skipped (idempotent no-op) when it already matches the artifact.
+    Appends an `[ok]`/`[skip]`/`[fail]` line. Returns success.
+    """
+    if skip_if_identical:
+        existing = await _get_resource(client, kind, path)
+        if existing is not None and _fingerprint(
+            _normalized_for_compare(kind, existing)
+        ) == _fingerprint(_normalized_for_compare(kind, _sent_resource(kind, body))):
+            lines.append(f"[skip] {label} unchanged")
+            return True
+    resp = await client.put(path, content=json.dumps(body))
+    if not resp.is_success:
+        lines.append(
+            f"[fail] {label}: PUT returned HTTP {resp.status_code} — {_error_detail(resp)}"
+        )
+        return False
+    return await _verify_after_put(client, label, path, body, kind=kind, lines=lines)
+
+
+async def _get_ism_policy(
+    client: httpx.AsyncClient, path: str
+) -> tuple[dict[str, Any] | None, int | None, int | None]:
+    """GET an ISM policy: (policy body, seq_no, primary_term).
+
+    `(None, None, None)` when the policy is absent (404) or not a readable
+    policy. `seq_no`/`primary_term` come from the SAME response as the body, so
+    the deploy reuses one GET for both the compare and the versioned update
+    (no second request).
+    """
+    resp = await client.get(path)
+    if resp.status_code == 404 or not resp.is_success:
+        return None, None, None
+    try:
+        parsed = resp.json()
+    except ValueError:
+        return None, None, None
+    if not isinstance(parsed, dict):
+        return None, None, None
+    body = parsed.get("policy")
+    if not isinstance(body, dict):
+        return None, None, None
+    seq_no = parsed.get("_seq_no")
+    primary_term = parsed.get("_primary_term")
+    return body, seq_no, primary_term
+
+
+async def _put_ism_verified(
+    client: httpx.AsyncClient,
+    label: str,
+    path: str,
+    body: dict[str, Any],
+    *,
+    lines: list[str],
+) -> bool:
+    """Deploy an ISM policy with optimistic concurrency (no 409 on re-deploy).
+
+    ISM policies are versioned documents: updating an existing policy requires
+    `?if_seq_no=<seq>&if_primary_term=<term>` taken from a prior GET; a plain
+    PUT on an existing policy returns HTTP 409 "version conflict". So, unlike
+    the other resources:
+
+      1. GET the policy first (ONE GET, reused) — 404 -> plain PUT (create);
+      2. 200 -> compare the deployed policy (server-managed fields ignored)
+         with the artifact: identical -> `[skip] ... unchanged`; different ->
+         PUT with the GET's seq/term (update);
+      3. a 409 (a concurrent change landed between GET and PUT) is retried once
+         with a fresh GET + PUT; a second 409 fails with a clear message;
+      4. every PUT is verified with a GET-back fingerprint check.
+    """
+    sent = _sent_resource("ism", body)
+    for attempt in (1, 2):
+        existing, seq_no, primary_term = await _get_ism_policy(client, path)
+        if existing is None:
+            # Missing -> create with a plain PUT (no version params).
+            resp = await client.put(path, content=json.dumps(body))
+            if not resp.is_success:
+                lines.append(
+                    f"[fail] {label}: PUT returned HTTP {resp.status_code} — "
+                    f"{_error_detail(resp)}"
+                )
+                return False
+            return await _verify_after_put(
+                client, label, path, body, kind="ism", lines=lines
+            )
+        if _fingerprint(_normalized_for_compare("ism", existing)) == _fingerprint(
+            _normalized_for_compare("ism", sent)
+        ):
+            lines.append(f"[skip] {label} unchanged")
+            return True
+        # Existing but different -> update with optimistic concurrency.
+        if seq_no is None or primary_term is None:
+            lines.append(
+                f"[fail] {label}: existing policy GET carried no seq_no/"
+                "primary_term — cannot issue a versioned update"
+            )
+            return False
+        params: dict[str, Any] = {
+            "if_seq_no": seq_no,
+            "if_primary_term": primary_term,
+        }
+        resp = await client.put(path, params=params, content=json.dumps(body))
+        if resp.status_code == 409:
+            if attempt == 1:
+                lines.append(
+                    f"[retry] {label}: version conflict (HTTP 409) — re-reading "
+                    "the policy and retrying once"
+                )
+                continue
+            lines.append(
+                f"[fail] {label}: version conflict (HTTP 409) persisted after "
+                "one retry — the policy changed concurrently between GET and "
+                "PUT; re-run the deploy"
+            )
+            return False
+        if not resp.is_success:
+            lines.append(
+                f"[fail] {label}: PUT returned HTTP {resp.status_code} — "
+                f"{_error_detail(resp)}"
+            )
+            return False
+        return await _verify_after_put(
+            client, label, path, body, kind="ism", lines=lines
+        )
+    return False  # pragma: no cover
 
 
 def _error_detail(resp: httpx.Response) -> str:
@@ -350,7 +503,7 @@ async def _deploy_core(
     quarantine_template = build_quarantine_index_template(cfg, mappings)
     roles, mappings_cfg = _parse_roles_fragment(cfg)
 
-    # 1. Pipeline
+    # 1. Pipeline (GET-first compare: re-deploying an identical pipeline is a no-op).
     if not await _put_verified(
         client,
         f"pipeline {cfg.pipeline_name}",
@@ -358,24 +511,24 @@ async def _deploy_core(
         pipeline,
         kind="pipeline",
         lines=lines,
+        skip_if_identical=True,
     ):
         return False
-    # 2. ISM policies (both)
-    if not await _put_verified(
+    # 2. ISM policies (both) — versioned documents: GET-first compare/skip,
+    #    versioned update (if_seq_no/if_primary_term), one 409 retry.
+    if not await _put_ism_verified(
         client,
         f"ISM {cfg.ism_policy_name}",
         f"/_plugins/_ism/policies/{cfg.ism_policy_name}",
         ism,
-        kind="ism",
         lines=lines,
     ):
         return False
-    if not await _put_verified(
+    if not await _put_ism_verified(
         client,
         f"ISM {cfg.quarantine_ism_policy_name}",
         f"/_plugins/_ism/policies/{cfg.quarantine_ism_policy_name}",
         quarantine_ism,
-        kind="ism",
         lines=lines,
     ):
         return False
