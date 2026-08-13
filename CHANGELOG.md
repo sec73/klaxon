@@ -24,12 +24,28 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   GET-compares and skips when identical, so a re-run is a full no-op for the
   pipeline and both ISM policies. The security roles API is verified as
   200-overwrite (no optimistic concurrency), so roles keep their plain PUT +
-  GET-back verify. In `deploy.py`: `_put_ism_verified`, `_get_ism_policy`,
+  GET-back verify. In `deploy.py`: `_put_ism_policy`, `_get_ism_policy`,
   `_verify_after_put`, `_ISM_SERVER_KEYS` / `_normalized_for_compare`; new unit
   tests simulate missing / identical / different / 409-once / 409-twice against
   a mocked indexer (`tests/test_deploy.py`). Pipeline/ISM re-run output
   contract unchanged except the `[skip] ... unchanged` lines for the two
   idempotent steps.
+
+- **`klaxon masking deploy --rollback` no longer fails with HTTP 409 on the
+  ISM step.** The rollback path re-deployed ISM policies with a plain PUT, which
+  a versioned ISM document rejects with 409 "version conflict, document already
+  exists". Rollback now goes through the SAME shared helper as deploy —
+  `_put_ism_policy` (formerly `_put_ism_verified`) — for both the masked and
+  the quarantine policy: GET-first compare/skip (an unchanged policy is a
+  no-op, so a second `--rollback` writes nothing), versioned PUT
+  (`?if_seq_no&if_primary_term` from a fresh GET, never a stale seq), and one
+  409 retry before failing with a clear message. The duplicated plain-PUT in
+  the rollback path is gone; the rollback output contract is unchanged except
+  the `[skip] rollback ism-* <id> unchanged` no-op line. Unit tests cover all
+  five cases (missing / identical / different / 409-once / 409-twice) for BOTH
+  the deploy and the rollback path, plus the ISM GET `_seq_no`/`_primary_term`
+  shape and an end-to-end rollback/no-op second rollback
+  (`tests/test_deploy.py`).
 
 - `klaxon_mcp.__version__` again matches the packaged version (`0.1.7`) after
   it had drifted from `pyproject.toml`. It is the fallback used when the

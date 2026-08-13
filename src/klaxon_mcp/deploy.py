@@ -241,8 +241,8 @@ async def _get_ism_policy(
 
     `(None, None, None)` when the policy is absent (404) or not a readable
     policy. `seq_no`/`primary_term` come from the SAME response as the body, so
-    the deploy reuses one GET for both the compare and the versioned update
-    (no second request).
+    the shared ISM write path reuses one GET for both the compare and the
+    versioned update (no second request).
     """
     resp = await client.get(path)
     if resp.status_code == 404 or not resp.is_success:
@@ -261,7 +261,7 @@ async def _get_ism_policy(
     return body, seq_no, primary_term
 
 
-async def _put_ism_verified(
+async def _put_ism_policy(
     client: httpx.AsyncClient,
     label: str,
     path: str,
@@ -271,17 +271,24 @@ async def _put_ism_verified(
 ) -> bool:
     """Deploy an ISM policy with optimistic concurrency (no 409 on re-deploy).
 
-    ISM policies are versioned documents: updating an existing policy requires
-    `?if_seq_no=<seq>&if_primary_term=<term>` taken from a prior GET; a plain
-    PUT on an existing policy returns HTTP 409 "version conflict". So, unlike
-    the other resources:
+    THE shared ISM write path — used by BOTH `deploy` and `--rollback`, for the
+    masked AND quarantine policies. It replaces the duplicated plain-PUT in the
+    rollback path, which died with HTTP 409 "version conflict, document already
+    exists" whenever it touched an existing ISM policy.
 
-      1. GET the policy first (ONE GET, reused) — 404 -> plain PUT (create);
+    ISM policies are versioned documents: updating an existing policy requires
+    `?if_seq_no=<seq>&if_primary_term=<term>` taken from a FRESH GET; a plain
+    PUT on an existing policy returns HTTP 409. So, unlike the other resources:
+
+      1. GET the policy first (fresh, inside this helper; ONE GET reused) —
+         404 -> plain PUT (create);
       2. 200 -> compare the deployed policy (server-managed fields ignored)
-         with the artifact: identical -> `[skip] ... unchanged`; different ->
-         PUT with the GET's seq/term (update);
+         with the artifact: identical -> `[skip] {label} unchanged` (no write
+         at all — makes a re-deploy / a repeat rollback a no-op); different ->
+         PUT with the GET's seq/term (versioned update);
       3. a 409 (a concurrent change landed between GET and PUT) is retried once
-         with a fresh GET + PUT; a second 409 fails with a clear message;
+         with a fresh GET + PUT (a stale seq is NEVER reused); a second 409
+         fails with a clear message;
       4. every PUT is verified with a GET-back fingerprint check.
     """
     sent = _sent_resource("ism", body)
@@ -516,7 +523,7 @@ async def _deploy_core(
         return False
     # 2. ISM policies (both) — versioned documents: GET-first compare/skip,
     #    versioned update (if_seq_no/if_primary_term), one 409 retry.
-    if not await _put_ism_verified(
+    if not await _put_ism_policy(
         client,
         f"ISM {cfg.ism_policy_name}",
         f"/_plugins/_ism/policies/{cfg.ism_policy_name}",
@@ -524,7 +531,7 @@ async def _deploy_core(
         lines=lines,
     ):
         return False
-    if not await _put_ism_verified(
+    if not await _put_ism_policy(
         client,
         f"ISM {cfg.quarantine_ism_policy_name}",
         f"/_plugins/_ism/policies/{cfg.quarantine_ism_policy_name}",
@@ -726,9 +733,19 @@ async def _rollback(
             "template-masked": f"/_index_template/{name}",
             "template-quarantine": f"/_index_template/{name}",
         }[resource]
-        if not await _put_verified(
-            client, f"rollback {resource} {name}", target, body, kind=kind, lines=lines
-        ):
+        # ISM policies are versioned documents — the shared _put_ism_policy
+        # helper GET-first-compares/skips and issues a versioned PUT (plain PUT
+        # on an existing policy would 409). Everything else keeps the plain
+        # PUT + GET-back verify.
+        if kind == "ism":
+            ok = await _put_ism_policy(
+                client, f"rollback {resource} {name}", target, body, lines=lines
+            )
+        else:
+            ok = await _put_verified(
+                client, f"rollback {resource} {name}", target, body, kind=kind, lines=lines
+            )
+        if not ok:
             return False
     return True
 

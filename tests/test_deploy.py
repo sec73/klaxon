@@ -477,7 +477,7 @@ class TestIsmOptimisticConcurrency:
     async def test_missing_ism_created_with_plain_put(self) -> None:
         fake = FakeIndexer()
         lines: list[str] = []
-        ok = await deploy._put_ism_verified(
+        ok = await deploy._put_ism_policy(
             fake, self.LABEL, self.ISM_PATH, self._policy(), lines=lines
         )
         assert ok
@@ -491,7 +491,7 @@ class TestIsmOptimisticConcurrency:
         policy = self._policy()
         await fake.put(self.ISM_PATH, content=json.dumps(policy))
         lines: list[str] = []
-        ok = await deploy._put_ism_verified(
+        ok = await deploy._put_ism_policy(
             fake, self.LABEL, self.ISM_PATH, policy, lines=lines
         )
         assert ok
@@ -506,7 +506,7 @@ class TestIsmOptimisticConcurrency:
             self.ISM_PATH, content=json.dumps(self._policy(retention_days=7))
         )
         lines: list[str] = []
-        ok = await deploy._put_ism_verified(
+        ok = await deploy._put_ism_policy(
             fake, self.LABEL, self.ISM_PATH, self._policy(), lines=lines
         )
         assert ok
@@ -521,7 +521,7 @@ class TestIsmOptimisticConcurrency:
             self.ISM_PATH, content=json.dumps(self._policy(retention_days=7))
         )
         lines: list[str] = []
-        ok = await deploy._put_ism_verified(
+        ok = await deploy._put_ism_policy(
             fake, self.LABEL, self.ISM_PATH, self._policy(), lines=lines
         )
         assert ok
@@ -538,7 +538,7 @@ class TestIsmOptimisticConcurrency:
             self.ISM_PATH, content=json.dumps(self._policy(retention_days=7))
         )
         lines: list[str] = []
-        ok = await deploy._put_ism_verified(
+        ok = await deploy._put_ism_policy(
             fake, self.LABEL, self.ISM_PATH, self._policy(), lines=lines
         )
         assert not ok
@@ -548,6 +548,26 @@ class TestIsmOptimisticConcurrency:
         assert lines[-1].startswith("[fail]")
         assert "HTTP 409" in lines[-1]
         assert "re-run the deploy" in lines[-1]
+
+    async def test_get_ism_policy_exposes_seq_and_primary_term(self) -> None:
+        # The real ISM GET returns _seq_no/_primary_term at the TOP level of the
+        # response, next to the wrapped policy — the versioned PUT reads them
+        # from the SAME GET. Assert the helper parses that shape.
+        fake = FakeIndexer()
+        await fake.put(self.ISM_PATH, content=json.dumps(self._policy()))
+        body, seq_no, primary_term = await deploy._get_ism_policy(
+            fake, self.ISM_PATH
+        )
+        assert isinstance(body, dict)
+        assert body.get("description")  # the unwrapped policy body
+        assert (seq_no, primary_term) == (1, 1)
+
+    async def test_get_ism_policy_missing_returns_none(self) -> None:
+        fake = FakeIndexer()
+        body, seq_no, primary_term = await deploy._get_ism_policy(
+            fake, self.ISM_PATH
+        )
+        assert (body, seq_no, primary_term) == (None, None, None)
 
     def test_end_to_end_rerun_is_a_noop_for_pipeline_and_ism(
         self, env: None, run_deploy: Any, capsys: Any
@@ -563,6 +583,167 @@ class TestIsmOptimisticConcurrency:
         assert "[skip] pipeline klaxon-mask-customer-a unchanged" in out
         assert "[skip] ISM klaxon-masked-retention-customer-a unchanged" in out
         assert "[skip] ISM klaxon-quarantine-retention-customer-a unchanged" in out
+
+
+class TestRollbackIsmOptimisticConcurrency:
+    """Regression: `--rollback` must re-deploy ISM policies through the SAME
+    shared helper as deploy (_put_ism_policy). It used a plain PUT on an
+    existing ISM policy and died with HTTP 409 "version conflict, document
+    already exists"; it must GET-first-compare/skip, issue a versioned PUT
+    (if_seq_no/if_primary_term), and retry-once a 409 — exactly like deploy.
+    """
+
+    ISM_PATH = "/_plugins/_ism/policies/klaxon-masked-retention-customer-a"
+
+    @staticmethod
+    def _policy(retention_days: int = 30) -> dict[str, Any]:
+        return build_ism_policy(load_tenant_config("customer-a"), retention_days)
+
+    def _ism_puts(self, fake: FakeIndexer) -> list[tuple[str, Any]]:
+        return [
+            (p, prm)
+            for m, p, c, prm in fake.puts
+            if p.startswith("/_plugins/_ism/policies/")
+        ]
+
+    @staticmethod
+    def _snapshot(tmp_path: Any, **files: dict[str, Any]) -> Any:
+        """A snapshot dir holding the given `NN-<resource>.json` files."""
+        snap = tmp_path / "snap"
+        snap.mkdir(parents=True, exist_ok=True)
+        for name, body in files.items():
+            (snap / name).write_text(json.dumps(body), encoding="utf-8")
+        return snap
+
+    async def test_rollback_missing_ism_uses_plain_put(self, tmp_path: Any) -> None:
+        # No live policy -> 404 -> plain PUT (create), just like deploy.
+        fake = FakeIndexer()
+        snap = self._snapshot(
+            tmp_path, **{"02-ism-masked.json": self._policy(retention_days=7)["policy"]}
+        )
+        lines: list[str] = []
+        ok = await deploy._rollback(fake, load_tenant_config("customer-a"), snap, lines)
+        assert ok
+        ism_puts = self._ism_puts(fake)
+        assert len(ism_puts) == 1  # one plain PUT
+        assert ism_puts[0][1] is None  # no version params on a create
+        assert lines[0].startswith("[ok] rollback ism-masked")
+
+    async def test_rollback_existing_identical_ism_skips(self, tmp_path: Any) -> None:
+        # Live policy already matches the snapshot -> no write at all.
+        fake = FakeIndexer()
+        await fake.put(
+            self.ISM_PATH, content=json.dumps(self._policy(retention_days=7))
+        )
+        snap = self._snapshot(
+            tmp_path, **{"02-ism-masked.json": self._policy(retention_days=7)["policy"]}
+        )
+        lines: list[str] = []
+        ok = await deploy._rollback(fake, load_tenant_config("customer-a"), snap, lines)
+        assert ok
+        # The pre-create PUT is the only ISM write — the rollback skipped.
+        assert len(self._ism_puts(fake)) == 1
+        assert lines == [
+            "[skip] rollback ism-masked klaxon-masked-retention-customer-a unchanged"
+        ]
+
+    async def test_rollback_existing_different_ism_uses_versioned_put(
+        self, tmp_path: Any
+    ) -> None:
+        # Live policy differs from the snapshot -> VERSIONED PUT (a plain PUT
+        # would have 409'd). The deployed policy ends at the snapshot content.
+        fake = FakeIndexer()
+        await fake.put(
+            self.ISM_PATH, content=json.dumps(self._policy(retention_days=30))
+        )
+        snap = self._snapshot(
+            tmp_path, **{"02-ism-masked.json": self._policy(retention_days=7)["policy"]}
+        )
+        lines: list[str] = []
+        ok = await deploy._rollback(fake, load_tenant_config("customer-a"), snap, lines)
+        assert ok
+        ism_puts = self._ism_puts(fake)
+        assert len(ism_puts) == 2  # pre-create + versioned update
+        assert ism_puts[1][1] == {"if_seq_no": 1, "if_primary_term": 1}
+        # Live policy now holds the snapshot content (retention 7d).
+        live = fake.store["klaxon-masked-retention-customer-a"]["policy"]
+        assert live["states"][0]["transitions"][0]["conditions"]["min_index_age"] == "7d"
+        assert lines[0].startswith("[ok] rollback ism-masked")
+
+    async def test_rollback_409_once_retries_and_succeeds(self, tmp_path: Any) -> None:
+        fake = FakeIndexer(ism_conflict_before_put=1)
+        await fake.put(
+            self.ISM_PATH, content=json.dumps(self._policy(retention_days=30))
+        )
+        snap = self._snapshot(
+            tmp_path, **{"02-ism-masked.json": self._policy(retention_days=7)["policy"]}
+        )
+        lines: list[str] = []
+        ok = await deploy._rollback(fake, load_tenant_config("customer-a"), snap, lines)
+        assert ok
+        ism_puts = self._ism_puts(fake)
+        assert len(ism_puts) == 3  # pre-create + stale PUT (409) + retried PUT
+        assert ism_puts[1][1] == {"if_seq_no": 1, "if_primary_term": 1}  # stale
+        assert ism_puts[2][1] == {"if_seq_no": 2, "if_primary_term": 1}  # fresh
+        assert any(l.startswith("[retry]") for l in lines)
+        assert lines[-1].startswith("[ok] rollback ism-masked")
+
+    async def test_rollback_409_twice_fails_with_clear_message(
+        self, tmp_path: Any
+    ) -> None:
+        fake = FakeIndexer(ism_conflict_before_put=2)
+        await fake.put(
+            self.ISM_PATH, content=json.dumps(self._policy(retention_days=30))
+        )
+        snap = self._snapshot(
+            tmp_path, **{"02-ism-masked.json": self._policy(retention_days=7)["policy"]}
+        )
+        lines: list[str] = []
+        ok = await deploy._rollback(fake, load_tenant_config("customer-a"), snap, lines)
+        assert not ok
+        assert len(self._ism_puts(fake)) == 3
+        assert sum(1 for l in lines if l.startswith("[retry]")) == 1
+        assert lines[-1].startswith("[fail]")
+        assert "HTTP 409" in lines[-1]
+        assert "re-run the deploy" in lines[-1]
+
+    def test_rollback_end_to_end_restores_and_is_a_noop_second_time(
+        self, env: None, run_deploy: Any, tmp_path: Any, capsys: Any
+    ) -> None:
+        # Live cluster has the CURRENT policy (retention 30); the snapshot holds
+        # the OLD one (retention 7). --rollback must versioned-PUT the snapshot
+        # content; a second --rollback is a no-op (skip-if-identical).
+        cfg = load_tenant_config("customer-a")
+        fake = run_deploy()
+        ism_name = cfg.ism_policy_name
+        ism_path = f"/_plugins/_ism/policies/{ism_name}"
+        # Seed a LIVE (current) policy — retention 30 — like a real cluster.
+        # Note: FakeIndexer.store is keyed by the policy NAME, not the full path.
+        fake.ism_meta[ism_name] = {"version": 1, "seq_no": 1, "primary_term": 1}
+        fake.store[ism_name] = self._policy(retention_days=30)
+        self._snapshot(
+            tmp_path, **{"02-ism-masked.json": self._policy(retention_days=7)["policy"]}
+        )
+
+        rc = deploy.deploy_main(["--tenant", "customer-a", "--rollback"])
+        assert rc == 0
+        ism_puts = self._ism_puts(fake)
+        # One VERSIONED update (no plain PUT that would 409).
+        assert ism_puts == [(ism_path, {"if_seq_no": 1, "if_primary_term": 1})]
+        # Live policy now matches the snapshot content.
+        live = fake.store[ism_name]["policy"]
+        assert live["states"][0]["transitions"][0]["conditions"]["min_index_age"] == "7d"
+
+        capsys.readouterr()  # clear run 1 output
+        n_before = len(fake.puts)
+        rc2 = deploy.deploy_main(["--tenant", "customer-a", "--rollback"])
+        assert rc2 == 0
+        assert len(fake.puts) == n_before  # no write at all
+        out = capsys.readouterr().out
+        assert (
+            "[skip] rollback ism-masked klaxon-masked-retention-customer-a unchanged"
+            in out
+        )
 
 
 class TestNoSecretOutput:
