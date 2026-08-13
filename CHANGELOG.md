@@ -40,6 +40,23 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deployed pipeline. No artifact/token output changed (self-test only), so no
   version bump or artifact regeneration.
 
+### Docs
+
+- Documentation reconciled against the code/config (see
+  `docs/REVIEW-reconciliation.md`): token construction phrased as
+  `HMAC-SHA256(key = salt, message = "family:value")` everywhere (no inverted
+  "over the salt" wording, no six-hex token examples, no stale "MD5 or
+  SHA-256, six hex digits"); aggregation-key masking default corrected to
+  `true` (fail-closed) in the `docs/TOOLS.md` reference; the four live-verified
+  leak fields (`wazuh.rule.title` in findings, `url.original`, `file.path`,
+  `file.owner`) documented as Known limitations in `docs/llm-safety.md`; the
+  GDPR-checker coverage is now index-scoped (events "0 to add" is a
+  value-heuristic blind spot; findings ~120 open DSGVO fields); Option B
+  carries an explicit "implemented, not deployed" status badge; the
+  pure-Painless HMAC is marked as a deliberate design decision, not a
+  workaround; generator artifact count fixed to seven everywhere. No code or
+  behaviour change.
+
 
 ## 0.1.9 – 2026-08-13
 
