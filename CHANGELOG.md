@@ -8,6 +8,8 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.2.0 – 2026-08-13
+
 ### Fixed
 
 - **The masked-stream pattern is now consistent everywhere
