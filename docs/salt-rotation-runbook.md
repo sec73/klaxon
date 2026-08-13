@@ -5,6 +5,11 @@ bricht die Korrelation zwischen vor- und nach-rotations-Tokens (gleicher
 Rohwert → anderes Token) — das ist ein akzeptierter Trade-off. Rotiere NUR bei
 begründetem Verdacht auf Salt-Kompromittierung.
 
+> Ein **Token-Schema-Wechsel bei unverändertem Salt** (z.B. 0.1.8 → 0.1.9) ist
+> KEINE Rotation, hat aber für den Masked Stream **dieselbe operative
+> Konsequenz** und nutzt dasselbe Playbook — siehe
+> [Token-Schema-Wechsel bei unverändertem Salt](#token-schema-wechsel-bei-unverändertem-salt).
+
 ---
 
 ## Grundsatz
@@ -60,6 +65,11 @@ gilt:
 - **Alte Dokumente** im Stream sind mit dem alten Salt tokenisiert. Es gibt
   zwei akzeptable Strategien:
 
+> Für einen **Token-Schema-Wechsel bei unverändertem Salt** gelten Strategie A
+> und B genauso (dort bleibt nur das Salt gleich; die Pipeline wird mit den neu
+> generierten Artifakten des neuen Schemas deployed) — siehe
+> [Token-Schema-Wechsel bei unverändertem Salt](#token-schema-wechsel-bei-unverändertem-salt).
+
 ### Strategie A — Retentionsfenster reindizieren
 
 Reindiziere das Retentionsfenster der Rohdaten (`wazuh-events-v5-*`) durch die
@@ -90,6 +100,51 @@ Korrelation zwischen alt und neu ist **gebrochen** (bewusst akzeptiert); alte
 Dokumente verschwinden erst mit dem ISM-Delete (Masked 30d, Quarantäne 90d
 Default). Kein Reindex, keine Ausfallzeit — aber Aggregationen über den
 Gesamtzeitraum zählen alte und neue Entitäten getrennt.
+
+## Token-Schema-Wechsel bei unverändertem Salt
+
+*(engl. „token-scheme change with unchanged salt“)* — Ein Wechsel der
+**Token-Konstruktion** — Hash-Funktion, Key/Message-Aufbau,
+Trunkierung, Familien-/UTF-8-Kodierung — ist **keine Salt-Rotation**, hat aber
+für den Masked Stream **dieselbe operative Konsequenz**: Bestandsdokumente im
+Stream wurden unter dem alten Schema tokenisiert, die Korrelation alt ↔ neu ist
+gebrochen.
+
+Konkretes Beispiel: **0.1.8 → 0.1.9** — der Masked-Stream-Token wechselte von
+Konkatenations-`SHA-256("family:value:salt")[:16]` zu
+`HMAC-SHA256(key = salt, message = "family:value")[:16]`, bei **unverändertem
+Salt**. Derselbe Rohwert produziert andere Tokens, obwohl das Salt gleich blieb.
+
+- **Response-Layer: kein Reindex, keine Historie.** Response-Tokens sind
+  ephemer — pro Query erzeugt und **nie gespeichert**. Mit der nächsten Query
+  verwenden sie einfach die neue Konstruktion; es gibt kein Migrationsfenster.
+- **Option-B Masked Stream: wie eine Salt-Rotation.** Der Stream speichert
+  Tokens **dauerhaft** (mit dem Schema, das beim Deploy in die Pipeline
+  eingebacken war). Das Vorgehen ist **identisch zu Pfad 2** —
+  **Strategie A (Retentionsfenster reindizieren)** oder
+  **Strategie B (Zwei-Salt-Historie akzeptieren)** oben — mit dem einzigen
+  Unterschied, dass das Salt **gleich bleibt** und stattdessen die **neu
+  generierten Artifakte** (neues Schema) deployed werden:
+  `klaxon masking generate --tenant X`, dann
+  `klaxon-mcp --apply-masked-infra --tenant X`, dann
+  `klaxon masking selftest --tenant X` (Byte-Identität Painless ↔
+  `derive_token` unter dem neuen Schema), danach Strategie A oder B. Die
+  Korrelation ist in beiden Fällen gebrochen — dokumentiere das Fenster.
+
+**Wann gilt das?** Bei JEDER Änderung der Token-Ableitung — nicht nur bei
+HMAC-vs-SHA: Hash-Funktion, Key/Message-Konstruktion, Trunkierung (z.B. andere
+Hex-Länge), Familien- oder UTF-8-Kodierung. Der Generator-Selbsttest
+(`klaxon masking generate` / `klaxon masking selftest`) schlägt bei einem
+Schema-Wechsel **nicht** fehl — er prüft nur, dass das generierte Painless mit
+`derive_token` byte-identisch ist; die operative Migration ist Operator-Sache.
+
+**Status: vor dem ersten produktiven Deploy klären.** Option B ist derzeit
+**nicht deployed** (`klaxon-masked-*-v5-*` = 0 Shards) — es gibt also heute
+**keine Produktionsdaten** zu migrieren. Der Fall ist kein akuter Notfall,
+sondern ein **Must-Fix vor dem ersten produktiven Deploy / Migrationsfenster**:
+der Schema-Wechsel 0.1.8 → 0.1.9 ist bereits geschehen, also muss der
+Betreiber vor der ersten produktiven Befüllung des Streams entscheiden, ob
+Strategie A oder B gilt.
 
 ## Gemeinsame Schritte (beide Pfade)
 
