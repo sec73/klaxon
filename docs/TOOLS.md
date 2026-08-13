@@ -270,7 +270,7 @@ the settings and what the gate does.
 | deterministic placeholders | `KLAXON_ANONYMIZATION_USE_HASH` | `use_hash` | `true` |
 | token salt (HMAC key) | `KLAXON_ANONYMIZATION_SALT` | `salt` | auto-generated + persisted (`*.salt`) |
 | masked fields | `KLAXON_ANONYMIZATION_MASK_FIELDS` | `mask_fields` | see below |
-| aggregation key masking | `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS` | `mask_aggregation_keys` | `false` |
+| aggregation key masking | `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS` | `mask_aggregation_keys` | `true` (fail-closed) |
 | free-text username masking | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS` | `mask_free_text_users` | `true` |
 | extra free-text fields | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS` | `mask_free_text_fields` | empty (hint pattern) |
 | block on residual PII | `KLAXON_ANONYMIZATION_WHITELIST_ENABLED` | `whitelist_enabled` | `true` |
@@ -282,19 +282,23 @@ the settings and what the gate does.
 Precedence is always **env > YAML > default**. The YAML file is optional and
 only the `anonymization:` block is read.
 
-Default masked fields: `source.ip`, `destination.ip`, `client.ip`, `server.ip`,
-`related.ip`, `source.domain`, `destination.domain`, `host.hostname`,
-`host.name`, `user.name`, `user.id`, `user.effective.name`, `source.user.name`,
-`destination.user.name`, `wazuh.agent.name`, `wazuh.agent.id`, `agent.name`,
-`agent.id`. A field listed here has its value replaced wholesale; the
-placeholder family follows the field name (`.ip` → `[IP_…]`, `user.name` →
+Default masked fields (**18** built-in defaults): `source.ip`, `destination.ip`,
+`client.ip`, `server.ip`, `related.ip`, `source.domain`, `destination.domain`,
+`host.hostname`, `host.name`, `user.name`, `user.id`, `user.effective.name`,
+`source.user.name`, `destination.user.name`, `wazuh.agent.name`, `wazuh.agent.id`,
+`agent.name`, `agent.id`. A field listed here has its value replaced wholesale;
+the placeholder family follows the field name (`.ip` → `[IP_…]`, `user.name` →
 `[USER_…]`, `agent.name`/`host.hostname` → `[HOST_…]`, `agent.id` → `[AGENT_…]`).
-A custom field not in the built-in table falls back to `[USER_…]`.
+A custom field not in the built-in table falls back to `[USER_…]`. The
+per-tenant effective list is generated from `tenants/<tenant>/fields.yaml` and
+can differ from the defaults — customer-a resolves to **19** fields
+(`tenants/customer-a/fields.yaml`).
 
 **Aggregation keys.** Bucket keys are computed on indexed values, so without a
 masking pass a `terms` agg on `related.hosts` returns raw hostnames even when
-`_source` is clean. With `mask_aggregation_keys` on (off by default), the
-`search` response walker tokenises the `key` of `terms` / `significant_terms` /
+`_source` is clean. With `mask_aggregation_keys` on (**on by default**,
+fail-closed; `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS=false` restores raw
+keys), the `search` response walker tokenises the `key` of `terms` / `significant_terms` /
 `significant_text` / `multi_terms` / `composite` buckets whose source field is
 in `mask_fields`, using the same deterministic tokens as `_source`. `composite`
 `after_key` is tokenised the same way so pagination stays consistent.
