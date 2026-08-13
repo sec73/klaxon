@@ -90,14 +90,17 @@ body=…)` and returns the masked response:
 ```json
 {
   "hits": { "hits": [ { "_source": {
-      "user":    { "name": "[USER_9f2a1c…]" },
-      "source":  { "ip": "[IP_5c01e7…]" },
-      "message": "user [USER_9f2a1c…] logged in via ssh from [IP_5c01e7…]"
+      "user":    { "name": "[USER_9f2a1c467dd5e2b8]" },
+      "source":  { "ip": "[IP_5c01e73f9a2b4c1d]" },
+      "message": "user [USER_9f2a1c467dd5e2b8] logged in via ssh from [IP_5c01e73f9a2b4c1d]"
   } } ] }
 }
 ```
 
-The same value always maps to the same token; the personal data never appears.
+The same value always maps to the same token. Masking is pseudonymization, not
+anonymization, and it has documented blind spots — see
+[`docs/llm-safety.md`](docs/llm-safety.md) (in particular the verified leaks in
+"Known limitations") before pointing an external model at Klaxon.
 
 ---
 
@@ -143,7 +146,7 @@ The keys a normal user changes day to day. Full reference: [`docs/configuration.
 
 The deep material lives in dedicated docs — linked, not duplicated:
 
-- **DSGVO/GDPR plausibility checker** (classification layers, custom rules, sampling, reports) → [`docs/gdpr-checker.md`](docs/gdpr-checker.md)
+- **GDPR plausibility checker** (classification layers, custom rules, sampling, reports) → [`docs/gdpr-checker.md`](docs/gdpr-checker.md)
 - **Ingest masking / Option B masked stream** (pipeline, ISM, index templates, quarantine for masking failures, sync job) → [`docs/option-b-masked-stream.md`](docs/option-b-masked-stream.md)
 - **Multi-tenant setup** (`fields.yaml`, `klaxon masking generate`, salt, namespacing) → [`docs/multi-tenant.md`](docs/multi-tenant.md)
 - **Drift prevention & CI** (pre-commit drift hook, provenance fingerprints, fail-closed startup, sync preflight, `--verify-config`) → [`docs/drift-prevention.md`](docs/drift-prevention.md)
@@ -181,7 +184,7 @@ Release history: [`CHANGELOG.md`](CHANGELOG.md).
 
 - [`docs/TOOLS.md`](docs/TOOLS.md) — full tool reference & parameters
 - [`docs/configuration.md`](docs/configuration.md) — complete configuration reference
-- [`docs/gdpr-checker.md`](docs/gdpr-checker.md) — the DSGVO plausibility checker
+- [`docs/gdpr-checker.md`](docs/gdpr-checker.md) — the GDPR plausibility checker
 - [`docs/option-b-masked-stream.md`](docs/option-b-masked-stream.md) — ingest-side masking
 - [`docs/multi-tenant.md`](docs/multi-tenant.md) — multi-tenant setup
 - [`docs/drift-prevention.md`](docs/drift-prevention.md) — drift prevention & CI

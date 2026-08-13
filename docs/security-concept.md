@@ -1,88 +1,86 @@
-# Security Concept — Pseudonymisierung & Salt
+# Security Concept — pseudonymization & salt
 
-Dieses Dokument beschreibt das Sicherheitsmodell der Tokenisierung in Klaxon:
-die Konstruktion der Tokens (keyed HMAC-SHA256), die Rolle des Salts und — im
-Kern dieses Dokuments — das **Pseudonymisierungs-Risiko: Brute-Force-
-Re-Identifikation** (aufzählbare Werte mit bekanntem Salt), seine Mitigationen
-und das akzeptierte Restrisiko.
+This document describes the security model of tokenization in Klaxon: the
+construction of the tokens (keyed HMAC-SHA256), the role of the salt and — at
+the core of this document — the **pseudonymization risk: brute-force
+re-identification** (enumerable values with a known salt), its mitigations and
+the accepted residual risk.
 
-Siehe auch:
-- [`security-model.md`](security-model.md) — Token-Schema, 16 Hex, Salt-Auflösung
-- [`salt-rotation-runbook.md`](salt-rotation-runbook.md) — Rotations-Runbook
-  (keine geplante Rotation; nur bei Verdacht)
-- [`option-b-masked-stream.md`](option-b-masked-stream.md) — Masked/Quarantäne-Stream
-
----
-
-## Konstruktion der Tokens
-
-- Token-Display: `[FAMILIE_16hex]` (z.B. `[USER_3cc5982657e33301]`).
-- Konstruktion (Response-Layer UND Masked-Stream identisch):
-  `HMAC-SHA256(key = Salt, message = "<familie>:<wert>")`, auf 16 Hex-Zeichen
-  (64 Bit) gekürzt.
-- Eine **keyed MAC** (kein Konkatenations-Hash): Das Salt ist der Schlüssel, die
-  Familie der Kontext — derselbe Wert in verschiedenen Familien ergibt
-  verschiedene Tokens; die Konstruktion ist nicht anfällig für
-  Length-Extension-artigen Missbrauch.
-- Deterministisch: gleicher Wert + gleiche Familie + gleiches Salt → gleiches
-  Token, über Aufrufe und Neustarts hinweg, in `_source`, Aggregations-Bucket-Keys
-  und `composite after_key`.
-- Byte-Identität zwischen Python (`tokens.derive_token`) und dem generierten
-  Painless-Script wird vom Generator-Selbsttest erzwungen (und von
-  `klaxon masking test` live gegen den Indexer geprüft). Der Painless-Teil
-  implementiert HMAC-SHA256 in reinem Painless (der Ingest-Allowlist fehlt
-  `javax.crypto.Mac`), byte-identisch zu Pythons `hmac`.
+See also:
+- [`security-model.md`](security-model.md) — token scheme, 16 hex, salt resolution
+- [`salt-rotation-runbook.md`](salt-rotation-runbook.md) — salt-rotation runbook
+  (no scheduled rotation; only on suspicion)
+- [`option-b-masked-stream.md`](option-b-masked-stream.md) — masked/quarantine stream
 
 ---
 
-## Pseudonymisierungs-Risiko: Brute-Force-Re-Identifikation
+## Token construction
 
-### Risiko
+- Token display: `[FAMILY_16hex]` (e.g. `[USER_3cc5982657e33301]`).
+- Construction (response layer AND masked stream identical):
+  `HMAC-SHA256(key = salt, message = "<family>:<value>")`, truncated to 16 hex
+  chars (64 bits).
+- A **keyed MAC** (not a concatenation hash): the salt is the key, the family
+  the context — the same value in different families yields different tokens;
+  the construction is not susceptible to length-extension-style misuse.
+- Deterministic: same value + same family + same salt → same token, across
+  calls and restarts, in `_source`, aggregation bucket keys and
+  `composite after_key`.
+- Byte-identity between Python (`tokens.derive_token`) and the generated
+  Painless script is enforced by the generator self-test (and checked live
+  against the indexer by `klaxon masking test`). The Painless part implements
+  HMAC-SHA256 in pure Painless (the ingest allowlist lacks `javax.crypto.Mac`),
+  byte-identical to Python's `hmac`.
 
-Pseudonymisierung ist **keine Anonymisierung**. Ein Token hat zwar 64 Bit
-Digest-Entropie (16 Hex), aber die **Werte-Raum** ist oft klein und aufzählbar:
+---
 
-- Benutzernamen, interne IP-Adressen, Hostnamen, Agent-IDs — typischerweise
-  einige Tausend bis Millionen Kandidaten.
-- Mit **bekanntem Salt** kann ein Angreifer für jeden Kandidaten das Token
-  berechnen (HMAC ist öffentlich) und mit dem beobachteten Token abgleichen.
-  Ein Dictionary- oder Brute-Force-Angriff ist dann praktisch sofort erfolgreich.
+## Pseudonymization risk: brute-force re-identification
 
-Das Salt ist die einzige Barriere. Wird es kompromittiert (Leak in Logs,
-Backups, Repos; `params.salt` der Pipeline von Unbefugten gelesen; Zugriff auf
-den Deployment-Host), sind **alle** tokenisierten Werte re-identifizierbar —
-unabhängig von der Token-Konstruktion (keyed HMAC hat unter Salt-Kompromiss
-dieselbe Brute-Force-Exposition wie ein Konkatenations-Hash; HMAC ist dennoch
-die standardisierte, robustere Schlüssel-Konstruktion und entspricht der
-Designabsicht).
+### Risk
 
-### Mitigationen
+Pseudonymization is **not anonymization**. A token does have 64 bits of digest
+entropy (16 hex), but the **value space** is often small and enumerable:
 
-| Mitigation | Wirkung |
+- Usernames, internal IP addresses, hostnames, agent IDs — typically a few
+  thousand to millions of candidates.
+- With a **known salt** an attacker can compute the token for every candidate
+  (HMAC is public) and match it against the observed token. A dictionary or
+  brute-force attack then succeeds practically immediately.
+
+The salt is the only barrier. If it is compromised (leak in logs, backups,
+repos; `params.salt` of the pipeline read by unauthorized parties; access to
+the deployment host), **all** tokenized values are re-identifiable — regardless
+of the token construction (under salt compromise, keyed HMAC has the same
+brute-force exposure as a concatenation hash; HMAC is nevertheless the
+standardized, more robust key construction and matches the design intent).
+
+### Mitigations
+
+| Mitigation | Effect |
 |---|---|
-| **Keyed HMAC** (Salt als Schlüssel, Familie als Kontext) | Standard-Konstruktion, resistent gegen Length-Extension-artigen Missbrauch; Familie trennt gleiche Werte in verschiedenen Kontexten. |
-| **Salt als hoch-entropiges Secret** (≥ 256 Bit empfohlen; `secrets.token_hex(32)`); Startup-Warnung bei < 32 Hex | Macht das *Erraten des Salts* infeasible (der Angriff bleibt auf „Salt bekannt" beschränkt). |
-| **Zugriff auf das Salt beschränken** (Secrets Manager / Env auf dem Deployment-Host, `0600` für `.salt`, Pipeline-Read nur für Admins) | Reduziert die Wahrscheinlichkeit einer Salt-Kompromittierung. |
-| **Rotation nur bei Verdacht** (nie planmäßig) | Begrenzt die Dauer einer Kompromittierung; bricht aber bewusst die Korrelation (siehe Runbook). |
-| **Response-Layer-only-Konstruktion** (keine Rohwerte gespeichert; nur der Masked-Stream hält Tokens) | Verkleinert die Angriffsfläche auf die Streams, in denen Tokens dauerhaft liegen. |
+| **Keyed HMAC** (salt as key, family as context) | Standard construction, resistant to length-extension-style misuse; the family separates equal values in different contexts. |
+| **Salt as a high-entropy secret** (≥ 256 bits recommended; `secrets.token_hex(32)`); startup warning below 32 hex | Makes *guessing the salt* infeasible (the attack stays limited to "salt known"). |
+| **Restrict access to the salt** (secrets manager / env on the deployment host, `0600` for `.salt`, pipeline read for admins only) | Reduces the probability of salt compromise. |
+| **Rotation only on suspicion** (never scheduled) | Limits the duration of a compromise; but deliberately breaks correlation (see runbook). |
+| **Response-layer-only construction** (no raw values stored; only the masked stream holds tokens) | Shrinks the attack surface to the streams where tokens reside permanently. |
 
-### Restrisiko (akzeptiert)
+### Residual risk (accepted)
 
-Ein motivierter Angreifer **mit dem Salt** und einem guten Dictionary kann
-spezifische aufzählbare Werte brechen. Das ist dem Pseudonymisierungs-Modell
-inhärent und lässt sich nicht vollständig entfernen, ohne die deterministische
-Tokenisierung (die für korrelierbare Aggregationen und die
-Zwei-Schichten-Idempotenz nötig ist) aufzugeben. Akzeptiert by design;
-dokumentiert, damit Betreiber die Restrisiken (Salt-Handling, Zugriff auf den
-Masked/Quarantäne-Stream) entsprechend behandeln.
+A motivated attacker **with the salt** and a good dictionary can break specific
+enumerable values. This is inherent to the pseudonymization model and cannot be
+fully removed without giving up the deterministic tokenization (which is
+needed for correlatable aggregations and two-layer idempotency). Accepted by
+design; documented so operators treat the residual risks (salt handling,
+access to the masked/quarantine stream) accordingly.
 
-### Operative Konsequenzen
+### Operational consequences
 
-1. **Salt niemals loggen/committen/exportieren** — nicht in Fehlermeldungen,
-   Config-Dumps, Health-Endpoints oder committete Artifakte. Deploybare
-   Pipeline-Dateien mit echtem Salt sind gitignored.
-2. **Quarantäne-Stream ist Rohdaten** — nur Ops-Rolle; nie im LLM-Allowlist.
-3. **Rotation gemäß Runbook** (nur bei Verdacht) — nicht planmäßig.
-4. Bei Salt-Verdacht: **nicht** nur rotieren, sondern auch prüfen, ob bereits
-   Tokens abgeflossen sind (Incident-Response; Rotation re-anonymisiert nichts
-   bereits Geleaktes).
+1. **Never log/commit/export the salt** — not in error messages, config dumps,
+   health endpoints or committed artifacts. Deployable pipeline files with a
+   real salt are gitignored.
+2. **The quarantine stream is raw data** — ops role only; never in the LLM
+   allowlist.
+3. **Rotation per the runbook** (only on suspicion) — never scheduled.
+4. On suspected salt compromise: **not only** rotate, but also check whether
+   tokens have already leaked (incident response; rotation does not
+   re-anonymize anything already leaked).

@@ -27,6 +27,10 @@ sync-state doc `klaxon-sync-<tenant>`.
 
 ## The `fields.yaml` schema
 
+Abridged example — the effective list is exactly `tenants/customer-a/fields.yaml`
+(19 fields incl. `event.original` and `related.ip`); copy that file as the
+template for a new tenant.
+
 ```yaml
 # tenants/<tenant>/fields.yaml
 tenant: customer-a
@@ -67,7 +71,12 @@ fields:
     family: HOST
   - field: wazuh.agent.host.hostname
     family: HOST
-  # array: true masks each element of a list field (e.g. related.user)
+  - field: event.original
+    family: USER
+  # array: true masks each element of a list field
+  - field: related.ip
+    family: IP
+    array: true
   - field: related.user
     family: USER
     array: true
@@ -94,7 +103,7 @@ operator's/CI's job). The mandatory token-scheme self-test runs first; on ANY
 failure generation aborts and emits no artifacts.
 
 ```bash
-# build the 4 artifacts from tenants/<tenant>/fields.yaml
+# build the seven artifacts from tenants/<tenant>/fields.yaml
 klaxon masking generate --tenant customer-a
 
 # DEPLOYABLE form (real salt in params.salt) into a directory or stdout
@@ -152,7 +161,7 @@ and an index-pattern component.
 | `index-template-klaxon-masked-<tenant>.json` | `PUT /_index_template/klaxon-masked-<tenant>` |
 | `ism-klaxon-quarantine-retention-<tenant>.json` | `PUT /_plugins/_ism/policies/klaxon-quarantine-retention-<tenant>` (quarantine, 90d) |
 | `index-template-klaxon-quarantine-<tenant>.json` | `PUT /_index_template/klaxon-quarantine-<tenant>` (no `index.default_pipeline`) |
-| `roles-klaxon-<tenant>.yaml` | OpenSearch security-plugin roles fragment (LLM/ops/sync) |
+| `roles-<tenant>.yaml` | OpenSearch security-plugin roles fragment (LLM/ops/sync) |
 
 The committed (checked-in) form carries `params.salt = "__SALT__"` and is
 secret-free; the deployable form (`--out`/`--stdout`) carries the real salt.

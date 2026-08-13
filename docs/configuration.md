@@ -15,7 +15,7 @@ environment > YAML > default.**
 - [Indexer, manager, engine](#indexer-manager-engine)
 - [HTTP serving (transport)](#http-serving-transport)
 - [Anonymization](#anonymization)
-- [DSGVO/GDPR checker](#dsgvogdpr-checker)
+- [GDPR checker](#gdpr-checker)
 - [The YAML config file](#the-yaml-config-file)
 - [Precedence and drift guard](#precedence-and-drift-guard)
 
@@ -100,7 +100,7 @@ still applies — only the audit trail is lost.
 
 ---
 
-## DSGVO/GDPR checker
+## GDPR checker
 
 | Variable | Default | Purpose |
 |---|---|---|

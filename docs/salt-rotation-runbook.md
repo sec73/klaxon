@@ -1,70 +1,79 @@
-# Salt-Rotations-Runbook (Token-Salt)
+# Salt-rotation runbook (token salt)
 
-**Kurzfassung: Es gibt KEINE geplante/periodische Salt-Rotation.** Rotation
-bricht die Korrelation zwischen vor- und nach-rotations-Tokens (gleicher
-Rohwert → anderes Token) — das ist ein akzeptierter Trade-off. Rotiere NUR bei
-begründetem Verdacht auf Salt-Kompromittierung.
+**Short version: there is NO scheduled/periodic salt rotation.** Rotation
+breaks the correlation between pre- and post-rotation tokens (same raw value →
+different token) — that is an accepted trade-off. Rotate ONLY on well-founded
+suspicion of salt compromise.
+
+> A **token-scheme change with unchanged salt** (e.g. 0.1.8 → 0.1.9) is NOT a
+> rotation, but has **the same operational consequence** for the masked stream
+> and uses the same playbook — see
+> [Token-scheme change with unchanged salt](#token-scheme-change-with-unchanged-salt).
 
 ---
 
-## Grundsatz
+## Principle
 
-Das Salt (`KLAXON_ANONYMIZATION_SALT`) ist der HMAC-Schlüssel, mit dem Werte
-tokenisiert werden. Solange es geheim und unverändert bleibt, sind Tokens über
-Zeit und über den Response-Layer und den Masked-Stream hinweg deterministisch.
-Wird das Salt gewechselt, produziert derselbe Rohwert ein **anderes** Token —
-Dokumente/Abfragen von vor der Rotation lassen sich nicht mehr mit solchen von
-nach der Rotation korrelieren. Genau deshalb:
+The salt (`KLAXON_ANONYMIZATION_SALT`) is the HMAC key with which values are
+tokenized. As long as it stays secret and unchanged, tokens are deterministic
+over time and across the response layer and the masked stream. If the salt is
+changed, the same raw value produces a **different** token — documents/queries
+from before the rotation can no longer be correlated with those from after the
+rotation. That is exactly why:
 
-> **Rotiere das Salt nicht planmäßig.** Rotation ist ein Notfall-Eingriff,
-> keine Routine. Dokumentiert ist sie hier als Runbook für den Verdachtsfall.
+> **Do not rotate the salt on a schedule.** Rotation is an emergency measure,
+> not a routine. It is documented here as a runbook for the suspicion case.
 
-Wann rotieren? Nur wenn Grund zur Annahme besteht, dass das Salt kompromittiert
-ist oder war (Leak in Logs/Backups/Repos, Zugriff auf den Deployment-Host durch
-Unbefugte, Pipeline-`params.salt` von Unbefugten gelesen, ...).
+When to rotate? Only when there is reason to believe the salt is or was
+compromised (leak in logs/backups/repos, access to the deployment host by
+unauthorized parties, the pipeline's `params.salt` read by unauthorized
+parties, ...).
 
-## Was Rotation NICHT tut
+## What rotation does NOT do
 
-- Sie re-anonymisiert **keine bereits geleakten Rohdaten/Tokens**. Ein Wert,
-  der unter dem kompromittierten Salt schon tokenisiert und abgeflossen ist,
-  bleibt re-identifizierbar.
-- Sie entfernt die Brute-Force-Re-Identifikationsgefahr für Werte, die bereits
-  unter dem kompromittierten Salt tokenisiert wurden.
-- Sie ist **kein Ersatz** für die übrigen Kontrollen (Salt-Zugriff beschränken,
-  Pipeline-Read sperren, Quarantäne/Backstop). Siehe
+- It does **not** re-anonymize **already leaked raw data/tokens**. A value that
+  was already tokenized and leaked under the compromised salt stays
+  re-identifiable.
+- It does not remove the brute-force re-identification risk for values that
+  were already tokenized under the compromised salt.
+- It is **no substitute** for the other controls (restrict salt access, lock
+  down pipeline read, quarantine/backstop). See
   [security-concept.md](security-concept.md).
 
-## Pfad 1 — Response-Layer (billig, kein Reindex)
+## Path 1 — response layer (cheap, no reindex)
 
-Der Response-Layer tokenisiert pro Query; er speichert keine Tokens dauerhaft.
+The response layer tokenizes per query; it does not store tokens permanently.
 
-1. Salt auf allen Hosts in der Umgebung rotieren
-   (`KLAXON_ANONYMIZATION_SALT`, z.B. `secrets.token_hex(32)`; siehe
-   [§ Entropie](#entropie-des-salts)).
-2. Alle Klaxon-Prozesse neu starten.
-3. Determinsmus über zwei Queries prüfen: derselbe Wert liefert in beiden
-   Antworten dasselbe Token (und ein anderes als vor der Rotation).
-4. Generator-Selbsttest erneut ausführen (`klaxon masking selftest
-   --tenant X`).
-5. **Kein Reindex nötig.** Historische Abfragen (falls überhaupt gespeichert)
-   korrelieren nicht mehr mit neuen Tokens — bewusst.
+1. Rotate the salt on all hosts in the environment
+   (`KLAXON_ANONYMIZATION_SALT`, e.g. `secrets.token_hex(32)`; see
+   [§ Entropy](#entropy-of-the-salt)).
+2. Restart all Klaxon processes.
+3. Check determinism over two queries: the same value yields the same token in
+   both answers (and a different one than before the rotation).
+4. Re-run the generator self-test (`klaxon masking selftest --tenant X`).
+5. **No reindex needed.** Historical queries (if stored at all) no longer
+   correlate with the new tokens — deliberately.
 
-## Pfad 2 — Option-B Masked Stream (reindex ODER Zwei-Salt-Fenster)
+## Path 2 — Option-B masked stream (reindex OR two-salt window)
 
-Der Masked Stream speichert Tokens **dauerhaft** (mit dem Salt, das zum
-Deploy-Zeitpunkt in die Pipeline eingebacken war). Nach einer Salt-Rotation
-gilt:
+The masked stream stores tokens **permanently** (with the salt that was baked
+into the pipeline at deploy time). After a salt rotation:
 
-- **Neue Syncs** tokenisieren mit dem neuen Salt (Pipeline muss neu deployed
-  werden, siehe unten).
-- **Alte Dokumente** im Stream sind mit dem alten Salt tokenisiert. Es gibt
-  zwei akzeptable Strategien:
+- **New syncs** tokenize with the new salt (the pipeline must be redeployed,
+  see below).
+- **Old documents** in the stream are tokenized with the old salt. There are
+  two acceptable strategies:
 
-### Strategie A — Retentionsfenster reindizieren
+> For a **token-scheme change with unchanged salt**, Strategy A and B apply the
+> same way (only the salt stays the same; the pipeline is deployed with the
+> newly generated artifacts of the new scheme) — see
+> [Token-scheme change with unchanged salt](#token-scheme-change-with-unchanged-salt).
 
-Reindiziere das Retentionsfenster der Rohdaten (`wazuh-events-v5-*`) durch die
-neu gebaute Pipeline in den Masked Stream. Danach ist der gesamte Stream
-konsistent mit dem neuen Salt.
+### Strategy A — reindex the retention window
+
+Reindex the retention window of the raw data (`wazuh-events-v5-*`) through the
+newly built pipeline into the masked stream. Afterwards the whole stream is
+consistent with the new salt.
 
 ```console
 # 1. Salt rotieren (Env) + Artifakte neu generieren
@@ -78,50 +87,92 @@ klaxon masking salt-check --tenant X
 klaxon-mcp --sync-masked --tenant X --initial-lookback-hours <retention>
 ```
 
-Hinweis: Der Sync-Job verhindert Duplikate über `op_type: create` +
-`conflicts: proceed`; ein Teilfenster wird nicht doppelt angelegt. Alte Tokens
-(mit altem Salt) bleiben bis zum ISM-Delete im Quarantäne-/Masked-Stream und
-korrelieren nicht mit den neuen — dokumentiere das Fenster.
+Note: the sync job prevents duplicates via `op_type: create` + `conflicts:
+proceed`; a partial window is not created twice. Old tokens (with the old salt)
+stay in the quarantine/masked stream until the ISM delete and do not correlate
+with the new ones — document the window.
 
-### Strategie B — Zwei-Salt-Historie akzeptieren
+### Strategy B — accept a two-salt history
 
-Alte Dokumente behalten ihre Tokens (altes Salt), neue bekommen neue Tokens.
-Korrelation zwischen alt und neu ist **gebrochen** (bewusst akzeptiert); alte
-Dokumente verschwinden erst mit dem ISM-Delete (Masked 30d, Quarantäne 90d
-Default). Kein Reindex, keine Ausfallzeit — aber Aggregationen über den
-Gesamtzeitraum zählen alte und neue Entitäten getrennt.
+Old documents keep their tokens (old salt), new ones get new tokens.
+Correlation between old and new is **broken** (deliberately accepted); old
+documents only disappear with the ISM delete (masked 30d, quarantine 90d by
+default). No reindex, no downtime — but aggregations over the whole period
+count old and new entities separately.
 
-## Gemeinsame Schritte (beide Pfade)
+## Token-scheme change with unchanged salt
 
-1. **Salt rotieren** — env auf allen Hosts (Secrets Manager / Deployment-Env;
-   niemals committen, niemals loggen).
-2. **Token-Determinismus verifizieren**: zwei Queries / zwei Syncs, gleicher
-   Wert → gleiches Token; neues Token ≠ altes Token.
-3. **Generator-Selbsttest** erneut ausführen: `klaxon masking selftest
-   --tenant X` (byte-identität Painless ↔ `derive_token`).
-4. **Pipeline neu deployen** (Pfad 2): `klaxon-mcp --apply-masked-infra
-   --tenant X`, dann `klaxon masking salt-check --tenant X` (Deployed-Salt ==
-   aktuelles Env-Salt).
-5. **Masked Stream**: Strategie A (Reindex) oder B (Zwei-Salt-Fenster) — und
-   die Korrelationsbrechung explizit dokumentieren.
-6. **Doku/Log**: Rotation mit Datum + Grund (OHNE das Salt selbst) ins
-   Betriebshandbuch/Incident-Log eintragen.
+A change to the **token construction** — hash function, key/message build-up,
+truncation, family/UTF-8 encoding — is **not a salt rotation**, but has **the
+same operational consequence** for the masked stream: existing documents in the
+stream were tokenized under the old scheme, so the old ↔ new correlation is
+broken.
 
-## Entropie des Salts
+Concrete example: **0.1.8 → 0.1.9** — the masked-stream token changed from
+concatenation `SHA-256("family:value:salt")[:16]` to
+`HMAC-SHA256(key = salt, message = "family:value")[:16]`, with **unchanged
+salt**. The same raw value produces different tokens even though the salt
+stayed the same.
 
-- Empfohlen: `python -c "import secrets; print(secrets.token_hex(32))"`
-  (64 Hex-Zeichen = 32 Bytes = 256 Bit).
-- Minimum, das die Startup-Warnung akzeptiert: 32 Hex-Zeichen (16 Bytes =
-  128 Bit). Alles kürzere erzeugt eine Startup-Warnung (`weak_salt`) — das Salt
-  ist der HMAC-Schlüssel, ein schwaches Salt macht aufzählbare Werte leicht
-  brute-forcbar.
-- Das Salt ist ein **Secret**: Zugriff beschränken (Secrets Manager / Env auf
-  dem Deployment-Host, `0600` für `.salt`-Dateien, Pipeline-Read
-  (`GET /_ingest/pipeline`) nur für Admins).
+- **Response layer: no reindex, no history.** Response tokens are ephemeral —
+  generated per query and **never stored**. With the next query they simply use
+  the new construction; there is no migration window.
+- **Option-B masked stream: like a salt rotation.** The stream stores tokens
+  **permanently** (with the scheme that was baked into the pipeline at deploy
+  time). The procedure is **identical to Path 2** — **Strategy A (reindex the
+  retention window)** or **Strategy B (accept a two-salt history)** above —
+  with the only difference that the salt **stays the same** and instead the
+  **newly generated artifacts** (new scheme) are deployed:
+  `klaxon masking generate --tenant X`, then
+  `klaxon-mcp --apply-masked-infra --tenant X`, then
+  `klaxon masking selftest --tenant X` (byte-identity of Painless ↔
+  `derive_token` under the new scheme), then Strategy A or B. Correlation is
+  broken in both cases — document the window.
 
-## Zusammenhang mit dem Brute-Force-Risiko
+**When does this apply?** On ANY change to token derivation — not only
+HMAC-vs-SHA: hash function, key/message construction, truncation (e.g. a
+different hex length), family or UTF-8 encoding. The generator self-test
+(`klaxon masking generate` / `klaxon masking selftest`) does **not** fail on a
+scheme change — it only checks that the generated Painless is byte-identical to
+`derive_token`; the operational migration is the operator's job.
 
-Rotation mildert die *Dauer* einer Kompromittierung (nach der Rotation gilt das
-alte Salt nicht mehr für neue Werte), beseitigt aber **nicht** die Brute-Force-
-Re-Identifikation bereits tokenisierter Werte. Das Risiko und die Mitigationen
-sind in [security-concept.md](security-concept.md) dokumentiert.
+**Status: settle before the first productive deploy.** Option B is currently
+**not deployed** (`klaxon-masked-*-v5-*` = 0 shards) — so there is **no
+production data** to migrate today. This is not an urgent incident, but a
+**must-fix before the first productive deploy / migration window**: the scheme
+change 0.1.8 → 0.1.9 has already happened, so the operator must decide before
+the stream is first filled productively whether Strategy A or B applies.
+
+## Common steps (both paths)
+
+1. **Rotate the salt** — env on all hosts (secrets manager / deployment env;
+   never commit, never log).
+2. **Verify token determinism**: two queries / two syncs, same value → same
+   token; new token ≠ old token.
+3. **Re-run the generator self-test**: `klaxon masking selftest --tenant X`
+   (byte-identity of Painless ↔ `derive_token`).
+4. **Redeploy the pipeline** (path 2): `klaxon-mcp --apply-masked-infra
+   --tenant X`, then `klaxon masking salt-check --tenant X` (deployed salt ==
+   current env salt).
+5. **Masked stream**: Strategy A (reindex) or B (two-salt window) — and
+   document the correlation break explicitly.
+6. **Docs/log**: record the rotation with date + reason (WITHOUT the salt
+   itself) in the operations handbook/incident log.
+
+## Entropy of the salt
+
+- Recommended: `python -c "import secrets; print(secrets.token_hex(32))"`
+  (64 hex chars = 32 bytes = 256 bits).
+- Minimum that the startup warning accepts: 32 hex chars (16 bytes = 128
+  bits). Anything shorter triggers a startup warning (`weak_salt`) — the salt
+  is the HMAC key; a weak salt makes enumerable values easy to brute-force.
+- The salt is a **secret**: restrict access (secrets manager / env on the
+  deployment host, `0600` for `.salt` files, pipeline read
+  (`GET /_ingest/pipeline`) for admins only).
+
+## Relationship to the brute-force risk
+
+Rotation mitigates the *duration* of a compromise (after the rotation the old
+salt no longer applies to new values), but does **not** eliminate the
+brute-force re-identification of already-tokenized values. The risk and the
+mitigations are documented in [security-concept.md](security-concept.md).

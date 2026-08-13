@@ -281,9 +281,9 @@ class Anonymizer:
     """Mask, verify, block and log tool output for external LLM clients.
 
     Deterministic by construction: with hashing on, the token is an
-    HMAC-SHA256 over the salt keyed by the placeholder family, so the same
-    value always maps to the same token and no cross-request state is required.
-    The in-memory counters only feed the compliance report.
+    HMAC-SHA256(key = salt, message = `kind:value`) (first 16 hex chars), so
+    the same value always maps to the same token and no cross-request state is
+    required. The in-memory counters only feed the compliance report.
     """
 
     def __init__(self, config: AnonymizationConfig) -> None:
@@ -341,11 +341,12 @@ class Anonymizer:
     def _token(self, kind: str, value: str) -> str:
         """Deterministic, keyed token for a value in one placeholder family.
 
-        HMAC-SHA256 over the salt with the family as context, truncated to 64
-        bits of output: dictionary reversal of a single token is infeasible, and
-        the same value in different families gets different tokens. The
-        `[PREFIX_xxxx]` display shape is unchanged, so existing consumers keep
-        parsing it. use_hash=false falls back to the generic labels.
+        HMAC-SHA256(key = salt, message = `kind:value`), truncated to the first
+        16 hex chars (64 bits) of the full digest: dictionary reversal of a
+        single token is infeasible, and the same value in different families
+        gets different tokens. The `[PREFIX_xxxx]` display shape is unchanged,
+        so existing consumers keep parsing it. use_hash=false falls back to the
+        generic labels.
         """
         if not self.config.use_hash:
             return _NO_HASH_LABELS[kind]

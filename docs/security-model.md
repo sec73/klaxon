@@ -1,11 +1,12 @@
 # Token scheme & security model
 
-Both token layers use the **same keyed construction**:
+Both token layers use the **same keyed construction** — on both layers the
+salt is the HMAC key and the message is `<family>:<value>`:
 
 - **Response layer** (what an LLM client receives): `Anonymizer._token` —
-  **HMAC-SHA256** over the salt, keyed by the placeholder family.
+  `HMAC-SHA256(key = salt, message = "kind:value")`.
 - **Pipeline / masked stream** (Option B, ingest side): `tokens.token` —
-  **HMAC-SHA256** over the salt, keyed by the family (migrated from a
+  `HMAC-SHA256(key = salt, message = "family:value")` (migrated from a
   concatenation `SHA-256(family:value:salt)` in 0.1.9).
 
 They are the same scheme on two layers — a masked-stream value is already a
@@ -33,10 +34,11 @@ produce the **same** token.
 `Anonymizer._token(kind, value)` computes
 
 ```
-[KIND_ <first 16 hex of HMAC-SHA256(salt, "kind:value")>]
+[KIND_ <first 16 hex of HMAC-SHA256(key = salt, message = "kind:value")>]
 ```
 
-e.g. `[USER_9f2a1c…]`, `[IP_5c01e7…]`. Properties:
+e.g. `[USER_9f2a1c467dd5e2b8…]`, `[IP_5c01e73f9a2b4c1d…]` (16 hex chars).
+Properties:
 
 - **Deterministic**: the same value always maps to the same token, so one
   entity is correlatable across responses (that is the point — and the
@@ -60,7 +62,10 @@ Painless: the restricted ingest allowlist has no `javax.crypto.Mac`, and
 `String.sha256()` can only hash UTF-8 text (not the raw inner digest bytes of
 HMAC), so SHA-256 is reimplemented over an `int[]` byte sequence — byte-
 identical to Python's `hmac` and proven by the mandatory self-test and the live
-`_simulate` (`klaxon masking test`). Idempotent on already-tokenised values.
+`_simulate` (`klaxon masking test`). This is a **deliberate design decision**, not
+a workaround: the hand-rolled SHA-256 is pinned against authoritative RFC 4231
+vectors (plus key-length, UTF-8 and truncation edge cases) by the generator
+self-test. Idempotent on already-tokenised values.
 `tokens.py` is the single canonical Python source for this scheme.
 
 ## Why 16 hex (64 bits)
