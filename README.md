@@ -175,6 +175,15 @@ klaxon masking selftest --tenant customer-a
 klaxon masking generate --check   # CI/pre-commit drift check
 ```
 
+Deploy the masking artifacts to the indexer in one idempotent, ordered,
+self-verifying step (preflight + GET-back verification + a `_simulate` smoke
+test; `--dry-run` / `--rollback`):
+
+```bash
+klaxon masking deploy --tenant customer-a --dry-run   # plan only, no writes
+klaxon masking deploy --tenant customer-a             # needs KLAXON_INDEXER_*
+```
+
 The live integration test (`klaxon masking test`) needs real indexer credentials —
 see [`docs/option-b-masked-stream.md`](docs/option-b-masked-stream.md#the-live-integration-test-klaxon-masking-test).
 Release history: [`CHANGELOG.md`](CHANGELOG.md).

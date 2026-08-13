@@ -24,6 +24,26 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`klaxon masking deploy` — operator-friendly Option B deployment.** Deploys
+the masking artifacts to the indexer in ONE idempotent, ordered,
+self-verifying step: pipeline → both ISM policies → both index templates →
+masked data stream (created only if absent; "already exists" is success) →
+security roles (roles `-<tenant>.yaml` converted to JSON in code — no `yq`
+dependency) → role-mapping reminder. Preflight aborts on drift (names the
+file), missing `KLAXON_INDEXER_*` credentials, a salt mismatch between the
+deployed pipeline and the env salt, or a running sync (a documented heuristic;
+`--force` overrides). Every PUT is verified with a GET-back fingerprint check,
+and a final `_simulate` smoke test asserts `user.name` and a free-text `uid=`
+share one token with no `klaxon.masking_error`. `--dry-run` prints the full
+plan with no writes; the previous deployed state is snapshotted under
+`tenants/<tenant>/generated/backup/<ts>/` (gitignored) and `--rollback`
+re-deploys it via the same ordered path. Reuses the live-test indexer client
+and the verify-config drift logic; the running server stays write-incapable
+(this is an explicit operator/CI CLI path). The password, salt, tokens and raw
+data are never logged. New `src/klaxon_mcp/deploy.py`; wired into
+`klaxon masking deploy`. See `docs/option-b-masked-stream.md` (operator
+section) and `docs/TOOLS.md`.
+
 - **`klaxon_posture_check` — on-demand security/DSGVO posture check (facts +
   gaps, never a verdict).** Read-only MCP tool returning one `check: status —
   fact` line per item with source attribution: masking, response gate +

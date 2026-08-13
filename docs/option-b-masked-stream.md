@@ -289,22 +289,37 @@ The generated config fragment never adds the quarantine stream to
 # 1. generate the artifacts (or use the committed ones); selftest runs first
 klaxon masking generate --tenant customer-a
 
-# 2. deploy pipeline (real salt in params.salt), ISM, index template, data
-#    stream + quarantine ISM/template
-klaxon-mcp --apply-masked-infra --tenant customer-a --retention-days 30
-#    (or PUT the deployable set from `klaxon masking generate --out DIR`)
+# 2. deploy everything in one idempotent, ordered, self-verifying step:
+#    pipeline, ISM policies, index templates, masked data stream, security
+#    roles. Preflight aborts on drift / missing credentials / salt mismatch /
+#    a running sync. Roles YAML -> JSON in code (no yq needed).
+klaxon masking deploy --tenant customer-a --retention-days 30
+klaxon masking deploy --tenant customer-a --dry-run   # plan only, no writes
+klaxon masking deploy --tenant customer-a --rollback  # restore last snapshot
 
-# 3. apply the roles fragment (LLM/ops/sync) — see "Access control"
-
-# 4. merge generated/klaxon-config.yaml into the Klaxon config so the response
+# 3. merge generated/klaxon-config.yaml into the Klaxon config so the response
 #    layer passes masked-stream tokens through
 
-# 5. first sync (no checkpoint -> 24h lookback)
+# 4. first sync (no checkpoint -> 24h lookback)
 klaxon-mcp --sync-masked --tenant customer-a
 
-# 6. schedule the sync (e.g. cron/kubernetes CronJob every 5-15 minutes)
+# 5. schedule the sync (e.g. cron/kubernetes CronJob every 5-15 minutes)
 klaxon-mcp --sync-masked --tenant customer-a --overlap-hours 1
 ```
+
+`klaxon masking deploy` reuses the drift check (it aborts naming any generated
+artifact that differs from what `klaxon masking generate` would produce now),
+the deployed-pipeline salt comparison (`params.salt` vs the env salt — a
+mismatch aborts with a warning that stream and response-layer tokens would
+diverge), and a running-sync heuristic (aborts unless `--force`; there is no
+lock in the sync job, so a checkpoint written within the last 5 minutes is the
+best-effort signal). Every PUT is followed by a GET-back fingerprint check, and
+a final `_simulate` smoke test asserts `user.name` and a free-text `uid=` share
+one token with no `klaxon.masking_error`. A snapshot of the previous deployed
+state is kept under `tenants/<tenant>/generated/backup/<ts>/` (gitignored — it
+embeds the real deployed salt) for `--rollback`; pipeline rollback is safe: no
+data loss, the sync job can simply re-run. The running server stays
+write-incapable — this is an explicit operator/CI CLI path.
 
 `--sync-masked` **preflights** before every run and refuses to sync when the
 deployed pipeline's fingerprint or field list no longer matches `fields.yaml`,
