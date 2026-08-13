@@ -342,7 +342,9 @@ async def search(index: str, body: str) -> str:
 
     parsed_body = _parse_body(body)
 
-    notices: list[str] = []
+    # Automatic safety banner (unmasked mode / raw-stream query): first line of
+    # the diagnostics block, on every response, so it cannot be forgotten.
+    notices = diagnostics.safety_banner(get_anonymizer().config, safe_index)
     capped = _cap_size(parsed_body, get_config().search_max_size)
     if capped:
         notices.append(capped)
@@ -1138,7 +1140,10 @@ async def findings_overview(
     top_titles = _positive("top_titles", top_titles, OVERVIEW_TOP_MAX)
 
     client = get_indexer()
-    notices: list[str] = []
+    # Automatic safety banner: findings_overview always queries the raw findings
+    # stream, so the raw-stream banner is emitted on every call, first in the
+    # diagnostics block (including the empty-window early return below).
+    notices = diagnostics.safety_banner(get_anonymizer().config, FINDINGS_PATTERN)
 
     # Same exists-probe as the `schema` tool, for the same reason: a field that
     # is mapped but never populated aggregates to zero buckets with HTTP 200.

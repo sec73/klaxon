@@ -24,6 +24,20 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Automatic safety banner in the diagnostics layer** (`[UNMASKED MODE]` /
+  `[RAW STREAM QUERY]`). Every search response is prefixed — before any other
+  diagnostics line — with a one-line banner per active condition whenever the
+  response may carry personal data: anonymization is disabled (feature off or
+  no fields configured), the LLM endpoint is not local (no loopback) and the
+  response gate (`whitelist_enabled`) is inactive, or the query targeted a raw
+  stream (`wazuh-events-v5-*` / `wazuh-findings-v5-*`) instead of a masked
+  stream (`klaxon-masked-<tenant>-v5-*`). Automatic (no opt-in, no separate
+  tool), fires on every response including zero-hit/error/aggregation-only
+  ones, and never contains values, tokens or the salt. New
+  `diagnostics.safety_banner`; wired into `search` and `findings_overview`
+  (which always queries the raw findings stream). Existing diagnostics
+  unchanged.
+
 - **HMAC edge-case vector suite** in the generator self-test (`klaxon masking
   generate` / `selftest`): the pure-Painless HMAC (hand-rolled SHA-256;
   `javax.crypto.Mac` is not in the ingest allowlist) is now pinned against

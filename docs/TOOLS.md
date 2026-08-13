@@ -35,6 +35,16 @@ so a lowered bucket count is never read as the real one.
 Diagnostics emitted: zero hits, total-hits cap, partial aggregation coverage,
 empty aggregations, legacy 4.x index patterns, size cap, aggregation size cap.
 
+**Automatic safety banner.** Every response is prefixed — **before** any other
+diagnostics line — with `[UNMASKED MODE]` and/or `[RAW STREAM QUERY]` whenever
+the response may carry personal data: anonymization is disabled, the LLM
+endpoint is not local (no loopback) and the response gate is inactive, or the
+query targeted a raw stream (`wazuh-events-v5-*` / `wazuh-findings-v5-*`)
+instead of a masked stream (`klaxon-masked-<tenant>-v5-*`). It is automatic (no
+opt-in, no separate tool) so it cannot be forgotten, fires on every response
+including zero-hit/error/aggregation-only ones, and carries only the condition
++ a one-line reason — never values, tokens or the salt.
+
 ---
 
 ## `schema`
