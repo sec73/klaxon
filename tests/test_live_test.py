@@ -210,15 +210,23 @@ def test_missing_ingest_members_empty_when_complete() -> None:
     assert live_test.missing_ingest_members({"classes": _FULL_CLASSES}) == []
 
 
-def test_missing_ingest_members_flags_missing_sha256() -> None:
+def test_missing_ingest_members_flags_missing_substring() -> None:
+    """A missing member the script DOES use (String.substring) is flagged."""
     classes = [
-        {**c, "methods": [m for m in c.get("methods", []) if m["name"] != "sha256"]}
+        {**c, "methods": [m for m in c.get("methods", []) if m["name"] != "substring"]}
         if c["name"] == "java.lang.String"
         else c
         for c in _FULL_CLASSES
     ]
     missing = live_test.missing_ingest_members({"classes": classes})
-    assert any("sha256" in m for m in missing)
+    assert any("substring" in m for m in missing)
+
+
+def test_missing_ingest_members_does_not_require_sha256() -> None:
+    """The token scheme is a pure-Painless HMAC over int[] arrays — it does NOT
+    need the String.sha256() ingest augmentation (or any crypto class), so a
+    cluster without it must not be flagged."""
+    assert live_test.missing_ingest_members({"classes": _FULL_CLASSES}) == []
 
 
 def test_missing_ingest_members_flags_missing_type() -> None:
@@ -322,3 +330,56 @@ def test_pipeline_with_forced_failure_keeps_on_failure(cfg: Any) -> None:
     assert script["on_failure"] == original_on_failure
     assert "throw new RuntimeException" in script["source"]
     assert "masking_error" in script["source"].lower() or "original_index" not in script["source"]
+
+
+# --------------------------------------------------------------------------- #
+# Stage B — HMAC edge-case vectors (offline: assertion + mapping)
+# --------------------------------------------------------------------------- #
+
+
+def test_check_hmac_vectors_passes_on_expected_results(cfg: Any) -> None:
+    from klaxon_mcp.hmac_vectors import KLAXON_VECTORS
+
+    results = [
+        (vec[0], live_test._FAMILY_FIELD[vec[2]], vec[5]) for vec in KLAXON_VECTORS
+    ]
+    assert live_test.check_hmac_vectors(results, cfg) == []
+
+
+def test_check_hmac_vectors_flags_wrong_token(cfg: Any) -> None:
+    from klaxon_mcp.hmac_vectors import KLAXON_VECTORS
+
+    results = [
+        (vec[0], live_test._FAMILY_FIELD[vec[2]], "[USER_0000000000000000]")
+        for vec in KLAXON_VECTORS
+    ]
+    problems = live_test.check_hmac_vectors(results, cfg)
+    assert len(problems) == len(KLAXON_VECTORS)
+    assert "simulated" in problems[0] and "expected" in problems[0]
+
+
+def test_check_hmac_vectors_flags_missing_token(cfg: Any) -> None:
+    from klaxon_mcp.hmac_vectors import KLAXON_VECTORS
+
+    results = [
+        (vec[0], live_test._FAMILY_FIELD[vec[2]], None) for vec in KLAXON_VECTORS
+    ]
+    problems = live_test.check_hmac_vectors(results, cfg)
+    assert any("no token produced" in p for p in problems)
+
+
+def test_hmac_vector_families_map_to_live_tenant_fields() -> None:
+    """Every family used by the Klaxon HMAC vectors must map to a structured
+    field the live-test tenant (customer-a) masks, so the live _simulate never
+    silently skips a vector."""
+    from klaxon_mcp.hmac_vectors import KLAXON_VECTORS
+    from klaxon_mcp.masked_stream import load_tenant_config
+
+    cfg = load_tenant_config("customer-a")
+    for vec in KLAXON_VECTORS:
+        label, _salt, family, _value, _full, _tok = vec
+        field = live_test._FAMILY_FIELD.get(family)
+        assert field is not None, f"{label}: no field mapped for family {family}"
+        assert field in cfg.all_masked_fields, (
+            f"{label}: {field} is not in customer-a fields.yaml"
+        )

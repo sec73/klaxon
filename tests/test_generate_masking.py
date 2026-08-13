@@ -45,6 +45,7 @@ from klaxon_mcp.masked_stream import (
     pipeline_has_quarantine_on_failure,
     pipeline_provenance,
     token,
+    token_hex,
 )
 from klaxon_mcp.masking import (
     CONFIG_FRAGMENT_NAME,
@@ -207,6 +208,34 @@ def test_token_is_idempotent_on_existing_tokens(cfg: Any) -> None:
     assert token("USER", first, SALT) == first
 
 
+def test_token_is_keyed_hmac_sha256(cfg: Any) -> None:
+    """The stream token is HMAC-SHA256(key=salt, msg=`family:value`), truncated
+    to 16 hex — a KEYED MAC, not a concatenation hash. Pins the exact
+    construction so a revert to concat-SHA-256 fails here before the self-test
+    even runs."""
+    import hashlib as _hashlib
+    import hmac as _hmac
+
+    def py(salt: str, family: str, value: str) -> str:
+        digest = _hmac.new(
+            salt.encode(), f"{family}:{value}".encode(), _hashlib.sha256
+        ).hexdigest()
+        return f"[{family}_{digest[:16]}]"
+
+    assert derive_token("alice", "USER", SALT) == py(SALT, "USER", "alice")
+    assert token_hex("IP", "192.168.50.42", SALT) == _hmac.new(
+        SALT.encode(), b"IP:192.168.50.42", _hashlib.sha256
+    ).hexdigest()[:16]
+    # Family separation: same value, different family -> different token.
+    assert token("jdoe", "USER", SALT) != token("jdoe", "HOST", SALT)
+    # Family is part of the MAC message: salt+value alone is not the key.
+    assert token_hex("USER", "alice", SALT) != _hmac.new(
+        SALT.encode(), b"alice", _hashlib.sha256
+    ).hexdigest()[:16]
+    # Unicode values are MAC'd over UTF-8 (matches the Painless utf8()).
+    assert token("USER", "müller", SALT) == py(SALT, "USER", "müller")
+
+
 # --------------------------------------------------------------------------- #
 # Token-schema self-test (mandatory): Painless reference vs derive_token
 # --------------------------------------------------------------------------- #
@@ -253,9 +282,9 @@ def test_generator_selftest_fails_on_tampered_script(cfg: Any) -> None:
     derive_token scheme must be caught by the script-scheme verification."""
     source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
     assert verify_script_scheme(source) == []
-    # The new scheme hashes via the String.sha256() augmentation; changing the
-    # hash (or the 16-hex truncation) must be flagged.
-    tampered = source.replace(".sha256().substring(0, 16)", ".sha256().substring(0, 24)")
+    # The scheme is a KEYED HMAC; changing the inner pad (ipad 0x36 = 54)
+    # breaks the MAC construction and must be flagged by the scheme markers.
+    tampered = source.replace("kb[i] ^ 54", "kb[i] ^ 53")
     assert verify_script_scheme(tampered)
     assert run_generator_selftest(cfg, SALT) == []
 
@@ -287,10 +316,16 @@ def test_verify_script_structure_passes_on_generated_script(cfg: Any) -> None:
     source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
     assert verify_script_structure(source) == []
     assert "ctx['_source']" not in source
-    # Functions precede the first top-level statement.
+    # Functions precede the first top-level statement. The HMAC helper set must
+    # all be emitted before `def SALT =`.
     first_def = source.index("def SALT =")
     for name, rtype in (
-        ("sha256hex", "String"),
+        ("sha256", "int[]"),
+        ("ror", "int"),
+        ("utf8", "int[]"),
+        ("wordsToBytes", "int[]"),
+        ("wordsToHex", "String"),
+        ("hmacSha256Hex", "String"),
         ("token", "String"),
         ("TOKEN_RE", "Pattern"),
         ("maskPattern", "String"),
@@ -329,11 +364,11 @@ def test_verify_script_structure_catches_functions_after_statements(cfg: Any) ->
 def test_verify_script_structure_catches_missing_function(cfg: Any) -> None:
     """A dropped function declaration is a compile failure at ingest time."""
     source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
-    start = source.index("String sha256hex(String input) {")
+    start = source.index("String hmacSha256Hex(String salt, String message) {")
     end = source.index("}\n", start) + len("}\n")
     tampered = source[:start] + source[end:]
     problems = verify_script_structure(tampered)
-    assert any("missing function" in p and "sha256hex" in p for p in problems)
+    assert any("missing function" in p and "hmacSha256Hex" in p for p in problems)
 
 
 def test_generator_selftest_includes_structure_check(

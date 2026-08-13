@@ -11,11 +11,12 @@ writing anything to the cluster:
 
   Stage A — Ingest allowlist preflight: `GET /_scripts/painless/_context`
             (context=ingest) verifies the cluster's ingest Painless allowlist
-            has every API the generated script needs (`String.sha256()`,
-            `Pattern`/`Matcher`, `StringBuilder`, collections). `_execute`
-            cannot compile an ingest script — its painless_test context lacks
-            the ingest-only `sha256` augmentation — so Stage B's `_simulate` is
-            the authoritative compile check.
+            has every API the generated script needs (`Pattern`/`Matcher`,
+            `StringBuilder`, String/collection methods). The token scheme is a
+            pure-Painless HMAC-SHA256 over `int[]` arrays, so no crypto class
+            is required. `_execute` cannot compile an ingest script — its
+            painless_test context lacks the ingest allowlist — so Stage B's
+            `_simulate` is the authoritative compile check.
   Stage B — Pipeline simulate:       `POST /_ingest/pipeline/_simulate`
             runs the generated pipeline (inline, so nothing is deployed) over
             representative documents and asserts the masking behaviour.
@@ -46,6 +47,7 @@ from typing import Any
 
 import httpx
 
+from .hmac_vectors import KLAXON_VECTORS
 from .live_config import (
     DEFAULT_TEST_SALT,
     ENV_FILE_CANDIDATES,
@@ -80,6 +82,7 @@ __all__ = [
     "LiveTestError",
     "_env_bool",
     "_url_has_embedded_credentials",
+    "check_hmac_vectors",
     "check_quarantine_routing",
     "check_simulated",
     "find_env_file",
@@ -92,6 +95,7 @@ __all__ = [
     "stage_a_ingest_allowlist",
     "stage_b_simulate",
     "stage_b_simulate_failure",
+    "stage_b_simulate_hmac_vectors",
     "test_main",
 ]
 
@@ -99,20 +103,21 @@ _TIMEOUT = 60.0
 
 #
 # `_scripts/painless/_execute` only supports the painless_test/filter/score
-# contexts, which do NOT carry the ingest-context allowlist (e.g. the
-# `String.sha256()` augmentation the generated script hashes with) — so it can
-# never compile an ingest script on a restricted cluster. The authoritative
-# compile check is therefore Stage B's `_simulate`, which compiles in the
-# ingest context. Stage A instead VERIFIES the cluster's ingest allowlist
-# actually contains every API the generated script needs (this is the "Painless
-# needs cluster verification of the MessageDigest/Pattern whitelist" caveat
-# from docs/option-b-masked-stream.md, made explicit and machine-checked).
+# contexts, which do NOT carry the ingest-context allowlist — so it can never
+# compile an ingest script on a restricted cluster. The authoritative compile
+# check is therefore Stage B's `_simulate`, which compiles in the ingest
+# context. Stage A instead VERIFIES the cluster's ingest allowlist actually
+# contains every API the generated script needs (this is the "Painless needs
+# cluster verification of the whitelist" caveat from
+# docs/option-b-masked-stream.md, made explicit and machine-checked). The token
+# scheme is a pure-Painless HMAC-SHA256 over `int[]` byte arrays (no
+# javax.crypto.Mac / MessageDigest / String.sha256() needed), so only plain
+# String/collection types and regex literals are required.
 
 
 # (label, class name, kind, member) — the ingest-context members the script
 # relies on. `kind` is "method" (instance method) or "type" (class exists).
 _REQUIRED_INGEST_MEMBERS: tuple[tuple[str, str, str, str], ...] = (
-    ("String.sha256() — the SHA-256 augmentation the token scheme hashes with", "java.lang.String", "method", "sha256"),
     ("String.isEmpty()", "java.lang.String", "method", "isEmpty"),
     ("String.substring()", "java.lang.String", "method", "substring"),
     ("String.charAt()", "java.lang.String", "method", "charAt"),
@@ -185,7 +190,8 @@ async def stage_a_ingest_allowlist(
     return (
         True,
         "ingest Painless allowlist has every API the generated script needs "
-        "(String.sha256, Pattern/Matcher, StringBuilder, collections).",
+        "(Pattern/Matcher, StringBuilder, String/collection methods — the HMAC "
+        "token scheme is pure Painless and needs no crypto class).",
     )
 
 
@@ -236,7 +242,10 @@ def live_test_docs() -> list[dict[str, Any]]:
     token without a bare-username registry hit. Doc 3 is a no-op document (no
     personal data) with a HOST field. Doc 4 is a dot/digit-heavy free-text line
     with no e-mail, sized to pass on a default `script.painless.regex.limit-factor`
-    cluster (longer lines need that setting raised — the test reports it).
+    cluster (longer lines need that setting raised — the test reports it). Doc 5
+    is a unicode username: proves the keyed HMAC tokenises UTF-8 values (umlauts)
+    and that the free-text registry reuses the exact structured token for the
+    unicode name (the pure-Painless `utf8()` correctness on the live cluster).
     """
     return [
         {
@@ -291,6 +300,18 @@ def live_test_docs() -> list[dict[str, Any]]:
                     "packet from 10.0.0.1 to 10.0.0.2 via 192.168.1.10 "
                     "and 203.0.113.5"
                 ),
+            },
+        },
+        {
+            # Doc 5 — a unicode username (umlaut): proves the keyed HMAC tokenises
+            # UTF-8 values AND that the free-text registry reuses the exact
+            # structured token for the unicode name (the pure-Painless utf8() is
+            # byte-correct on the live cluster).
+            "_index": "klaxon-masked-customer-a-v5-000001",
+            "_id": "5",
+            "_source": {
+                "user.name": "müller",
+                "message": "session opened for user müller from 10.20.30.50",
             },
         },
     ]
@@ -545,6 +566,33 @@ def check_simulated(
             if tok("IP", ip) not in msg4 or ip in msg4:
                 problems.append(f"doc 4 did not mask IP {ip!r}")
 
+    # ---- Doc 5: unicode username — structured + free-text share the HMAC token
+    # over UTF-8 (proves the pure-Painless utf8()/HMAC on the live cluster) ----
+    d5 = sources[4]
+    note5 = _error_note(d5)
+    if note5:
+        problems.append(f"doc 5 rejected: {note5}")
+    if d5.get("user.name") != tok("USER", "müller"):
+        problems.append(
+            f"doc 5 user.name -> {d5.get('user.name')!r} (expected "
+            f"{tok('USER', 'müller')!r})"
+        )
+    msg5 = d5.get("message")
+    if not isinstance(msg5, str):
+        problems.append("doc 5 message missing after simulate")
+    else:
+        muller_tok = tok("USER", "müller")
+        if muller_tok not in msg5:
+            problems.append(
+                "doc 5: unicode username 'müller' in free text did not reuse the "
+                f"structured token ({muller_tok!r} not in message)"
+            )
+        if "müller" in msg5:
+            problems.append("doc 5 message still contains raw 'müller'")
+        ip_tok = tok("IP", "10.20.30.50")
+        if ip_tok not in msg5 or "10.20.30.50" in msg5:
+            problems.append("doc 5 did not mask 10.20.30.50")
+
     return problems
 
 
@@ -605,6 +653,102 @@ def check_quarantine_routing(
             "routed doc did not preserve the original source fields (quarantine "
             "keeps the RAW document)"
         )
+    return problems
+
+
+# --------------------------------------------------------------------------- #
+# Stage B — HMAC edge-case vectors (_simulate, one pipeline per vector salt)
+# --------------------------------------------------------------------------- #
+
+# Family -> a structured field the live-test tenant's fields.yaml masks, so the
+# vector's `family:value` flows through the REAL generated pipeline.
+_FAMILY_FIELD = {
+    "USER": "user.name",
+    "IP": "destination.ip",
+    "HOST": "host.hostname",
+    "AGENT": "wazuh.agent.id",
+}
+
+
+async def stage_b_simulate_hmac_vectors(
+    client: httpx.AsyncClient, cfg: Any
+) -> tuple[list[tuple[str, str, str | None]], list[str]]:
+    """Simulate one document per Klaxon HMAC vector against the generated pipeline.
+
+    Each vector's salt is baked into a pipeline via `build_pipeline(cfg, salt)`
+    and `_simulate`d with one doc per vector (the `family:value` placed in a
+    structured field the tenant masks). Returns `(results, errors)` where each
+    result is `(label, field, actual_token_or_None)`. This proves the DEPLOYED
+    pure-Painless script — not just the Python port — reproduces the
+    offline-expected tokens, including the >64-byte salt (hash-first branch)
+    and UTF-8 (umlaut/CJK/emoji) cases. Writes nothing; skips cleanly when the
+    credentials are unset (the caller does that).
+    """
+    results: list[tuple[str, str, str | None]] = []
+    errors: list[str] = []
+
+    by_salt: dict[str, list[tuple[str, str, str, str, str, str]]] = {}
+    for vec in KLAXON_VECTORS:
+        by_salt.setdefault(vec[1], []).append(vec)
+
+    for salt, vecs in by_salt.items():
+        sent: list[tuple[str, str, str, str, str, str]] = []
+        docs: list[dict[str, Any]] = []
+        for vec in vecs:
+            label, _salt, family, value, _full, _tok = vec
+            field = _FAMILY_FIELD.get(family)
+            if field is None or field not in cfg.all_masked_fields:
+                errors.append(
+                    f"HMAC vector {label}: no masked field for family "
+                    f"{family} in the live-test tenant"
+                )
+                continue
+            sent.append(vec)
+            docs.append(
+                {
+                    "_index": "klaxon-masked-customer-a-v5-000001",
+                    "_id": label,
+                    "_source": {field: value},
+                }
+            )
+        if not docs:
+            continue
+
+        pipeline = build_pipeline(cfg, salt)
+        sources, sim_errors = await stage_b_simulate(client, pipeline, docs)
+        for doc, err in zip(docs, sim_errors):
+            if err:
+                errors.append(f"HMAC vector {doc['_id']}: {err}")
+
+        for vec, src in zip(sent, sources):
+            label, _s, family, value, _full, _tok = vec
+            field = _FAMILY_FIELD[family]
+            results.append((label, field, src.get(field) if src else None))
+
+    return results, errors
+
+
+def check_hmac_vectors(
+    results: list[tuple[str, str, str | None]], cfg: Any
+) -> list[str]:
+    """Assert the simulated Klaxon HMAC vectors against the offline-expected tokens.
+
+    Pure function (runs from the CLI and the pytest without a cluster): each
+    vector's simulated token must equal the authoritative expected token from
+    the shared vector table. Empty list = the deployed pure-Painless script is
+    byte-identical to the reference for every edge case.
+    """
+    expected: dict[str, str] = {vec[0]: vec[5] for vec in KLAXON_VECTORS}
+    problems: list[str] = []
+    for label, field, actual in results:
+        exp = expected.get(label)
+        if actual is None:
+            problems.append(f"HMAC vector {label}: no token produced")
+        elif exp is not None and actual != exp:
+            problems.append(
+                f"HMAC vector {label} ({field}): simulated {actual!r}, "
+                f"expected {exp!r}"
+            )
     return problems
 
 
@@ -692,6 +836,35 @@ async def _run_live_test(
             "(same token for user.name and uid=, arrays element-wise, "
             "event.original single token, related.hash untouched, idempotent, "
             "no masking_error)."
+        )
+
+        # Stage B (HMAC vectors) — the deployed pure-Painless script must
+        # reproduce the offline-expected tokens for every Klaxon HMAC vector:
+        # UTF-8 values (umlaut/CJK/emoji), ':'-containing value, empty value,
+        # preserved spaces, 16/64/131/empty-byte salts (131 exercises the
+        # hash-first branch). One _simulate per distinct vector salt.
+        try:
+            hmac_results, hmac_errors = await stage_b_simulate_hmac_vectors(
+                client, cfg
+            )
+        except LiveTestError as exc:
+            lines.append("Stage B — HMAC edge-case vectors (_simulate): FAIL")
+            lines.append(f"  {exc}")
+            return "\n".join(lines), False
+        lines.append(
+            "Stage B — HMAC edge-case vectors (_simulate): "
+            f"{len(hmac_results)} vector(s), {len(hmac_errors)} error(s)"
+        )
+        for err in hmac_errors:
+            lines.append(f"  {err}")
+        hmac_problems = check_hmac_vectors(hmac_results, cfg)
+        if hmac_problems:
+            lines.append("Stage B — HMAC edge-case vectors: FAIL")
+            lines.extend(f"  {p}" for p in hmac_problems)
+            return "\n".join(lines), False
+        lines.append(
+            "  ok: deployed pure-Painless HMAC reproduces every offline-expected "
+            "token (RFC 4231 / key-length / UTF-8 / truncation)."
         )
 
         # Stage C — quarantine on_failure routing (fail-closed). Force the

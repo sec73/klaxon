@@ -60,6 +60,7 @@ from .clients import Response
 from .config import AnonymizationConfig
 from .field_kinds import field_kind as _field_kind
 from .patterns import _EMAIL_RE, _FQDN_RE, _IPV4_RE, _IPV6_RE
+from .tokens import weak_salt
 
 logger = logging.getLogger("klaxon_mcp.anonymization")
 
@@ -287,6 +288,14 @@ class Anonymizer:
 
     def __init__(self, config: AnonymizationConfig) -> None:
         self.config = config
+        if config.salt and weak_salt(config.salt):
+            logger.warning(
+                "Anonymization salt is shorter than 32 hex chars (16 bytes / 128 "
+                "bits). The salt is the HMAC key; a weak salt makes enumerable "
+                "values (usernames, internal IPs) easy to re-identify by brute "
+                "force. Generate one with `python -c \"import secrets; print("
+                "secrets.token_hex(32))\"` (256 bits) via KLAXON_ANONYMIZATION_SALT."
+            )
         self._salt = (config.salt or _process_salt()).encode("utf-8")
         self._lock = threading.Lock()
         self._exchanges = 0

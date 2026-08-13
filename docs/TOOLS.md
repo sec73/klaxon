@@ -433,7 +433,12 @@ Flags: `--tenant`, `--out`, `--stdout`, `--check`, `--retention-days`, `--root`,
 `--salt`, `--salt-env` (and `--env` for `masking test`, `--dry-run` for
 `masking migrate`). The salt is read from
 `KLAXON_ANONYMIZATION_SALT` (or `salt_env` in `fields.yaml`); unset → random
-salt + warning (tokens rotate unless the salt is stable). `related.hash` is
+salt + warning (tokens rotate unless the salt is stable). Tokens are
+`HMAC-SHA256(key = salt, msg = "family:value")` — keep the salt ≥ 256 bits
+(`secrets.token_hex(32)`; a shorter salt warns at startup), restrict who can
+read it, and rotate only on suspicion, never on a schedule
+([`salt-rotation-runbook.md`](salt-rotation-runbook.md),
+[`security-concept.md`](security-concept.md)). `related.hash` is
 never masked. See `docs/option-b-masked-stream.md` for the full design.
 
 `masking test` reads the indexer credentials ONLY from `KLAXON_INDEXER_URL` /

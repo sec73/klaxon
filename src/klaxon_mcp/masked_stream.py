@@ -81,6 +81,8 @@ from .tokens import (
 from .tokens import (
     token as token,  # noqa: PLC0414 — used here and re-exported
 )
+from .tokens import token_hex as token_hex  # noqa: PLC0414 — facade re-export
+from .tokens import weak_salt
 
 logger = logging.getLogger("klaxon_mcp.masked_stream")
 
@@ -120,6 +122,8 @@ __all__ = [
     "pipeline_provenance",
     "resolve_salt",
     "token",
+    "token_hex",
+    "weak_salt",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -177,11 +181,22 @@ def resolve_salt(salt_env: str = "KLAXON_ANONYMIZATION_SALT") -> str:
     deployed pipeline at apply time (ingest pipelines cannot read process env);
     see the module docstring for the RBAC requirement this implies. A generated
     salt is random per run, so tokens will rotate — set the env var for a stable
-    salt across deploys and sync runs.
+    salt across deploys and sync runs. A configured salt shorter than 32 hex
+    chars (16 bytes / 128 bits) is weak for the HMAC key and triggers a warning.
     """
     raw = os.environ.get(salt_env)
     if raw and raw.strip():
-        return raw.strip()
+        salt = raw.strip()
+        if weak_salt(salt):
+            logger.warning(
+                "%s is set but shorter than 32 hex chars (16 bytes / 128 bits). "
+                "The salt is the HMAC key; a weak salt makes enumerable values "
+                "(usernames, internal IPs) easy to re-identify by brute force. "
+                "Generate one with `python -c \"import secrets; print("
+                "secrets.token_hex(32))\"` (256 bits).",
+                salt_env,
+            )
+        return salt
     generated = secrets.token_hex(32)
     logger.warning(
         "%s is not set. A random salt was generated for the masking pipeline; "

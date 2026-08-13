@@ -214,6 +214,29 @@ class TestAnonymizationEnv:
         assert salt_file.exists()
         assert salt_file.read_text(encoding="ascii").strip() == first
 
+    def test_weak_salt_flags_short_env_salt(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A configured salt shorter than 32 hex chars (16 bytes / 128 bits)
+        triggers a startup warning (the salt is the HMAC key)."""
+        from klaxon_mcp.tokens import weak_salt
+
+        assert weak_salt("super-secret")  # 12 chars
+        assert not weak_salt("a1" * 16)  # 32 hex chars = 16 bytes
+        assert not weak_salt("a1" * 32)  # 64 hex chars = 32 bytes (recommended)
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_SALT", "super-secret")
+        with caplog.at_level("WARNING", logger="klaxon_mcp.config"):
+            assert AnonymizationConfig.from_env().salt == "super-secret"
+        assert any("shorter than 32 hex chars" in r.message for r in caplog.records)
+
+    def test_strong_salt_is_silent(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_SALT", "a1" * 32)
+        with caplog.at_level("WARNING", logger="klaxon_mcp.config"):
+            assert AnonymizationConfig.from_env().salt == "a1" * 32
+        assert not any("shorter than 32 hex chars" in r.message for r in caplog.records)
+
     def test_mask_free_text_users_defaults_on(self) -> None:
         assert Config.from_env().anonymization.mask_free_text_users is True
 

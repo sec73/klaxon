@@ -36,6 +36,7 @@ from .envutil import (
     _yaml_get,
 )
 from .field_kinds import DEFAULT_ANONYMIZATION_MASK_FIELDS
+from .tokens import weak_salt
 
 # Explicit re-export for mypy strict: these are the names other modules (and
 # tests) import from klaxon_mcp.config.
@@ -71,10 +72,21 @@ def _resolve_salt(config_file: str) -> str:
     persisted next to the config file (`<config_file>.salt`) is reused, so tokens
     stay deterministic across restarts; when neither exists a random salt is
     generated and persisted (with a warning). The salt is never logged and is a
-    secret — `.salt` files are gitignored.
+    secret — `.salt` files are gitignored. A configured salt shorter than 32 hex
+    chars (16 bytes / 128 bits) is weak for the HMAC key and triggers a startup
+    warning (see `weak_salt`).
     """
     env_salt = _env_str("KLAXON_ANONYMIZATION_SALT", None)
     if env_salt:
+        if weak_salt(env_salt):
+            logger.warning(
+                "KLAXON_ANONYMIZATION_SALT is set but shorter than 32 hex chars "
+                "(16 bytes / 128 bits). The salt is the HMAC key; a weak salt "
+                "makes enumerable values (usernames, internal IPs) easy to "
+                "re-identify by brute force. Generate one with "
+                "`python -c \"import secrets; print(secrets.token_hex(32))\"` "
+                "(256 bits) and rotate it as a secret."
+            )
         return env_salt
     path = f"{config_file}.salt"
     try:

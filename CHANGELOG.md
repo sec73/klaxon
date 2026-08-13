@@ -22,6 +22,78 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `transport.py` imports `CORSMiddleware` directly for the HTTP transport and
   previously relied on starlette arriving transitively via `mcp`.
 
+### Added
+
+- **HMAC edge-case vector suite** in the generator self-test (`klaxon masking
+  generate` / `selftest`): the pure-Painless HMAC (hand-rolled SHA-256;
+  `javax.crypto.Mac` is not in the ingest allowlist) is now pinned against
+  authoritative vectors — RFC 4231 TC1–7, the key-length boundaries
+  64/65/63/0/1/32 bytes, and Klaxon-format vectors covering UTF-8
+  (umlaut/CJK/emoji), `:`-containing and empty values, spaces, and the
+  first-16-hex truncation — plus structural checks on the rendered script
+  (ipad/opad, two distinct SHA-256 steps, the `key.length > 64` hash-first
+  branch). On ANY mismatch generation aborts and emits NO artifacts. New
+  `src/klaxon_mcp/hmac_vectors.py` (single shared vector table) and
+  `pure_painless_hmac`/`run_hmac_vector_selftest`/`verify_hmac_structural` in
+  `selftest.py`; the live `klaxon masking test` gained a "Stage B — HMAC
+  edge-case vectors" `_simulate` stage that feeds one doc per vector through the
+  deployed pipeline. No artifact/token output changed (self-test only), so no
+  version bump or artifact regeneration.
+
+
+## 0.1.9 – 2026-08-13
+
+### Changed (BEHAVIOR-CHANGING: ALL token values changed)
+
+The Option-B masked-stream token was a **concatenation hash**
+`SHA-256("family:value:salt")[:16]` — not a keyed MAC. It is now a **keyed
+HMAC-SHA256** `HMAC-SHA256(key = salt, message = "family:value")[:16]`,
+matching the response layer (which already used HMAC) and the documented
+design intent. **Every token value changes** (same raw value → different
+token). Acceptable: no masked stream is deployed yet (0 shards), so this is
+response-layer + generator only — **no reindex needed**. The salt is NOT
+rotated as part of this change.
+
+- **`tokens.py`** (`derive_token`/`token`/`token_hex`): HMAC-SHA256 keyed by the
+  salt over `family:value`, truncated to 16 hex. `weak_salt()` flags a
+  configured salt shorter than 32 hex chars (16 bytes / 128 bits) with a
+  startup warning.
+- **Generated Painless** (`painless.py`): the same HMAC implemented in **pure
+  Painless** — the restricted ingest allowlist has no `javax.crypto.Mac`
+  (verified against OpenSearch 3.6.0: `cannot resolve symbol`), and
+  `String.sha256()` can only hash UTF-8 text (not the raw inner digest bytes of
+  HMAC), so SHA-256 is reimplemented over an `int[]` byte sequence. Byte-
+  identical to Python's `hmac` (verified live: short keys, unicode values,
+  long-key pre-hash). The self-test scheme markers + function table now pin the
+  HMAC construction (ipad 0x36 / opad 0x5c, key pre-hash, 16-hex truncation);
+  the live test gained a unicode doc (umlaut) proving UTF-8 HMAC + free-text
+  registry consistency on the cluster.
+- **`selftest.py`**: `painless_token_reference` is the independent HMAC
+  transcription; `verify_script_scheme`/`verify_script_structure` pin the HMAC
+  markers and the new function set.
+- **`live_test.py`**: Stage A no longer requires `String.sha256()` (the scheme
+  needs no crypto allowlist member); Stage B now covers a unicode doc.
+- **Salt hardening**: startup warnings for short salts (config, masked_stream
+  resolve, Anonymizer); minimum-entropy recommendation
+  (`secrets.token_hex(32)`, ≥ 256 bits) documented in `.env.example`,
+  `docs/security-model.md`.
+- **Docs**: new `docs/salt-rotation-runbook.md` (no scheduled rotation; only on
+  suspicion; response-layer + masked-stream paths incl. reindex vs two-salt
+  window; correlation-break stated) and `docs/security-concept.md`
+  (Pseudonymisierungs-Risiko: Brute-Force-Re-Identifikation — risk,
+  mitigations, residual risk). `docs/security-model.md`,
+  `docs/option-b-masked-stream.md`, README updated (both layers now use the
+  same keyed HMAC).
+- Version bumped 0.1.8 → 0.1.9; artifacts + golden regenerated.
+
+### Verified
+
+- Full suite 768 tests green (incl. 3 live), mypy strict clean, golden
+  byte-identical, `generate --check` OK.
+- Live (OpenSearch 3.6.0): `klaxon masking test --tenant customer-a` — Stages
+  A/B/C ok; Stage B 5 docs (incl. unicode) mask byte-identical to Python;
+  Stage C quarantine routing intact.
+
 
 ## 0.1.8 – 2026-08-13
 

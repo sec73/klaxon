@@ -112,7 +112,13 @@ Painless token scheme is **byte-identical** to `derive_token(value, family,
 salt)` for a fixed set of representative values per family, and that the
 rendered script compiles the way the live test exercises it (functions before
 statements, no `ctx['_source']`, and the fail-closed quarantine `on_failure`
-routing is present). On ANY mismatch the command aborts and emits NO artifacts —
+routing is present). It also pins the **pure-Painless HMAC** (hand-rolled
+SHA-256; `javax.crypto.Mac` is not in the ingest allowlist) against
+authoritative vectors — RFC 4231 TC1–7, the key-length boundaries
+64/65/63/0/1/32 bytes, UTF-8 umlaut/CJK/emoji, a `:`-containing value, empty
+value/spaces, and the first-16-hex truncation — plus structural checks on the
+rendered script (ipad/opad, two distinct SHA-256 steps, the `key.length > 64`
+hash-first branch). On ANY mismatch the command aborts and emits NO artifacts —
 changing the token scheme in `derive_token` breaks generation, not the deployed
 pipeline. Run it standalone for CI:
 
@@ -191,13 +197,20 @@ document never passes through the masking pipeline again.
 
 ### Token scheme (pipeline) vs (response layer)
 
-The pipeline produces tokens as `SHA-256(family + ":" + value + ":" + salt)`
-truncated to 16 hex characters, displayed as `[FAMILY_<16 hex>]`. The response
-layer uses HMAC-SHA256 with the same display shape. The two are **not** the
-same token for the same value — but that is inert: masked-stream values are
-already tokens, and the response layer's idempotent passthrough (`[FAMILY_<16
-hex>]` is never re-masked) leaves them byte-identical. What matters is that
-**within one stream** the tokens are deterministic and family-scoped.
+Both layers use the **same keyed construction**:
+`HMAC-SHA256(key = salt, message = "<family>:<value>")` truncated to 16 hex
+characters, displayed as `[FAMILY_<16 hex>]`. The pipeline implements it in pure
+Painless (the ingest allowlist has no `javax.crypto.Mac`; a manual HMAC over an
+`int[]` byte sequence is byte-identical to Python's `hmac` and proven by the
+generator self-test + the live `_simulate`). For the same `value`/`family`/
+`salt` both layers produce the **same** token — and a masked-stream value is
+already a token, so the response layer's idempotent passthrough
+(`[FAMILY_<16 hex>]` is never re-masked) leaves it byte-identical. What matters
+is that **within one stream** the tokens are deterministic and family-scoped.
+The salt is the HMAC key: keep it ≥ 256 bits, restrict who can read it, and do
+**not** rotate on a schedule — see
+[`docs/salt-rotation-runbook.md`](salt-rotation-runbook.md) and
+[`docs/security-concept.md`](security-concept.md).
 
 ## Quarantine stream (fail-closed)
 
