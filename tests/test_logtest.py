@@ -98,7 +98,7 @@ class TestEnumGuardsNameTheirSource:
     ) -> None:
         with pytest.raises(ToolError) as exc:
             await logtest(event="x", location="/var/log/x")
-        assert "WAZUH_LOGTEST_TRACE_LEVEL" in str(exc.value)
+        assert "KLAXON_LOGTEST_TRACE_LEVEL" in str(exc.value)
         assert "'1'" in str(exc.value)
 
     async def test_bad_argument_trace_level_names_the_argument(
@@ -108,13 +108,13 @@ class TestEnumGuardsNameTheirSource:
             await logtest(event="x", location="/var/log/x", trace_level="VERBOSE")
         message = str(exc.value)
         assert "trace_level must be one of" in message
-        assert "WAZUH_LOGTEST_TRACE_LEVEL" not in message
+        assert "KLAXON_LOGTEST_TRACE_LEVEL" not in message
         assert "'VERBOSE'" in message
 
     async def test_bad_env_space_names_the_variable(self, bad_defaults: None) -> None:
         with pytest.raises(ToolError) as exc:
             await logtest(event="x", location="/var/log/x", trace_level="ALL")
-        assert "WAZUH_LOGTEST_SPACE" in str(exc.value)
+        assert "KLAXON_LOGTEST_SPACE" in str(exc.value)
         assert "'produciton'" in str(exc.value)
 
     async def test_bad_argument_space_names_the_argument(
@@ -124,7 +124,7 @@ class TestEnumGuardsNameTheirSource:
             await logtest(event="x", location="/var/log/x", space="production")
         message = str(exc.value)
         assert "space must be one of" in message
-        assert "WAZUH_LOGTEST_SPACE" not in message
+        assert "KLAXON_LOGTEST_SPACE" not in message
 
 
 class TestLogtestNotices:

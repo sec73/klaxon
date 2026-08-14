@@ -611,7 +611,7 @@ class TestGdprCli:
         from klaxon_mcp.__main__ import gdpr_cli_main
 
         _, tmp = gdpr_env
-        monkeypatch.setenv("WAZUH_INDEXER_URL", "https://indexer.example:9200")
+        monkeypatch.setenv("KLAXON_INDEXER_URL", "https://indexer.example:9200")
         monkeypatch.setenv("KLAXON_GDPR_REPORT", str(tmp / "report.json"))
         monkeypatch.setenv("KLAXON_GDPR_CHECK_LOG", str(tmp / "gdpr.log"))
         rc = gdpr_cli_main(["--index", "wazuh-events-v5-*", "--dry-run", "--json"])

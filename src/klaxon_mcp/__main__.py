@@ -30,9 +30,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="klaxon-mcp",
         description="Klaxon MCP — MCP server for Wazuh 5.x.",
         epilog=(
-            "Every flag has an environment equivalent (WAZUH_MCP_TRANSPORT, "
-            "WAZUH_MCP_HOST, WAZUH_MCP_PORT, WAZUH_MCP_PATH, "
-            "WAZUH_MCP_AUTH_TOKEN, WAZUH_MCP_ALLOWED_HOSTS). Flags win."
+            "Every flag has an environment equivalent (KLAXON_MCP_TRANSPORT, "
+            "KLAXON_MCP_HOST, KLAXON_MCP_PORT, KLAXON_MCP_PATH, "
+            "KLAXON_MCP_AUTH_TOKEN, KLAXON_MCP_ALLOWED_HOSTS). Flags win."
         ),
     )
     parser.add_argument(
@@ -97,20 +97,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "of truth, e.g. customer-a.",
     )
     masked_stream.add_argument(
-        "--generate-masking",
-        action="store_true",
-        help="DEPRECATED — use `masking generate`. Regenerate the config "
-        "fragment + pipeline template from tenants/<tenant>/fields.yaml "
-        "(writes files; no Wazuh needed).",
-    )
-    masked_stream.add_argument(
-        "--generate-masking-check",
-        action="store_true",
-        help="DEPRECATED — use `masking generate --check`. Verify committed "
-        "generated artifacts match fields.yaml (no writes); exit non-zero on "
-        "drift. Used by CI and pre-commit.",
-    )
-    masked_stream.add_argument(
         "--sync-masked",
         action="store_true",
         help="Reindex the recent window from wazuh-events-v5-* through the "
@@ -159,7 +145,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     gdpr = parser.add_argument_group(
         "gdpr check",
         "The DSGVO plausibility checker. Needs the Wazuh indexer "
-        "(WAZUH_INDEXER_URL) and exits after running — it does not serve.",
+        "(KLAXON_INDEXER_URL) and exits after running — it does not serve.",
     )
     gdpr.add_argument(
         "--gdpr-check",
@@ -221,7 +207,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     masking_parser = subparsers.add_parser(
         "masking",
         help="Generate / verify the Option B masking artifacts (offline) and "
-        "check the deployed salt. Supersedes the old --generate-masking flags.",
+        "check the deployed salt.",
     )
     masking_sub = masking_parser.add_subparsers(
         dest="masking_command", metavar="SUBCOMMAND"
@@ -915,18 +901,6 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-
-    # Deprecated legacy aliases for the generator — superseded by
-    # `masking generate` / `masking generate --check` (same code path).
-    if args.generate_masking or args.generate_masking_check:
-        from . import masking
-
-        argv = []
-        if args.tenant:
-            argv += ["--tenant", args.tenant]
-        if args.generate_masking_check:
-            argv.append("--check")
-        return masking.generate_main(argv)
 
     # The DSGVO plausibility check needs the Wazuh indexer but not the MCP
     # listener; it runs and exits.

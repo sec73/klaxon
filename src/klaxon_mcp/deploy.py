@@ -54,6 +54,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -100,6 +101,38 @@ _ISM_SERVER_KEYS = frozenset(
     {"policy_id", "last_updated_time", "schema_version", "error_notification"}
 )
 
+# Sentinel: a key is NOT in ISM_SERVER_DEFAULTS (distinct from a default whose
+# value happens to be None).
+_UNSET = object()
+
+# Sentinel marking an ISM_SERVER_DEFAULTS entry as pure metadata: its value is
+# never meaningful and is never compared.
+_ISM_METADATA = object()
+
+# Known OpenSearch ISM server defaults & metadata the plugin adds when the PUT
+# body omitted them. These are OpenSearch ISM behaviors, NOT Klaxon's — a
+# re-served policy carries them, so the deploy verify must not report them as
+# drift. An explicit value in the sent body is always respected (never
+# clobbered): a key is only dropped from the DEPLOYED side when it is ABSENT in
+# the sent side AND (for defaults) the deployed value equals the default. Pure
+# metadata (`last_updated_time`) is never compared anywhere. THIS is the single
+# place to add future ISM defaults.
+ISM_SERVER_DEFAULTS: dict[str, Any] = {
+    # Default `retry` ISM injects into any action that omitted `retry`.
+    "retry": {"count": 3, "backoff": "exponential", "delay": "1m"},
+    # Default `copy_alias` ISM injects into a rollover action that omitted it.
+    "copy_alias": False,
+    # Metadata timestamp ISM injects into every `ism_template[]` entry; its
+    # value changes on every update and is never part of a meaningful diff.
+    "last_updated_time": _ISM_METADATA,
+}
+
+# Pure-metadata keys: their values are never meaningful and are always ignored.
+# Derived from ISM_SERVER_DEFAULTS so that constant stays the single source.
+_ISM_METADATA_KEYS: frozenset[str] = frozenset(
+    key for key, value in ISM_SERVER_DEFAULTS.items() if value is _ISM_METADATA
+)
+
 
 def _ts() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -143,6 +176,223 @@ def _normalized_for_compare(kind: str, obj: Any) -> Any:
     return obj
 
 
+def _fingerprint_for(kind: str, obj: Any) -> str:
+    """Fingerprint a normalized body for the comparison.
+
+    ISM durations are canonicalized first (`_normalize_ism_durations`) because
+    the indexer may re-serve an equal duration in another unit (e.g. `30d` as
+    `43200m`); every other kind is hashed exactly as normalized, so the pipeline
+    and template verify path is unchanged.
+    """
+    if kind == "ism":
+        obj = _normalize_ism_durations(obj)
+    return _fingerprint(obj)
+
+
+# ISM duration fields the plugin may re-serve in a different-but-equal form
+# (e.g. "30d" vs "43200m"). Canonicalized to total seconds on BOTH sides of the
+# fingerprint compare; genuinely different durations still differ. Size fields
+# (`min_size`) and counts are deliberately NOT touched.
+_ISM_DURATION_FIELDS = frozenset({"min_index_age", "min_rollover_age"})
+
+_DURATION_UNIT_SECONDS = {
+    "ms": 0.001,
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+    "M": 2_592_000,
+    "y": 31_536_000,
+}
+
+_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]+)\s*$")
+
+
+def _canonical_duration(value: Any) -> Any:
+    """A duration string in canonical seconds, or the value unchanged when it is
+    not a parseable ISM duration (sizes like `50gb` and plain numbers are left
+    alone)."""
+    if not isinstance(value, str):
+        return value
+    match = _DURATION_RE.match(value)
+    if not match:
+        return value
+    seconds = _DURATION_UNIT_SECONDS.get(match.group(2).lower())
+    if seconds is None:
+        return value
+    try:
+        number = float(match.group(1))
+    except ValueError:
+        return value
+    return number * seconds
+
+
+def _normalize_ism_durations(obj: Any) -> Any:
+    """Recursively canonicalize ISM duration fields so a policy the indexer
+    re-served in an equivalent unit still fingerprints equal to what was sent."""
+    if isinstance(obj, dict):
+        return {
+            key: (
+                _canonical_duration(value)
+                if key in _ISM_DURATION_FIELDS
+                else _normalize_ism_durations(value)
+            )
+            for key, value in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_normalize_ism_durations(value) for value in obj]
+    return obj
+
+
+def _normalize_ism_server_defaults(sent: Any, deployed: Any) -> tuple[Any, Any]:
+    """Drop known ISM server defaults/metadata from a sent/deployed policy pair.
+
+    OpenSearch ISM re-serves a policy with resolved defaults and metadata that
+    the PUT body omitted (see `ISM_SERVER_DEFAULTS`) — these are ISM behaviors,
+    not drift. Three steps, applied to the (already envelope-extracted +
+    canonicalized) pair:
+
+      1. `_strip_ism_metadata` — pure metadata (`last_updated_time`) is never
+         compared, wherever ISM injected it, on BOTH sides and in every branch;
+      2. `_canonicalize_ism_template` — ISM stores `ism_template` as a LIST of
+         entries while the artifact uses a single dict; canonicalize both sides
+         to the list form;
+      3. `_drop_ism_server_defaults` — a default-valued key (`retry`,
+         `copy_alias`) that is ABSENT in `sent` but present on the deployed
+         side with the known default is dropped, so both sides compare equal.
+
+    An explicit value in `sent` is never touched, so genuine drift still fails
+    with a precise field path.
+    """
+    return _drop_ism_server_defaults(
+        _canonicalize_ism_template(_strip_ism_metadata(sent)),
+        _canonicalize_ism_template(_strip_ism_metadata(deployed)),
+    )
+
+
+def _strip_ism_metadata(obj: Any) -> Any:
+    """Recursively remove pure-metadata keys (`last_updated_time`). Their values
+    change on every update and are never part of a meaningful diff, wherever the
+    plugin injected them."""
+    if isinstance(obj, dict):
+        return {
+            key: _strip_ism_metadata(value)
+            for key, value in obj.items()
+            if key not in _ISM_METADATA_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_ism_metadata(value) for value in obj]
+    return obj
+
+
+def _canonicalize_ism_template(obj: Any) -> Any:
+    """OpenSearch ISM stores `ism_template` as a LIST of entries; the Klaxon
+    artifact carries a single dict. Canonicalize both forms to the list form so
+    a re-served policy compares equal (an ISM storage behavior, not drift)."""
+    if isinstance(obj, dict) and "ism_template" in obj:
+        current = obj["ism_template"]
+        if isinstance(current, dict):
+            entries: list[dict[Any, Any]] = [dict(current)]
+        elif isinstance(current, list):
+            entries = [
+                dict(entry) for entry in current if isinstance(entry, dict)
+            ]
+        else:
+            return obj
+        return {**obj, "ism_template": entries}
+    return obj
+
+
+def _drop_ism_server_defaults(sent: Any, deployed: Any) -> tuple[Any, Any]:
+    """Pairwise: drop a deployed default when `sent` omitted the key. Metadata
+    and the `ism_template` shape are handled upstream (`_strip_ism_metadata` /
+    `_canonicalize_ism_template`)."""
+    if isinstance(sent, dict) and isinstance(deployed, dict):
+        sent_norm = dict(sent)
+        deployed_norm = dict(deployed)
+        for key in set(sent_norm) | set(deployed_norm):
+            default = ISM_SERVER_DEFAULTS.get(key, _UNSET)
+            if default is _UNSET or default is _ISM_METADATA:
+                continue
+            if key not in sent_norm and deployed_norm.get(key) == default:
+                # Sent omitted the key and ISM injected its default -> not drift.
+                del deployed_norm[key]
+        for key in set(sent_norm) & set(deployed_norm):
+            sent_norm[key], deployed_norm[key] = _drop_ism_server_defaults(
+                sent_norm[key], deployed_norm[key]
+            )
+        return sent_norm, deployed_norm
+    if isinstance(sent, list) and isinstance(deployed, list):
+        sent_items = list(sent)
+        deployed_items = list(deployed)
+        for index in range(min(len(sent_items), len(deployed_items))):
+            sent_items[index], deployed_items[index] = _drop_ism_server_defaults(
+                sent_items[index], deployed_items[index]
+            )
+        return sent_items, deployed_items
+    return sent, deployed
+
+
+def _json_diff(a: Any, b: Any, path: str = "$") -> list[str]:
+    """Human-readable field-level differences between two JSON-ish values.
+
+    Each entry is a JSON path (e.g. `$.states[0].transitions[0].conditions.
+    min_index_age`) plus the sent vs deployed values, so a genuine drift is
+    diagnosable instead of a bare "fingerprint differs".
+    """
+    if isinstance(a, dict) and isinstance(b, dict):
+        diffs: list[str] = []
+        for key in sorted(set(a) | set(b)):
+            child = f"{path}.{key}"
+            if key not in a:
+                diffs.append(f"{child}: absent in sent, deployed={b[key]!r}")
+            elif key not in b:
+                diffs.append(f"{child}: absent in deployed, sent={a[key]!r}")
+            else:
+                diffs.extend(_json_diff(a[key], b[key], child))
+        return diffs
+    if isinstance(a, list) and isinstance(b, list):
+        diffs = []
+        if len(a) != len(b):
+            diffs.append(f"{path}: length {len(a)} != {len(b)}")
+        for index, (left, right) in enumerate(zip(a, b)):
+            diffs.extend(_json_diff(left, right, f"{path}[{index}]"))
+        return diffs
+    if a != b:
+        return [f"{path}: {a!r} != {b!r}"]
+    return []
+
+
+def _ism_policy_from_envelope(parsed: Any) -> dict[str, Any] | None:
+    """The ACTUAL ISM policy from a GET response envelope, or None.
+
+    The ISM plugin does not return the policy flat. The response carries the
+    version metadata (`_id`, `_version`, `_seq_no`, `_primary_term`) next to a
+    `policy` key that itself wraps the stored document under ANOTHER `policy`
+    key (the shape observed on the live cluster that broke the verify):
+
+        {"_id": ..., "_version": ..., "_seq_no": ...,
+         "policy": {
+             "policy_id": ..., "last_updated_time": ..., "schema_version": ...,
+             "policy": {"description": ..., "states": [...]}
+         }}
+
+    Older OpenSearch versions / test doubles return the single-nested shape
+    (`"policy": {"description": ...}`), so both are accepted — the innermost
+    policy dict is always what the fingerprint must compare.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    outer = parsed.get("policy")
+    if not isinstance(outer, dict):
+        return None
+    nested = outer.get("policy")
+    if isinstance(nested, dict):
+        return nested
+    return outer
+
+
 def _extract_resource(kind: str, path: str, parsed: Any) -> dict[str, Any] | None:
     """The resource body from a GET response, per resource kind."""
     if not isinstance(parsed, dict):
@@ -152,8 +402,7 @@ def _extract_resource(kind: str, path: str, parsed: Any) -> dict[str, Any] | Non
         body = parsed.get(name)
         return body if isinstance(body, dict) else None
     if kind == "ism":
-        body = parsed.get("policy")
-        return body if isinstance(body, dict) else None
+        return _ism_policy_from_envelope(parsed)
     if kind == "template":
         entries = parsed.get("index_templates")
         if isinstance(entries, list) and entries and isinstance(entries[0], dict):
@@ -192,11 +441,16 @@ async def _verify_after_put(
     if received is None:
         lines.append(f"[fail] {label}: PUT ok but GET back failed/empty — verify")
         return False
-    if _fingerprint(_normalized_for_compare(kind, received)) != _fingerprint(sent):
+    received_norm = _normalized_for_compare(kind, received)
+    if kind == "ism":
+        sent, received_norm = _normalize_ism_server_defaults(sent, received_norm)
+    if _fingerprint_for(kind, received_norm) != _fingerprint_for(kind, sent):
         lines.append(
             f"[fail] {label}: deployed resource does not match what was sent "
             "(verify) — fingerprint differs"
         )
+        for diff_line in _json_diff(sent, received_norm)[:10]:
+            lines.append(f"  {diff_line}")
         return False
     lines.append(f"[ok] {label} (verified)")
     return True
@@ -220,9 +474,11 @@ async def _put_verified(
     """
     if skip_if_identical:
         existing = await _get_resource(client, kind, path)
-        if existing is not None and _fingerprint(
-            _normalized_for_compare(kind, existing)
-        ) == _fingerprint(_normalized_for_compare(kind, _sent_resource(kind, body))):
+        if existing is not None and _fingerprint_for(
+            kind, _normalized_for_compare(kind, existing)
+        ) == _fingerprint_for(
+            kind, _normalized_for_compare(kind, _sent_resource(kind, body))
+        ):
             lines.append(f"[skip] {label} unchanged")
             return True
     resp = await client.put(path, content=json.dumps(body))
@@ -253,8 +509,8 @@ async def _get_ism_policy(
         return None, None, None
     if not isinstance(parsed, dict):
         return None, None, None
-    body = parsed.get("policy")
-    if not isinstance(body, dict):
+    body = _ism_policy_from_envelope(parsed)
+    if body is None:
         return None, None, None
     seq_no = parsed.get("_seq_no")
     primary_term = parsed.get("_primary_term")
@@ -306,8 +562,12 @@ async def _put_ism_policy(
             return await _verify_after_put(
                 client, label, path, body, kind="ism", lines=lines
             )
-        if _fingerprint(_normalized_for_compare("ism", existing)) == _fingerprint(
-            _normalized_for_compare("ism", sent)
+        sent_norm, existing_norm = _normalize_ism_server_defaults(
+            _normalized_for_compare("ism", sent),
+            _normalized_for_compare("ism", existing),
+        )
+        if _fingerprint_for("ism", existing_norm) == _fingerprint_for(
+            "ism", sent_norm
         ):
             lines.append(f"[skip] {label} unchanged")
             return True

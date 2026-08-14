@@ -25,8 +25,28 @@ class ConfigError(RuntimeError):
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
 
+# --------------------------------------------------------------------------- #
+# Canonical KLAXON_* namespace (single source)
+#
+# Klaxon is configured by its own name (KLAXON_*), not by the system it talks
+# to. Every env read goes through `_get_env`, which reads ONLY the canonical
+# KLAXON_<NAME> name — the legacy WAZUH_* spellings were fully removed and must
+# not reappear (the CI grep check in tests/test_envutil.py forbids them).
+# --------------------------------------------------------------------------- #
+
+
+def _get_env(name: str, default: str | None = None) -> str | None:
+    """Read a Klaxon env var (`KLAXON_*`) verbatim.
+
+    The single choke point for every environment read. An unset or empty
+    variable returns `default`, so the standard missing-env error path applies
+    upstream.
+    """
+    return os.environ.get(name, default)
+
+
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
+    raw = _get_env(name)
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
@@ -45,7 +65,7 @@ def _env_bool_strict(name: str, default: bool) -> bool:
     these flags an explicit but invalid value is a configuration error, not a
     preference: refuse to start rather than serve unmasked.
     """
-    raw = os.environ.get(name)
+    raw = _get_env(name)
     if raw is None or raw.strip() == "":
         return default
     value = raw.strip().lower()
@@ -59,7 +79,7 @@ def _env_bool_strict(name: str, default: bool) -> bool:
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
+    raw = _get_env(name)
     if raw is None or raw == "":
         return default
     try:
@@ -70,19 +90,19 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_str(name: str, default: str | None) -> str | None:
     """Env value trimmed; an unset or empty variable falls back to `default`."""
-    raw = os.environ.get(name)
+    raw = _get_env(name)
     if raw is None or raw == "":
         return default
     return raw.strip()
 
 
 def _env_list(name: str) -> tuple[str, ...]:
-    raw = os.environ.get(name, "")
+    raw = _get_env(name) or ""
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
+    raw = _get_env(name)
     if raw is None or raw == "":
         return default
     try:

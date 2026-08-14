@@ -145,7 +145,7 @@ class EngineClient:
 
     A third base URL because the engine's own HTTP server is a third endpoint:
     it runs inside the manager container and answers neither on the indexer port
-    nor on the manager API port. Pointing WAZUH_ENGINE_URL at either of those
+    nor on the manager API port. Pointing KLAXON_ENGINE_URL at either of those
     yields a 404 from the wrong server, not a tester response.
 
     No credentials are sent. Whether that server expects any could not be
@@ -162,10 +162,10 @@ class EngineClient:
         if self._client is None:
             if not self._config.engine_url:
                 raise TransportError(
-                    "WAZUH_ENGINE_URL is not configured; the 'tester_sessions' tool "
+                    "KLAXON_ENGINE_URL is not configured; the 'tester_sessions' tool "
                     "is unavailable. The engine's internal API runs inside the "
                     "manager container on its own port — it is neither "
-                    "WAZUH_INDEXER_URL nor WAZUH_MANAGER_URL."
+                    "KLAXON_INDEXER_URL nor KLAXON_MANAGER_URL."
                 )
             self._client = httpx.AsyncClient(
                 base_url=self._config.engine_url,
@@ -219,7 +219,7 @@ class ManagerClient:
         if self._client is None:
             if not self._config.manager_url:
                 raise TransportError(
-                    "WAZUH_MANAGER_URL is not configured; the 'manager' tool is unavailable"
+                    "KLAXON_MANAGER_URL is not configured; the 'manager' tool is unavailable"
                 )
             self._client = httpx.AsyncClient(
                 base_url=self._config.manager_url,

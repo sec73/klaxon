@@ -138,7 +138,7 @@ MANAGER_AUTH_PATH: Final[str] = "/security/user/authenticate"
 # that does not survive the day.
 #
 # These live on the engine's own HTTP server inside the MANAGER container —
-# a different host and port from WAZUH_INDEXER_URL and from the manager API.
+# a different host and port from KLAXON_INDEXER_URL and from the manager API.
 TESTER_TABLE_GET: Final[str] = "/_internal/tester/table/get"
 
 # src/engine/source/proto/src/tester.proto:8-13, enum State. Protobuf JSON

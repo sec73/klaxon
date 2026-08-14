@@ -164,7 +164,7 @@ def build_transport_security(cfg: TransportConfig) -> TransportSecuritySettings:
     """
     # A CORS grant is a statement that these browser origins are legitimate
     # callers, so they belong in the rebinding allowlist too. Without this an
-    # origin named in WAZUH_MCP_CORS_ORIGINS clears the browser's preflight and
+    # origin named in KLAXON_MCP_CORS_ORIGINS clears the browser's preflight and
     # is then rejected 403 by the SDK's own Origin check — two allowlists
     # disagreeing, with only one of them mentioned in the error.
     origins = list(cfg.allowed_origins)
@@ -193,15 +193,15 @@ def build_transport_security(cfg: TransportConfig) -> TransportSecuritySettings:
     # empty allowlist would reject every request, so it stays off — and says so.
     logger.warning(
         "DNS rebinding protection is DISABLED: listening on %s with no "
-        "WAZUH_MCP_ALLOWED_HOSTS. Set it to the hostname clients use, "
-        "e.g. WAZUH_MCP_ALLOWED_HOSTS=klaxon-mcp.example:8000",
+        "KLAXON_MCP_ALLOWED_HOSTS. Set it to the hostname clients use, "
+        "e.g. KLAXON_MCP_ALLOWED_HOSTS=klaxon-mcp.example:8000",
         cfg.host,
     )
     if origins:
         logger.warning(
             "The configured origin allowlist is therefore NOT enforced: origin "
             "checking is part of the same protection and cannot be enabled "
-            "without WAZUH_MCP_ALLOWED_HOSTS."
+            "without KLAXON_MCP_ALLOWED_HOSTS."
         )
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
@@ -247,7 +247,7 @@ def preflight(cfg: TransportConfig) -> None:
             "SERVING WITHOUT AUTHENTICATION on %s:%s. Every tool in this server "
             "reaches your Wazuh indexer with the configured credentials, so "
             "anyone who can open a TCP connection to this port can read the SIEM. "
-            "Set WAZUH_MCP_AUTH_TOKEN, or bind 127.0.0.1 and front it with a "
+            "Set KLAXON_MCP_AUTH_TOKEN, or bind 127.0.0.1 and front it with a "
             "reverse proxy that terminates TLS and authenticates.",
             cfg.host,
             cfg.port,
@@ -262,7 +262,7 @@ def preflight(cfg: TransportConfig) -> None:
             # reachable from outside: a granted origin runs in the operator's
             # browser, which *is* on the loopback interface.
             logger.warning(
-                "CORS is granted to %s with no WAZUH_MCP_AUTH_TOKEN set, so a "
+                "CORS is granted to %s with no KLAXON_MCP_AUTH_TOKEN set, so a "
                 "page loaded from those origins can read the SIEM through this "
                 "server with no credential of its own.",
                 ", ".join(cfg.cors_origins),

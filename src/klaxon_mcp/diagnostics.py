@@ -36,7 +36,7 @@ from .constants import (
 PREAMBLE_HEADER = "=== DIAGNOSTICS (added by Klaxon MCP; not part of the API response) ==="
 RAW_HEADER = "=== RAW RESPONSE ==="
 
-SEARCH_SIZE_ENV = "WAZUH_SEARCH_MAX_SIZE"
+SEARCH_SIZE_ENV = "KLAXON_SEARCH_MAX_SIZE"
 
 # The raw Wazuh 5 streams carry unmasked personal data. A query that targets one
 # of these (or a sub-pattern of them) is a RAW STREAM QUERY unless it goes to a

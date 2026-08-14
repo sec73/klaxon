@@ -317,13 +317,13 @@ async def search(index: str, body: str) -> str:
     Set "track_total_hits": true whenever you need an exact count; without it
     OpenSearch stops counting at 10000.
 
-    A "size" larger than WAZUH_SEARCH_MAX_SIZE (default 100) is lowered to that
+    A "size" larger than KLAXON_SEARCH_MAX_SIZE (default 100) is lowered to that
     limit before the query is sent, and the diagnostics block says so. Use
     "size": 0 with aggregations to count without pulling documents.
 
     The same cap applies to the `size` of bucketed aggregations (terms,
     significant_terms, significant_text, multi_terms, composite, top_hits):
-    an oversized aggregation `size` is lowered to WAZUH_SEARCH_MAX_SIZE before
+    an oversized aggregation `size` is lowered to KLAXON_SEARCH_MAX_SIZE before
     the query is sent and an "[AGG SIZE CAPPED]" diagnostics line names the
     affected aggregation and its requested size, so a lowered bucket count is
     never read as the real one.
@@ -646,7 +646,7 @@ async def logtest(
         config.logtest_default_trace_level if level_from_env else trace_level or ""
     ).strip().upper()
     if level not in TRACE_LEVELS:
-        source = "WAZUH_LOGTEST_TRACE_LEVEL" if level_from_env else "trace_level"
+        source = "KLAXON_LOGTEST_TRACE_LEVEL" if level_from_env else "trace_level"
         raise ToolError(
             f"{source} must be one of {', '.join(TRACE_LEVELS)} (got {level!r}). "
             f"ASSET_ONLY is the level that shows the decoder chain."
@@ -657,7 +657,7 @@ async def logtest(
         config.logtest_default_space if space is None else space
     ).strip().lower()
     if resolved_space not in LOGTEST_SPACES:
-        source = "WAZUH_LOGTEST_SPACE" if space_from_env else "space"
+        source = "KLAXON_LOGTEST_SPACE" if space_from_env else "space"
         raise ToolError(
             f"{source} must be one of {', '.join(LOGTEST_SPACES)} (got {resolved_space!r}). "
             f"The Content Manager rejects every other space for logtest."
@@ -967,7 +967,7 @@ async def tester_sessions(action: str = "list") -> str:
 
     Calls POST /_internal/tester/table/get on the engine's internal HTTP API.
     That server runs inside the *manager* container on its own port, so it needs
-    WAZUH_ENGINE_URL — the indexer and manager URLs do not reach it.
+    KLAXON_ENGINE_URL — the indexer and manager URLs do not reach it.
 
     Read-only by design. The engine also exposes session/post, session/delete and
     session/reload; none of them are wired up here. Sessions are recreated on
@@ -1001,7 +1001,7 @@ async def tester_sessions(action: str = "list") -> str:
                 f"/_internal/* is not documented and was not verifiable, so nothing "
                 f"is guessed at here. If this build fronts the engine with an "
                 f"authenticating proxy, put Klaxon behind it or point "
-                f"WAZUH_ENGINE_URL at an endpoint that does not require the token."
+                f"KLAXON_ENGINE_URL at an endpoint that does not require the token."
             ],
             response,
             footer=f"request: POST {TESTER_TABLE_GET}",
@@ -1013,7 +1013,7 @@ async def tester_sessions(action: str = "list") -> str:
             [
                 f"[HTTP 404] {TESTER_TABLE_GET} does not exist at "
                 f"{get_config().engine_url!r}. Either this build predates the route, "
-                f"or WAZUH_ENGINE_URL points at the indexer or the manager API rather "
+                f"or KLAXON_ENGINE_URL points at the indexer or the manager API rather "
                 f"than at the engine's own HTTP server inside the manager container."
             ],
             response,
@@ -1296,7 +1296,7 @@ async def field_coverage(
     the key is present — evidence rather than a coverage figure.
 
     Cost scales with the field count — the schema has 2351 fields — so the
-    listing is capped at WAZUH_SCHEMA_FIELD_LIMIT (default 200) and the cap is
+    listing is capped at KLAXON_SCHEMA_FIELD_LIMIT (default 200) and the cap is
     reported. Pass a `prefix` to measure a namespace instead of a truncation.
 
     Args:
@@ -1375,7 +1375,7 @@ async def field_coverage(
             f"the remaining {len(mapped) - config.schema_field_limit} were not "
             f"probed at all. They are absent from the table below, which is not "
             f"the same as reading 0% — nothing is known about them. Narrow the run "
-            f"with `prefix`, or raise WAZUH_SCHEMA_FIELD_LIMIT (currently "
+            f"with `prefix`, or raise KLAXON_SCHEMA_FIELD_LIMIT (currently "
             f"{config.schema_field_limit})."
         )
 

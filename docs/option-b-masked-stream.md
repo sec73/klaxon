@@ -473,7 +473,7 @@ avoids that whole class of failure.
 
 * The reindex POST and each task-poll GET use a **generous per-request timeout**
   (`KLAXON_SYNC_REINDEX_TIMEOUT`, seconds, default `1800` = 30 min) instead of
-  the default short `WAZUH_TIMEOUT`; the overall deadline for the task to
+  the default short `KLAXON_TIMEOUT`; the overall deadline for the task to
   complete is `KLAXON_SYNC_TASK_TIMEOUT` (seconds, default `3600` = 60 min).
 * **Transport-level failures** (connect/read timeout, connection reset, protocol
   errors — the `httpx.TransportError` family) are **transient** and retried with

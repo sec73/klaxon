@@ -30,6 +30,7 @@ from .envutil import (
     _env_int,
     _env_list,
     _env_str,
+    _get_env,
     _is_loopback_url,
     _load_yaml_file,
     _section,
@@ -506,41 +507,43 @@ class TransportConfig:
 
     @classmethod
     def from_env(cls) -> TransportConfig:
-        transport = os.environ.get("WAZUH_MCP_TRANSPORT", "stdio").strip().lower()
+        transport = (_get_env("KLAXON_MCP_TRANSPORT", "stdio") or "").strip().lower()
         if transport not in get_args(Transport):
             valid = ", ".join(get_args(Transport))
             raise ConfigError(
-                f"WAZUH_MCP_TRANSPORT must be one of: {valid} (got {transport!r})"
+                f"KLAXON_MCP_TRANSPORT must be one of: {valid} (got {transport!r})"
             )
 
-        path = os.environ.get("WAZUH_MCP_PATH", "/mcp").strip() or "/mcp"
+        path = (_get_env("KLAXON_MCP_PATH", "/mcp") or "").strip() or "/mcp"
         if not path.startswith("/"):
             path = "/" + path
 
         # An Origin header never carries a path, so a trailing slash here would
         # produce an entry that matches nothing — and the failure surfaces in the
         # browser console as a generic CORS error, a long way from this file.
-        cors_origins = tuple(o.rstrip("/") for o in _env_list("WAZUH_MCP_CORS_ORIGINS"))
+        cors_origins = tuple(
+            o.rstrip("/") for o in _env_list("KLAXON_MCP_CORS_ORIGINS")
+        )
         if "*" in cors_origins:
             raise ConfigError(
-                "WAZUH_MCP_CORS_ORIGINS=* is refused. Every tool here runs with "
+                "KLAXON_MCP_CORS_ORIGINS=* is refused. Every tool here runs with "
                 "the Wazuh credentials in this file, so a wildcard grant lets any "
                 "page a browser loads read your SIEM from that browser's network "
                 "position. List the origins that need it, comma-separated, e.g. "
-                "WAZUH_MCP_CORS_ORIGINS=https://openwebui.example"
+                "KLAXON_MCP_CORS_ORIGINS=https://openwebui.example"
             )
 
         return cls(
             transport=transport,  # type: ignore[arg-type]  # checked above
-            host=os.environ.get("WAZUH_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1",
-            port=_env_int("WAZUH_MCP_PORT", 8000),
+            host=(_get_env("KLAXON_MCP_HOST", "127.0.0.1") or "127.0.0.1").strip(),
+            port=_env_int("KLAXON_MCP_PORT", 8000),
             path=path,
-            auth_token=os.environ.get("WAZUH_MCP_AUTH_TOKEN", "").strip(),
-            allowed_hosts=_env_list("WAZUH_MCP_ALLOWED_HOSTS"),
-            allowed_origins=_env_list("WAZUH_MCP_ALLOWED_ORIGINS"),
+            auth_token=(_get_env("KLAXON_MCP_AUTH_TOKEN", "") or "").strip(),
+            allowed_hosts=_env_list("KLAXON_MCP_ALLOWED_HOSTS"),
+            allowed_origins=_env_list("KLAXON_MCP_ALLOWED_ORIGINS"),
             cors_origins=cors_origins,
-            json_response=_env_bool("WAZUH_MCP_JSON_RESPONSE", False),
-            stateless=_env_bool("WAZUH_MCP_STATELESS", False),
+            json_response=_env_bool("KLAXON_MCP_JSON_RESPONSE", False),
+            stateless=_env_bool("KLAXON_MCP_STATELESS", False),
         )
 
 
@@ -598,24 +601,24 @@ class Config:
 
     @classmethod
     def from_env(cls) -> Config:
-        indexer_url = os.environ.get("WAZUH_INDEXER_URL", "").strip().rstrip("/")
+        indexer_url = (_get_env("KLAXON_INDEXER_URL", "") or "").strip().rstrip("/")
         if not indexer_url:
             raise ConfigError(
-                "WAZUH_INDEXER_URL is required (e.g. https://indexer.example:9200). "
+                "KLAXON_INDEXER_URL is required (e.g. https://indexer.example:9200). "
                 "See .env.example."
             )
 
-        manager_url = os.environ.get("WAZUH_MANAGER_URL", "").strip().rstrip("/")
-        engine_url = os.environ.get("WAZUH_ENGINE_URL", "").strip().rstrip("/")
+        manager_url = (_get_env("KLAXON_MANAGER_URL", "") or "").strip().rstrip("/")
+        engine_url = (_get_env("KLAXON_ENGINE_URL", "") or "").strip().rstrip("/")
 
-        verify_ssl = _env_bool("WAZUH_VERIFY_SSL", True)
+        verify_ssl = _env_bool("KLAXON_VERIFY_SSL", True)
         if not verify_ssl:
             # The transport layer is loud about the listening socket; this is
             # the same statement about the outbound one. Every request carries
             # the credentials below, so an unverified connection hands them to
             # anyone in a position to answer for the indexer or the manager.
             logger.warning(
-                "WAZUH_VERIFY_SSL=false disables TLS certificate verification for "
+                "KLAXON_VERIFY_SSL=false disables TLS certificate verification for "
                 "the indexer, manager and engine connections. The credentials in "
                 "this configuration are sent on every request, so anyone able to "
                 "intercept or impersonate those endpoints can take them and read "
@@ -623,36 +626,38 @@ class Config:
                 "production, trust the cluster CA on this host instead."
             )
 
-        search_max_size = _env_int("WAZUH_SEARCH_MAX_SIZE", 100)
+        search_max_size = _env_int("KLAXON_SEARCH_MAX_SIZE", 100)
         if search_max_size <= 0:
             # Disabling it is a legitimate choice for a caller that pages its own
             # way through a result set, but it is not a state to discover from an
             # unusable response — say it once, at startup.
             logger.warning(
-                "WAZUH_SEARCH_MAX_SIZE=%d disables the search result cap. A body "
+                "KLAXON_SEARCH_MAX_SIZE=%d disables the search result cap. A body "
                 'asking for "size": 10000 will now return 10000 full documents.',
                 search_max_size,
             )
 
         return cls(
             indexer_url=indexer_url,
-            indexer_user=os.environ.get("WAZUH_INDEXER_USER", ""),
-            indexer_password=os.environ.get("WAZUH_INDEXER_PASSWORD", ""),
+            indexer_user=_get_env("KLAXON_INDEXER_USER", "") or "",
+            indexer_password=_get_env("KLAXON_INDEXER_PASSWORD", "") or "",
             manager_url=manager_url,
-            manager_user=os.environ.get("WAZUH_MANAGER_USER", ""),
-            manager_password=os.environ.get("WAZUH_MANAGER_PASSWORD", ""),
+            manager_user=_get_env("KLAXON_MANAGER_USER", "") or "",
+            manager_password=_get_env("KLAXON_MANAGER_PASSWORD", "") or "",
             engine_url=engine_url,
             verify_ssl=verify_ssl,
-            timeout=_env_float("WAZUH_TIMEOUT", 60.0),
+            timeout=_env_float("KLAXON_TIMEOUT", 60.0),
             sync_reindex_timeout=_env_float("KLAXON_SYNC_REINDEX_TIMEOUT", 1800.0),
             sync_task_timeout=_env_float("KLAXON_SYNC_TASK_TIMEOUT", 3600.0),
-            schema_field_limit=_env_int("WAZUH_SCHEMA_FIELD_LIMIT", 200),
-            schema_probe_batch=_env_int("WAZUH_SCHEMA_PROBE_BATCH", 100),
+            schema_field_limit=_env_int("KLAXON_SCHEMA_FIELD_LIMIT", 200),
+            schema_probe_batch=_env_int("KLAXON_SCHEMA_PROBE_BATCH", 100),
             search_max_size=search_max_size,
-            logtest_default_trace_level=os.environ.get(
-                "WAZUH_LOGTEST_TRACE_LEVEL", DEFAULT_TRACE_LEVEL
-            ),
-            logtest_default_space=os.environ.get("WAZUH_LOGTEST_SPACE", "custom"),
+            logtest_default_trace_level=_get_env(
+                "KLAXON_LOGTEST_TRACE_LEVEL", DEFAULT_TRACE_LEVEL
+            )
+            or DEFAULT_TRACE_LEVEL,
+            logtest_default_space=_get_env("KLAXON_LOGTEST_SPACE", "custom")
+            or "custom",
             anonymization=AnonymizationConfig.from_env(),
             gdpr=GdprConfig.from_env(),
         )

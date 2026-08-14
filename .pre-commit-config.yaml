@@ -17,3 +17,14 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: klaxon-env-namespace
+        name: klaxon env namespace (KLAXON_* only)
+        description: >-
+          All env reads go through envutil._get_env and use only the canonical
+          KLAXON_* namespace. tests/test_envutil.py grep-scans the source and
+          fails if a legacy WAZUH_* name, the old generator flags or a
+          "deprecated" marker reappears.
+        entry: python -m pytest tests/test_envutil.py -q
+        language: system
+        pass_filenames: false
+        always_run: true

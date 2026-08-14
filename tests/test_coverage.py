@@ -564,7 +564,7 @@ class TestTruncation:
         out = await field_coverage(index=INDEX)
         assert "[TRUNCATED]" in out
         assert "250" in out
-        assert "WAZUH_SCHEMA_FIELD_LIMIT" in out
+        assert "KLAXON_SCHEMA_FIELD_LIMIT" in out
 
     async def test_only_the_capped_fields_are_probed(self, indexer: Any) -> None:
         client = indexer(

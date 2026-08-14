@@ -27,24 +27,24 @@ from klaxon_mcp.config import (
     GdprConfig,
 )
 
-WAZUH_VARS = (
-    "WAZUH_INDEXER_URL",
-    "WAZUH_INDEXER_USER",
-    "WAZUH_INDEXER_PASSWORD",
-    "WAZUH_MANAGER_URL",
-    "WAZUH_MANAGER_USER",
-    "WAZUH_MANAGER_PASSWORD",
-    "WAZUH_ENGINE_URL",
-    "WAZUH_VERIFY_SSL",
-    "WAZUH_TIMEOUT",
-    "WAZUH_SCHEMA_FIELD_LIMIT",
-    "WAZUH_SCHEMA_PROBE_BATCH",
-    "WAZUH_SEARCH_MAX_SIZE",
-    "WAZUH_LOGTEST_TRACE_LEVEL",
-    "WAZUH_LOGTEST_SPACE",
-)
-
 KLAXON_VARS = (
+    # Indexer / manager / engine / tuning (the canonical KLAXON_* namespace;
+    # the legacy WAZUH_* spellings were fully removed).
+    "KLAXON_INDEXER_URL",
+    "KLAXON_INDEXER_USER",
+    "KLAXON_INDEXER_PASSWORD",
+    "KLAXON_MANAGER_URL",
+    "KLAXON_MANAGER_USER",
+    "KLAXON_MANAGER_PASSWORD",
+    "KLAXON_ENGINE_URL",
+    "KLAXON_VERIFY_SSL",
+    "KLAXON_TIMEOUT",
+    "KLAXON_SCHEMA_FIELD_LIMIT",
+    "KLAXON_SCHEMA_PROBE_BATCH",
+    "KLAXON_SEARCH_MAX_SIZE",
+    "KLAXON_LOGTEST_TRACE_LEVEL",
+    "KLAXON_LOGTEST_SPACE",
+    # Anonymization / GDPR / sync.
     "KLAXON_ANONYMIZE_EXTERNAL_LLM",
     "KLAXON_LLM_BASE_URL",
     "KLAXON_ANONYMIZATION_USE_HASH",
@@ -72,9 +72,9 @@ KLAXON_VARS = (
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     """A developer's own .env must not decide what the defaults look like."""
-    for name in (*WAZUH_VARS, *KLAXON_VARS):
+    for name in KLAXON_VARS:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("WAZUH_INDEXER_URL", "https://indexer.example:9200")
+    monkeypatch.setenv("KLAXON_INDEXER_URL", "https://indexer.example:9200")
     # Point the optional config file (and its auto-generated .salt) at tmp so
     # from_env() never writes salt files into the repo.
     monkeypatch.setenv("KLAXON_CONFIG", str(tmp_path / "config.yaml"))
@@ -89,19 +89,19 @@ class TestVerifySsl:
     def test_explicit_true_is_accepted(
         self, monkeypatch: pytest.MonkeyPatch, value: str
     ) -> None:
-        monkeypatch.setenv("WAZUH_VERIFY_SSL", value)
+        monkeypatch.setenv("KLAXON_VERIFY_SSL", value)
         assert Config.from_env().verify_ssl is True
 
     def test_disabling_it_is_possible_but_never_silent(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A self-signed lab cluster is a real case; an unannounced one is not."""
-        monkeypatch.setenv("WAZUH_VERIFY_SSL", "false")
+        monkeypatch.setenv("KLAXON_VERIFY_SSL", "false")
         with caplog.at_level(logging.WARNING, logger="klaxon_mcp.config"):
             config = Config.from_env()
 
         assert config.verify_ssl is False
-        assert "WAZUH_VERIFY_SSL=false" in caplog.text
+        assert "KLAXON_VERIFY_SSL=false" in caplog.text
         assert "credentials" in caplog.text
 
     def test_verifying_says_nothing(
@@ -111,19 +111,20 @@ class TestVerifySsl:
             Config.from_env()
         # Verify_ssl default says nothing (the salt auto-generation warning may
         # fire on a fresh config path, which is unrelated to TLS verification).
-        assert "WAZUH_VERIFY_SSL" not in caplog.text
+        assert "KLAXON_VERIFY_SSL" not in caplog.text
 
 
 class TestRequiredAndOptional:
     def test_indexer_url_is_required(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("KLAXON_INDEXER_URL", raising=False)
         monkeypatch.delenv("WAZUH_INDEXER_URL", raising=False)
-        with pytest.raises(ConfigError, match="WAZUH_INDEXER_URL is required"):
+        with pytest.raises(ConfigError, match="KLAXON_INDEXER_URL is required"):
             Config.from_env()
 
     def test_urls_lose_their_trailing_slash(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("WAZUH_INDEXER_URL", "https://indexer.example:9200/")
+        monkeypatch.setenv("KLAXON_INDEXER_URL", "https://indexer.example:9200/")
         assert Config.from_env().indexer_url == "https://indexer.example:9200"
 
     def test_manager_and_engine_are_optional(self) -> None:
@@ -134,7 +135,7 @@ class TestRequiredAndOptional:
     def test_disabling_the_search_cap_warns(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        monkeypatch.setenv("WAZUH_SEARCH_MAX_SIZE", "0")
+        monkeypatch.setenv("KLAXON_SEARCH_MAX_SIZE", "0")
         with caplog.at_level(logging.WARNING, logger="klaxon_mcp.config"):
             config = Config.from_env()
         assert config.search_max_size == 0
@@ -143,7 +144,7 @@ class TestRequiredAndOptional:
     def test_a_non_numeric_integer_is_a_config_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("WAZUH_SEARCH_MAX_SIZE", "lots")
+        monkeypatch.setenv("KLAXON_SEARCH_MAX_SIZE", "lots")
         with pytest.raises(ConfigError, match="must be an integer"):
             Config.from_env()
 
@@ -394,7 +395,7 @@ class TestBooleanFailClosed:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Non-security flags keep the lenient parser (e.g. verify_ssl typo -> False).
-        monkeypatch.setenv("WAZUH_VERIFY_SSL", "treu")
+        monkeypatch.setenv("KLAXON_VERIFY_SSL", "treu")
         assert Config.from_env().verify_ssl is False
 
 
@@ -572,3 +573,33 @@ class TestGdprConfig:
         monkeypatch.setenv("KLAXON_GDPR_SAMPLE_SIZE", "-1")
         with pytest.raises(ConfigError, match="must be >= 0"):
             GdprConfig.from_env()
+
+
+class TestNoWazuhFallback:
+    """The legacy WAZUH_* spellings are fully removed: the loader reads ONLY
+    the canonical KLAXON_* names. A missing KLAXON_INDEXER_URL raises the
+    standard missing-env error even when the old WAZUH_INDEXER_URL is set —
+    there is no fallback and no deprecation path."""
+
+    def test_klaxon_read_directly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLAXON_INDEXER_URL", "https://klaxon.example:9200")
+        assert Config.from_env().indexer_url == "https://klaxon.example:9200"
+
+    def test_missing_klaxon_raises_even_when_wazuh_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A leftover WAZUH_INDEXER_URL must NOT satisfy the loader: the old
+        namespace is gone, so the canonical missing-env error fires."""
+        monkeypatch.delenv("KLAXON_INDEXER_URL", raising=False)
+        monkeypatch.setenv("WAZUH_INDEXER_URL", "https://legacy.example:9200")
+        with pytest.raises(ConfigError, match="KLAXON_INDEXER_URL is required"):
+            Config.from_env()
+
+    def test_missing_klaxon_ignores_wazuh_for_user(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("KLAXON_INDEXER_USER", raising=False)
+        monkeypatch.setenv("WAZUH_INDEXER_USER", "legacy-user")
+        # KLAXON_INDEXER_URL is still set by the clean_env fixture, so from_env
+        # succeeds — but the user comes ONLY from KLAXON_INDEXER_USER.
+        assert Config.from_env().indexer_user == ""
