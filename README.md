@@ -184,6 +184,19 @@ klaxon masking deploy --tenant customer-a --dry-run   # plan only, no writes
 klaxon masking deploy --tenant customer-a             # needs KLAXON_INDEXER_*
 ```
 
+Remove the Option B masking infrastructure from the indexer cleanly, leaving the
+raw Wazuh streams untouched (destructive — preview with `--dry-run`; a
+mandatory verification phase proves nothing `klaxon-*` is left and the raw
+streams are intact):
+
+```bash
+klaxon masking teardown --tenant customer-a --dry-run       # plan only, no writes
+klaxon masking teardown --tenant customer-a --yes           # needs KLAXON_INDEXER_*
+klaxon masking teardown --tenant customer-a --yes --purge-sync-state
+#   ^ also delete the sync checkpoint marker (default: keep it so a future
+#     re-setup can resume from the last checkpoint)
+```
+
 The live integration test (`klaxon masking test`) needs real indexer credentials —
 see [`docs/option-b-masked-stream.md`](docs/option-b-masked-stream.md#the-live-integration-test-klaxon-masking-test).
 Release history: [`CHANGELOG.md`](CHANGELOG.md).

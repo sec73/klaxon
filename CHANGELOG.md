@@ -6,7 +6,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## released
+
 ## Unreleased
+
+### Added
+
+- **`klaxon masking teardown --tenant <tenant>` — cleanly remove the Option B
+  masked-stream infrastructure from the indexer, leaving the raw Wazuh streams
+  untouched.** New module `src/klaxon_mcp/teardown.py`, wired into the
+  `masking` subcommand. Removes, in dependency order: the masked data stream
+  `klaxon-masked-<tenant>-v5` (plus any orphaned `.ds-klaxon-masked-<tenant>
+  -v5-*` backing indices), the sync checkpoint marker
+  (`klaxon-sync-state/_doc/klaxon-sync-<tenant>`, only with
+  `--purge-sync-state` — the default keeps it so a future re-setup can resume),
+  the index template `klaxon-masked-<tenant>`, the ISM policy
+  `klaxon-masked-retention-<tenant>` and the ingest pipeline
+  `klaxon-mask-<tenant>`. A mandatory verification phase then proves no
+  `klaxon-*` index/template/policy/pipeline is left (including hidden
+  `.ds-klaxon-*` backing indices) and that `wazuh-events-v5-*` /
+  `wazuh-findings-v5-*` still exist with unchanged doc counts; any leftover is
+  reported and the command exits non-zero, so a partial teardown is never
+  reported as success. Hard safety: only `klaxon-*`-namespaced resources are
+  ever deleted (a guard refuses anything else, e.g. `wazuh-*`), a missing
+  resource (404) is treated as already-removed (idempotent), credentials come
+  only from `KLAXON_INDEXER_URL/USER/PASSWORD` (or a local `.env`), and the
+  log contains only resource names and statuses — never the password, salt,
+  tokens or raw data. `--dry-run` prints the plan offline (no credentials
+  needed); without `--yes` the command prompts with the full list and aborts
+  with no changes on non-interactive input. The response-layer masking config
+  and `tenants/<tenant>/fields.yaml` are not touched. New unit tests
+  (`tests/test_teardown.py`, 23) cover dependency order, the backing-index
+  sweep, idempotency, dry-run no-op, confirmation gating, sync-state
+  keep-vs-purge, verification-failure non-zero, no-secret output and the
+  never-touches-`wazuh-*` guarantee.
 
 ## 0.2.0 – 2026-08-13
 
