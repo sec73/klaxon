@@ -119,7 +119,49 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-run-no-op with injected defaults; the live test
   (`tests/test_live_deploy.py`) now routes the comparison through the full
   defaults normalization.
+- **`masking deploy` no longer reports OpenSearch's own index-template and
+  security-role defaults/metadata as drift either.** The index-template GET
+  re-serves `composed_of: []`, a default `data_stream.timestamp_field`, moves
+  bare index settings (`number_of_shards`, ...) under `settings.index.*` and
+  stringifies numeric values (`1` -> `"1"`); the security-plugin roles PUT API
+  REJECTS `static`/`hidden`/`reserved` in the request body (`invalid_keys`),
+  and the role GET re-adds them plus `fls: []` / `masked_fields: []` to every
+  `index_permissions[]` entry. In `deploy.py`: data-driven `TEMPLATE_SERVER_
+  DEFAULTS` and `_ROLE_SERVER_DEFAULTS` constants (the single place to add
+  future defaults), `_canonical_settings` (settings shape/value canonicalization
+  — deliberately an allowlist so an unknown server behavior fails loud rather
+  than passing silently), `_ROLE_SERVER_KEYS` (stripped from the PUT body and
+  the compare), and a shared `_drop_server_defaults` helper (generalized from
+  the ISM one) that drops a default-valued key only when it is ABSENT in the
+  sent body — explicit sent values are never touched, so genuine drift (changed
+  `priority`/`index_patterns`/`number_of_shards`, different role `allowed_
+  actions`/`fls`) still fails with a field-level diff. New tests
+  (`tests/test_deploy.py::TestTemplateServerDefaults`, `TestRoleServerKeys`)
+  cover the normalized re-served shapes end to end.
 
+- **The Option B pipeline now masks NESTED structured fields — the real Wazuh
+  shape.** Real Wazuh events store their fields nested (`user: {name: ...}`,
+  `source: {ip: ...}`, `destination: {ip: ...}`, `related: {user: [...]}`), but
+  the generated Painless script (and its Python twin `pipeline_mask_doc`)
+  looked fields up as a FLAT top-level `user.name` key — so on a real indexer
+  the structured pass silently no-oped and personal data was left unmasked
+  (only the free-text pass and the flat-key live-test documents worked). In
+  `painless.py`: new `deepCopy`/`pathGet`/`pathPut` navigate dotted paths (both
+  the nested form and a flattened literal key) and the document is deep-copied
+  so the free-text registry still reads the RAW source; `masked_stream.py`
+  mirrors them (`_path_get`/`_path_set`). The free-text pass order now matches
+  the response layer — e-mails/IPs first, then the known-identity registry,
+  then the username context patterns — so an e-mail whose local part is a
+  structured username masks as ONE `[EMAIL_...]` (never `[USER_...]@example.
+  com`), and the twin's registry is now correctly gated on
+  `mask_free_text_users` (it ran unconditionally before, diverging from the
+  deployed script). `live_test.py` docs/checks and the HMAC-vector docs use the
+  NESTED shape, so `klaxon masking test` proves nested masking on a live
+  indexer, and the deploy smoke test (`user.name` + free-text `uid=` share one
+  token) passes on real nested documents. `selftest.py` registers the new
+  functions. Committed artifacts and the golden master regenerated; the
+  twin-masked-doc golden now masks the nested fields and matches the
+  response-layer golden exactly.
 ## 0.2.0 – 2026-08-13
 
 ### Fixed

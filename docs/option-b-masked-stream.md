@@ -150,18 +150,24 @@ artifacts, including the quarantine ISM/template and the roles fragment.
 
 ## The pipeline
 
-`klaxon-mask-<tenant>` is a Painless script processor. It copies `_source`,
-masks the structured fields from the table (arrays element-wise, missing fields
-no-op, already-tokenised values passed through unchanged), then runs a
-free-text pass over `message` and any other `free_text_fields`:
+`klaxon-mask-<tenant>` is a Painless script processor. It deep-copies `_source`,
+masks the structured fields from the table at their dotted paths — real Wazuh
+events NEST their fields (`user: {name: ...}`, `source: {ip: ...}`), and some
+flatten them into a single `user.name` key; both forms are masked, arrays
+element-wise, missing fields no-op, already-tokenised values passed through
+unchanged — then runs a free-text pass over `message` and any other
+`free_text_fields`:
 
-1. Known identities first — a raw username from a structured `USER` field is
-   replaced wherever it appears in free text, **reusing the exact structured
-   token** (the registry reads the raw document, not the already-masked map).
-2. Value types: e-mails and IP addresses anywhere.
-3. Username context patterns (`user=...`, `Accepted publickey for ...`,
-   `uid=...` with a leading letter, `... (uid=N)`, bare `user <name>`).
-4. When `mask_free_text_users: false`, steps 1 and 3's broader patterns are
+1. Value types first: e-mails and IP addresses anywhere. An e-mail whose local
+   part is a structured username masks as ONE `[EMAIL_...]` (never split into
+   `[USER_...]@example.com`).
+2. Known identities — a raw username from a structured `USER` field is replaced
+   wherever it appears in free text, **reusing the exact structured token** (the
+   registry reads the raw document, not the already-masked map).
+3. Username context patterns (`user: <name>` / `user=<name>`, `Accepted
+   publickey for ...`, `uid=...` with a leading letter, `... (uid=N)`); a bare
+   `user <name>` is masked via the step-2 registry when the username is known.
+4. When `mask_free_text_users: false`, steps 2 and 3's broader patterns are
    skipped; e-mails, IPs and the two basic `user`-noun/auth forms still mask.
 
 ### The `on_failure` block — FAIL-CLOSED (quarantine routing)
