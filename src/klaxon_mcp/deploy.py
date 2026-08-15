@@ -101,6 +101,13 @@ _ISM_SERVER_KEYS = frozenset(
     {"policy_id", "last_updated_time", "schema_version", "error_notification"}
 )
 
+# Keys the OpenSearch security plugin manages and its roles PUT API REJECTS in
+# the request body (`invalid_keys: static,hidden,reserved`) — they are
+# GET-returned metadata. Stripped from the PUT body and from the GET-back
+# compare so the deploy's role step works on a real cluster (the roles
+# fragment documents them, but they are not accepted on write).
+_ROLE_SERVER_KEYS = frozenset({"reserved", "hidden", "static"})
+
 # Sentinel: a key is NOT in ISM_SERVER_DEFAULTS (distinct from a default whose
 # value happens to be None).
 _UNSET = object()
@@ -166,13 +173,16 @@ def _normalized_for_compare(kind: str, obj: Any) -> Any:
     """Normalize a resource body for the fingerprint comparison.
 
     Drops the OpenSearch wrapper keys around a served resource plus per-kind
-    server-managed fields (the ISM plugin's policy_id / last_updated_time /
-    schema_version / error_notification) that a GET returns but a PUT body
-    never carries.
+    server-managed fields that a GET returns but a PUT body never carries (the
+    ISM plugin's policy_id / last_updated_time / schema_version /
+    error_notification, and the security plugin's reserved / hidden / static
+    role keys).
     """
     obj = _drop_wrapper_keys(obj)
     if kind == "ism" and isinstance(obj, dict):
         return {k: v for k, v in obj.items() if k not in _ISM_SERVER_KEYS}
+    if kind == "role" and isinstance(obj, dict):
+        return {k: v for k, v in obj.items() if k not in _ROLE_SERVER_KEYS}
     return obj
 
 
@@ -304,34 +314,184 @@ def _canonicalize_ism_template(obj: Any) -> Any:
     return obj
 
 
-def _drop_ism_server_defaults(sent: Any, deployed: Any) -> tuple[Any, Any]:
-    """Pairwise: drop a deployed default when `sent` omitted the key. Metadata
-    and the `ism_template` shape are handled upstream (`_strip_ism_metadata` /
-    `_canonicalize_ism_template`)."""
+def _drop_server_defaults(
+    sent: Any, deployed: Any, defaults: dict[str, Any]
+) -> tuple[Any, Any]:
+    """Pairwise: drop a deployed default when `sent` omitted the key.
+
+    `defaults` maps a key to its known server default (or the `_ISM_METADATA`
+    sentinel for pure metadata, which is handled upstream). A default-valued
+    key (`retry`, `copy_alias`, `composed_of`, `data_stream.timestamp_field`,
+    ...) that is ABSENT in `sent` but present on the deployed side with the
+    known default is dropped, so both sides compare equal. An explicit value in
+    `sent` is never touched, so genuine drift still fails with a precise field
+    path.
+    """
     if isinstance(sent, dict) and isinstance(deployed, dict):
         sent_norm = dict(sent)
         deployed_norm = dict(deployed)
         for key in set(sent_norm) | set(deployed_norm):
-            default = ISM_SERVER_DEFAULTS.get(key, _UNSET)
+            default = defaults.get(key, _UNSET)
             if default is _UNSET or default is _ISM_METADATA:
                 continue
             if key not in sent_norm and deployed_norm.get(key) == default:
-                # Sent omitted the key and ISM injected its default -> not drift.
+                # Sent omitted the key and the server injected its default.
                 del deployed_norm[key]
         for key in set(sent_norm) & set(deployed_norm):
-            sent_norm[key], deployed_norm[key] = _drop_ism_server_defaults(
-                sent_norm[key], deployed_norm[key]
+            sent_norm[key], deployed_norm[key] = _drop_server_defaults(
+                sent_norm[key], deployed_norm[key], defaults
             )
         return sent_norm, deployed_norm
     if isinstance(sent, list) and isinstance(deployed, list):
         sent_items = list(sent)
         deployed_items = list(deployed)
         for index in range(min(len(sent_items), len(deployed_items))):
-            sent_items[index], deployed_items[index] = _drop_ism_server_defaults(
-                sent_items[index], deployed_items[index]
+            sent_items[index], deployed_items[index] = _drop_server_defaults(
+                sent_items[index], deployed_items[index], defaults
             )
         return sent_items, deployed_items
     return sent, deployed
+
+
+def _drop_ism_server_defaults(sent: Any, deployed: Any) -> tuple[Any, Any]:
+    """Drop known ISM server defaults/metadata from a sent/deployed policy pair
+    (`ISM_SERVER_DEFAULTS`)."""
+    return _drop_server_defaults(sent, deployed, ISM_SERVER_DEFAULTS)
+
+
+# --------------------------------------------------------------------------- #
+# Index-template server-defaults normalization (mirrors the ISM one)
+# --------------------------------------------------------------------------- #
+
+# Known OpenSearch index-template server defaults the plugin adds when the PUT
+# body omitted them. These are OpenSearch behaviors, NOT Klaxon's — a re-served
+# template carries them, so the deploy verify must not report them as drift. An
+# explicit value in the sent body is always respected (never clobbered): a key
+# is only dropped from the DEPLOYED side when it is ABSENT in the sent side AND
+# the deployed value equals the default. THIS is the single place to add future
+# index-template defaults. The `template.settings` shape/value normalization is
+# separate (`_canonical_settings` / `_INDEX_LEVEL_SETTINGS`).
+TEMPLATE_SERVER_DEFAULTS: dict[str, Any] = {
+    # Default empty `composed_of` the plugin adds to every template that
+    # omitted it.
+    "composed_of": [],
+    # Default `@timestamp` timestamp field the plugin adds to the `data_stream`
+    # block of a data-stream template that omitted it.
+    "timestamp_field": {"name": "@timestamp"},
+}
+
+# Index-level settings OpenSearch re-serves nested under `template.settings.
+# index.*`: a bare spelling (`number_of_shards`) is moved there, a dotted
+# `index.default_pipeline` is split, and numeric values are stringified
+# (`1` -> `"1"`). Both spellings are equivalent for a given setting, so both
+# sides are canonicalized to the nested `index.<name>` form before the
+# fingerprint compare. Deliberately an ALLOWLIST: a setting outside it is left
+# as sent, so an unknown server behavior surfaces as a (loud, safe) verify
+# failure instead of silently hiding a real change — add it here once observed.
+_INDEX_LEVEL_SETTINGS = frozenset(
+    {"number_of_shards", "number_of_replicas", "default_pipeline"}
+)
+
+
+def _canonical_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    """Flatten `template.settings` to canonical `index.<name>` keys.
+
+    OpenSearch re-serves index-level settings nested under `settings.index.*`
+    (bare `number_of_shards` moved there, dotted `index.default_pipeline`
+    split) with numeric values stringified. Both spellings are equivalent, so
+    both sides flatten to `index.<name>` keys (numeric values as strings)
+    before the compare; genuinely different values still differ.
+    """
+    flat: dict[str, Any] = {}
+    for key, value in settings.items():
+        if key == "index" and isinstance(value, dict):
+            for sub, sub_value in value.items():
+                flat[f"index.{sub}"] = sub_value
+        elif key.startswith("index."):
+            flat[key] = value
+        elif key in _INDEX_LEVEL_SETTINGS:
+            flat[f"index.{key}"] = value
+        else:
+            flat[key] = value
+    return {
+        name: (
+            str(value)
+            if name.startswith("index.") and isinstance(value, int)
+            else value
+        )
+        for name, value in flat.items()
+    }
+
+
+def _canonicalize_template_settings(obj: Any) -> Any:
+    """Recursively apply `_canonical_settings` to every `template.settings`
+    block; every other value is left byte-identical (index_patterns, priority,
+    data_stream, mappings)."""
+    if isinstance(obj, dict):
+        result: dict[str, Any] = {}
+        for key, value in obj.items():
+            if key == "template" and isinstance(value, dict):
+                template = dict(value)
+                settings = template.get("settings")
+                if isinstance(settings, dict):
+                    template["settings"] = _canonical_settings(settings)
+                result[key] = _canonicalize_template_settings(template)
+            else:
+                result[key] = _canonicalize_template_settings(value)
+        return result
+    if isinstance(obj, list):
+        return [_canonicalize_template_settings(value) for value in obj]
+    return obj
+
+
+def _normalize_template_server_defaults(sent: Any, deployed: Any) -> tuple[Any, Any]:
+    """Drop known index-template server defaults from a sent/deployed pair.
+
+    OpenSearch re-serves a template with resolved defaults the PUT body omitted
+    (see `TEMPLATE_SERVER_DEFAULTS`) and in a normalized settings shape — these
+    are OpenSearch behaviors, not drift. Two steps, applied to the (already
+    wrapper-stripped) pair:
+
+      1. `_canonicalize_template_settings` — canonicalize the
+         `template.settings` shape (bare vs `settings.index.*` nesting, numeric
+         int vs str) on BOTH sides;
+      2. `_drop_server_defaults` with `TEMPLATE_SERVER_DEFAULTS` — a
+         default-valued key (`composed_of`, `data_stream.timestamp_field`)
+         that is ABSENT in `sent` but present on the deployed side with the
+         known default is dropped.
+
+    An explicit value in `sent` is never touched, so genuine drift still fails
+    with a precise field path.
+    """
+    return _drop_server_defaults(
+        _canonicalize_template_settings(sent),
+        _canonicalize_template_settings(deployed),
+        TEMPLATE_SERVER_DEFAULTS,
+    )
+
+
+# Server-managed defaults the security plugin adds to every `index_permissions`
+# entry when the PUT body omitted them (field-level security / masked fields —
+# GET-returned, like the ISM `retry` default). These are OpenSearch behaviors,
+# NOT Klaxon's; dropped from the deployed side when ABSENT in sent and equal to
+# the default. An explicit value in `sent` is always respected. THIS is the
+# single place to add future role defaults.
+_ROLE_SERVER_DEFAULTS: dict[str, Any] = {
+    # Default empty field-level-security list the plugin adds to each
+    # `index_permissions[]` entry that omitted it.
+    "fls": [],
+    # Default empty masked-fields list the plugin adds to each
+    # `index_permissions[]` entry that omitted it.
+    "masked_fields": [],
+}
+
+
+def _normalize_role_server_defaults(sent: Any, deployed: Any) -> tuple[Any, Any]:
+    """Drop known security-plugin server defaults from a sent/deployed role pair
+    (`_ROLE_SERVER_DEFAULTS`): `fls` / `masked_fields` added to each
+    `index_permissions[]` entry. An explicit value in `sent` is never touched,
+    so genuine drift still fails with a precise field path."""
+    return _drop_server_defaults(sent, deployed, _ROLE_SERVER_DEFAULTS)
 
 
 def _json_diff(a: Any, b: Any, path: str = "$") -> list[str]:
@@ -444,6 +604,10 @@ async def _verify_after_put(
     received_norm = _normalized_for_compare(kind, received)
     if kind == "ism":
         sent, received_norm = _normalize_ism_server_defaults(sent, received_norm)
+    elif kind == "template":
+        sent, received_norm = _normalize_template_server_defaults(sent, received_norm)
+    elif kind == "role":
+        sent, received_norm = _normalize_role_server_defaults(sent, received_norm)
     if _fingerprint_for(kind, received_norm) != _fingerprint_for(kind, sent):
         lines.append(
             f"[fail] {label}: deployed resource does not match what was sent "
@@ -741,8 +905,12 @@ async def _deploy_roles(
 ) -> bool:
     ok = True
     for name, spec in roles.items():
+        # The security-plugin roles PUT API rejects the server-managed keys
+        # (`static`/`hidden`/`reserved`) in the request body — strip them
+        # (the GET-back compare drops them too, see `_ROLE_SERVER_KEYS`).
+        body = {k: v for k, v in spec.items() if k not in _ROLE_SERVER_KEYS}
         if not await _put_verified(
-            client, f"role {name}", f"/_plugins/_security/api/roles/{name}", spec, kind="role", lines=lines
+            client, f"role {name}", f"/_plugins/_security/api/roles/{name}", body, kind="role", lines=lines
         ):
             ok = False
     return ok

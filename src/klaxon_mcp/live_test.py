@@ -66,7 +66,7 @@ from .live_config import (
     resolve_live_config,
     safe_url,
 )
-from .masked_stream import build_pipeline, load_tenant_config, token
+from .masked_stream import _path_get, build_pipeline, load_tenant_config, token
 from .masking import verify_script_structure
 
 # Explicit re-export for mypy strict: names tests access via `live_test.X`.
@@ -232,6 +232,24 @@ def _error_note(doc: dict[str, Any]) -> str:
     return f"klaxon.masking_error: {err[:300]}"
 
 
+def _nested_from_path(path: str, value: Any) -> dict[str, Any]:
+    """Build a NESTED document for a dotted field path.
+
+    Real Wazuh events store their fields nested (`"user.name"` becomes
+    `{"user": {"name": value}}`), and the masking pipeline now navigates
+    those paths — so the live test sends the nested shape.
+    """
+    parts = path.split(".")
+    out: dict[str, Any] = {}
+    cur = out
+    for part in parts[:-1]:
+        nxt: dict[str, Any] = {}
+        cur[part] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+    return out
+
+
 def live_test_docs() -> list[dict[str, Any]]:
     """Representative documents for the pipeline simulate.
 
@@ -252,18 +270,23 @@ def live_test_docs() -> list[dict[str, Any]]:
             "_index": "klaxon-masked-customer-a-v5-000001",
             "_id": "1",
             "_source": {
-                "user.name": "alice",
-                "user.effective.name": "root(uid=0)",
-                "related.user": ["bob", "carol"],
-                "related.hosts": ["web01", "web02"],
-                "related.hash": [
-                    "sha256:aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
-                ],
-                "event.original": (
-                    "Aug 11 09:00:00 web01 sshd[1234]: Accepted publickey for "
-                    "alice from 192.168.1.10 port 22"
-                ),
-                "destination.ip": "[IP_0123456789abcdef]",
+                # Real Wazuh events NEST their fields — the pipeline now
+                # navigates those paths, so the live test sends the nested form.
+                "user": {"name": "alice", "effective": {"name": "root(uid=0)"}},
+                "related": {
+                    "user": ["bob", "carol"],
+                    "hosts": ["web01", "web02"],
+                    "hash": [
+                        "sha256:aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
+                    ],
+                },
+                "event": {
+                    "original": (
+                        "Aug 11 09:00:00 web01 sshd[1234]: Accepted publickey for "
+                        "alice from 192.168.1.10 port 22"
+                    )
+                },
+                "destination": {"ip": "[IP_0123456789abcdef]"},
                 "message": (
                     "sudo: pam_unix(sudo:session): session opened for user alice "
                     "by root(uid=0); uid=alice login as alice; ssh from "
@@ -275,7 +298,7 @@ def live_test_docs() -> list[dict[str, Any]]:
             "_index": "klaxon-masked-customer-a-v5-000001",
             "_id": "2",
             "_source": {
-                "user.name": "dave",
+                "user": {"name": "dave"},
                 "message": (
                     "login failed for uid=dave from 10.20.30.40 (invalid credentials)"
                 ),
@@ -285,7 +308,7 @@ def live_test_docs() -> list[dict[str, Any]]:
             "_index": "klaxon-masked-customer-a-v5-000001",
             "_id": "3",
             "_source": {
-                "host.hostname": "server42",
+                "host": {"hostname": "server42"},
                 "message": "kernel: boot sequence complete; no personal data",
             },
         },
@@ -310,7 +333,7 @@ def live_test_docs() -> list[dict[str, Any]]:
             "_index": "klaxon-masked-customer-a-v5-000001",
             "_id": "5",
             "_source": {
-                "user.name": "müller",
+                "user": {"name": "müller"},
                 "message": "session opened for user müller from 10.20.30.50",
             },
         },
@@ -466,31 +489,41 @@ def check_simulated(
     def tok(family: str, value: str) -> str:
         return token(family, value, salt)
 
-    # ---- Doc 1: the comprehensive document ----
+    # ---- Doc 1: the comprehensive document (NESTED fields, the real Wazuh shape) ----
     d1, raw1 = sources[0], docs[0]["_source"]
     note1 = _error_note(d1)
     if note1:
         problems.append(f"doc 1 rejected: {note1}")
-    if d1.get("user.name") != tok("USER", "alice"):
-        problems.append(f"doc 1 user.name -> {d1.get('user.name')!r} (expected {tok('USER', 'alice')!r})")
-    if d1.get("user.effective.name") != tok("USER", "root(uid=0)"):
+    if _path_get(d1, "user.name") != tok("USER", "alice"):
         problems.append(
-            f"doc 1 user.effective.name -> {d1.get('user.effective.name')!r} "
+            f"doc 1 user.name -> {_path_get(d1, 'user.name')!r} "
+            f"(expected {tok('USER', 'alice')!r})"
+        )
+    if _path_get(d1, "user.effective.name") != tok("USER", "root(uid=0)"):
+        problems.append(
+            f"doc 1 user.effective.name -> {_path_get(d1, 'user.effective.name')!r} "
             f"(expected {tok('USER', 'root(uid=0)')!r})"
         )
-    if d1.get("related.user") != [tok("USER", "bob"), tok("USER", "carol")]:
-        problems.append(f"doc 1 related.user not masked element-wise: {d1.get('related.user')!r}")
-    if d1.get("related.hosts") != [tok("HOST", "web01"), tok("HOST", "web02")]:
-        problems.append(f"doc 1 related.hosts not masked element-wise: {d1.get('related.hosts')!r}")
-    if d1.get("related.hash") != raw1["related.hash"]:
-        problems.append(f"doc 1 related.hash was masked: {d1.get('related.hash')!r}")
-    if d1.get("destination.ip") != "[IP_0123456789abcdef]":
+    if _path_get(d1, "related.user") != [tok("USER", "bob"), tok("USER", "carol")]:
         problems.append(
-            f"doc 1 already-tokenised destination.ip was re-masked: {d1.get('destination.ip')!r}"
+            f"doc 1 related.user not masked element-wise: {_path_get(d1, 'related.user')!r}"
         )
-    if d1.get("event.original") != tok("USER", raw1["event.original"]):
+    if _path_get(d1, "related.hosts") != [tok("HOST", "web01"), tok("HOST", "web02")]:
         problems.append(
-            f"doc 1 event.original -> {d1.get('event.original')!r} (expected one token {tok('USER', raw1['event.original'])!r})"
+            f"doc 1 related.hosts not masked element-wise: {_path_get(d1, 'related.hosts')!r}"
+        )
+    if _path_get(d1, "related.hash") != _path_get(raw1, "related.hash"):
+        problems.append(f"doc 1 related.hash was masked: {_path_get(d1, 'related.hash')!r}")
+    if _path_get(d1, "destination.ip") != "[IP_0123456789abcdef]":
+        problems.append(
+            "doc 1 already-tokenised destination.ip was re-masked: "
+            f"{_path_get(d1, 'destination.ip')!r}"
+        )
+    if _path_get(d1, "event.original") != tok("USER", _path_get(raw1, "event.original")):
+        problems.append(
+            "doc 1 event.original -> "
+            f"{_path_get(d1, 'event.original')!r} (expected one token "
+            f"{tok('USER', _path_get(raw1, 'event.original'))!r})"
         )
 
     msg = d1.get("message")
@@ -517,13 +550,16 @@ def check_simulated(
                 "(free-text registry consistency)"
             )
 
-    # ---- Doc 2: uid=<name> reuses the structured token ----
+    # ---- Doc 2: uid=<name> reuses the structured token (NESTED) ----
     d2, raw2 = sources[1], docs[1]["_source"]
     note2 = _error_note(d2)
     if note2:
         problems.append(f"doc 2 rejected: {note2}")
-    if d2.get("user.name") != tok("USER", "dave"):
-        problems.append(f"doc 2 user.name -> {d2.get('user.name')!r} (expected {tok('USER', 'dave')!r})")
+    if _path_get(d2, "user.name") != tok("USER", "dave"):
+        problems.append(
+            f"doc 2 user.name -> {_path_get(d2, 'user.name')!r} "
+            f"(expected {tok('USER', 'dave')!r})"
+        )
     msg2 = d2.get("message")
     if not isinstance(msg2, str):
         problems.append("doc 2 message missing after simulate")
@@ -540,13 +576,13 @@ def check_simulated(
         if ip_tok not in msg2 or "10.20.30.40" in msg2:
             problems.append("doc 2 message did not mask 10.20.30.40")
 
-    # ---- Doc 3: no personal data -> no-op ----
+    # ---- Doc 3: no personal data -> no-op (NESTED HOST) ----
     d3, raw3 = sources[2], docs[2]["_source"]
     note3 = _error_note(d3)
     if note3:
         problems.append(f"doc 3 rejected: {note3}")
-    if d3.get("host.hostname") != tok("HOST", "server42"):
-        problems.append(f"doc 3 host.hostname -> {d3.get('host.hostname')!r}")
+    if _path_get(d3, "host.hostname") != tok("HOST", "server42"):
+        problems.append(f"doc 3 host.hostname -> {_path_get(d3, 'host.hostname')!r}")
     if d3.get("message") != raw3["message"]:
         problems.append(
             f"doc 3 no-op message changed: {d3.get('message')!r}"
@@ -572,9 +608,9 @@ def check_simulated(
     note5 = _error_note(d5)
     if note5:
         problems.append(f"doc 5 rejected: {note5}")
-    if d5.get("user.name") != tok("USER", "müller"):
+    if _path_get(d5, "user.name") != tok("USER", "müller"):
         problems.append(
-            f"doc 5 user.name -> {d5.get('user.name')!r} (expected "
+            f"doc 5 user.name -> {_path_get(d5, 'user.name')!r} (expected "
             f"{tok('USER', 'müller')!r})"
         )
     msg5 = d5.get("message")
@@ -647,8 +683,9 @@ def check_quarantine_routing(
             )
     # The original raw source must be preserved in quarantine (that is what
     # makes it forensically useful and is the reason it is NOT in the LLM
-    # allowlist).
-    if "message" not in src and "user.name" not in src:
+    # allowlist). The forced-failure doc is nested, so read the field at its
+    # dotted path.
+    if "message" not in src and _path_get(src, "user.name") is None:
         problems.append(
             "routed doc did not preserve the original source fields (quarantine "
             "keeps the RAW document)"
@@ -708,7 +745,9 @@ async def stage_b_simulate_hmac_vectors(
                 {
                     "_index": "klaxon-masked-customer-a-v5-000001",
                     "_id": label,
-                    "_source": {field: value},
+                    # Real Wazuh events NEST their fields; build the nested shape
+                    # so the vector flows through the nested-path masking.
+                    "_source": _nested_from_path(field, value),
                 }
             )
         if not docs:
@@ -723,7 +762,7 @@ async def stage_b_simulate_hmac_vectors(
         for vec, src in zip(sent, sources):
             label, _s, family, value, _full, _tok = vec
             field = _FAMILY_FIELD[family]
-            results.append((label, field, src.get(field) if src else None))
+            results.append((label, field, _path_get(src, field) if src else None))
 
     return results, errors
 

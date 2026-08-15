@@ -23,7 +23,11 @@ import httpx
 import pytest
 
 from klaxon_mcp import deploy
-from klaxon_mcp.masked_stream import build_ism_policy, load_tenant_config
+from klaxon_mcp.masked_stream import (
+    build_index_template,
+    build_ism_policy,
+    load_tenant_config,
+)
 from klaxon_mcp.tokens import token
 
 TEST_SALT = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -62,6 +66,40 @@ def _inject_ism_server_defaults(policy: dict[str, Any]) -> dict[str, Any]:
         for entry in template:
             if isinstance(entry, dict):
                 entry.setdefault("last_updated_time", 1_786_700_788_793)
+    return served
+
+
+def _inject_template_server_defaults(template: dict[str, Any]) -> dict[str, Any]:
+    """The template as OpenSearch re-serves it (mirrors deploy's
+    TEMPLATE_SERVER_DEFAULTS / _canonical_settings): `composed_of: []` and the
+    default `data_stream.timestamp_field` added, and `template.settings` with
+    every index-level setting nested under `settings.index.*` and numeric
+    values stringified (`1` -> `"1"`). The Klaxon templates carry only index
+    settings, so moving every bare setting under `index.*` is faithful."""
+    import copy
+
+    served = copy.deepcopy(template)
+    served.setdefault("composed_of", [])
+    if isinstance(served.get("data_stream"), dict):
+        served["data_stream"].setdefault(
+            "timestamp_field", {"name": "@timestamp"}
+        )
+    settings = served.get("template", {}).get("settings")
+    if isinstance(settings, dict):
+        index_settings: dict[str, Any] = {}
+        for key, value in settings.items():
+            if key == "index" and isinstance(value, dict):
+                index_settings.update(value)
+            elif key.startswith("index."):
+                index_settings[key[len("index.") :]] = value
+            else:
+                index_settings[key] = value
+        served["template"]["settings"] = {
+            "index": {
+                name: (str(value) if isinstance(value, int) else value)
+                for name, value in index_settings.items()
+            }
+        }
     return served
 
 
@@ -106,6 +144,8 @@ class FakeIndexer:
         ism_conflict_before_put: int = 0,
         ism_double_nested: bool = False,
         ism_inject_defaults: bool = False,
+        template_normalize: bool = False,
+        role_strict: bool = False,
     ) -> None:
         self.salt = salt
         self.data_stream_present = data_stream_present
@@ -115,6 +155,8 @@ class FakeIndexer:
         self.ism_conflict_before_put = ism_conflict_before_put
         self.ism_double_nested = ism_double_nested
         self.ism_inject_defaults = ism_inject_defaults
+        self.template_normalize = template_normalize
+        self.role_strict = role_strict
         self.store: dict[str, Any] = {}  # path -> echoed body
         self.puts: list[tuple[str, str, Any, Any]] = []  # (method, path, body, params)
         self.ism_meta: dict[str, dict[str, int]] = {}  # policy name -> version state
@@ -193,15 +235,34 @@ class FakeIndexer:
         if path.startswith("/_index_template/"):
             name = path.rsplit("/", 1)[1]
             if name in self.store:
+                body = self.store[name]
+                if self.template_normalize:
+                    # Real OpenSearch re-serves the template with resolved
+                    # defaults + normalized settings (see
+                    # TEMPLATE_SERVER_DEFAULTS / _canonical_settings).
+                    body = _inject_template_server_defaults(body)
                 return FakeResp(
                     200,
-                    {"index_templates": [{"name": name, "index_template": self.store[name]}]},
+                    {"index_templates": [{"name": name, "index_template": body}]},
                 )
             return FakeResp(404, {"error": {"reason": "index_template_missing_exception"}})
         if path.startswith("/_plugins/_security/api/roles"):
             name = path.rsplit("/", 1)[1] if "/" in path.replace("/_plugins/_security/api/roles", "", 1) else None
             if name and name in self.store:
-                return FakeResp(200, {name: self.store[name]})
+                body = dict(self.store[name])
+                if self.role_strict:
+                    # Real GET re-serves the server-managed keys the PUT API
+                    # rejects (see _ROLE_SERVER_KEYS) plus the fls/masked_fields
+                    # defaults on every index_permissions entry (see
+                    # _ROLE_SERVER_DEFAULTS).
+                    body.setdefault("reserved", False)
+                    body.setdefault("hidden", False)
+                    body.setdefault("static", False)
+                    for perm in body.get("index_permissions") or []:
+                        if isinstance(perm, dict):
+                            perm.setdefault("fls", [])
+                            perm.setdefault("masked_fields", [])
+                return FakeResp(200, {name: body})
             if name:
                 return FakeResp(404, {"error": {"reason": "no such role"}})
             return FakeResp(200, {"roles": {k: v for k, v in self.store.items() if k.startswith("klaxon_")}})
@@ -227,7 +288,25 @@ class FakeIndexer:
             return FakeResp(200, {"acknowledged": True})
         if path.startswith("/_plugins/_ism/policies/"):
             return self._ism_put(path.rsplit("/", 1)[1], body, params)
+        if self.role_strict and path.startswith("/_plugins/_security/api/roles/"):
+            return self._role_put(path.rsplit("/", 1)[1], body)
         self.store[path.rsplit("/", 1)[1]] = body
+        return FakeResp(200, {"acknowledged": True})
+
+    def _role_put(self, name: str, body: dict[str, Any]) -> FakeResp:
+        """Simulate the security plugin's roles PUT API: it REJECTS the
+        server-managed keys (`static`/`hidden`/`reserved`) in the request
+        body (see deploy._ROLE_SERVER_KEYS)."""
+        if any(k in body for k in ("reserved", "hidden", "static")):
+            return FakeResp(
+                400,
+                {
+                    "status": "error",
+                    "reason": "Invalid configuration",
+                    "invalid_keys": {"keys": "static,hidden,reserved"},
+                },
+            )
+        self.store[name] = body
         return FakeResp(200, {"acknowledged": True})
 
     def _ism_put(
@@ -920,6 +999,23 @@ class TestIsmServerDefaults:
         assert not ok
         assert any("states" in l for l in lines)
 
+    async def test_changed_index_patterns_still_fails(self) -> None:
+        # A different `ism_template` pattern is real drift and must survive the
+        # defaults-stripping (which only drops the `last_updated_time`
+        # metadata), reporting the differing field path — never silently
+        # normalized away.
+        sent = self._policy()
+        deployed = self._policy()
+        deployed["policy"]["ism_template"]["index_patterns"] = ["other-tenant-v5*"]
+        fake = FakeIndexer(ism_double_nested=True, ism_inject_defaults=True)
+        await fake.put(self.ISM_PATH, content=json.dumps(deployed))
+        lines: list[str] = []
+        ok = await deploy._verify_after_put(
+            fake, self.LABEL, self.ISM_PATH, sent, kind="ism", lines=lines
+        )
+        assert not ok
+        assert any("index_patterns" in l for l in lines)
+
     def test_ism_server_defaults_constant_is_the_single_source(self) -> None:
         defaults = deploy.ISM_SERVER_DEFAULTS
         assert defaults["retry"] == dict(_ISM_RETRY_DEFAULT)
@@ -1020,9 +1116,314 @@ class TestIsmServerDefaults:
         assert "[skip] ISM klaxon-quarantine-retention-customer-a unchanged" in out
 
 
+class TestTemplateServerDefaults:
+    """OpenSearch re-serves an index template with resolved defaults and a
+    normalized settings shape the PUT body omitted (see
+    `deploy.TEMPLATE_SERVER_DEFAULTS` / `_canonical_settings`): `composed_of:
+    []`, `data_stream.timestamp_field`, and `template.settings` with the bare
+    index settings nested under `settings.index.*` with numeric values
+    stringified (`1` -> `"1"`). These are OpenSearch behaviors, not drift — the
+    verify must ignore them while still catching real changes. The FakeIndexer
+    models the re-served shape with `template_normalize=True`."""
+
+    MASKED = "index template klaxon-masked-customer-a"
+    MASKED_PATH = "/_index_template/klaxon-masked-customer-a"
+
+    @staticmethod
+    def _template() -> dict[str, Any]:
+        return build_index_template(load_tenant_config("customer-a"))
+
+    async def test_verify_passes_with_server_normalized_template(self) -> None:
+        # Sent with bare settings + no composed_of/timestamp_field vs deployed
+        # re-served WITH the server defaults/normalized shape -> PASSES.
+        sent = self._template()
+        fake = FakeIndexer(template_normalize=True)
+        await fake.put(self.MASKED_PATH, content=json.dumps(sent))
+        lines: list[str] = []
+        ok = await deploy._verify_after_put(
+            fake, self.MASKED, self.MASKED_PATH, sent, kind="template", lines=lines
+        )
+        assert ok
+        assert lines == [f"[ok] {self.MASKED} (verified)"]
+
+    async def test_verify_ignores_composed_of_and_timestamp_field(self) -> None:
+        # composed_of / data_stream.timestamp_field are server defaults:
+        # present on the deployed side, they must be ignored, not reported as
+        # drift.
+        sent = self._template()
+        fake = FakeIndexer(template_normalize=True)
+        await fake.put(self.MASKED_PATH, content=json.dumps(sent))
+        lines: list[str] = []
+        ok = await deploy._verify_after_put(
+            fake, self.MASKED, self.MASKED_PATH, sent, kind="template", lines=lines
+        )
+        assert ok
+        assert not any("composed_of" in l or "timestamp_field" in l for l in lines)
+
+    async def test_priority_drift_still_fails(self) -> None:
+        # A different priority is real drift and must survive the
+        # defaults-stripping, reporting the differing field path.
+        sent = self._template()
+        deployed = self._template()
+        deployed["priority"] = 999
+        fake = FakeIndexer(template_normalize=True)
+        await fake.put(self.MASKED_PATH, content=json.dumps(deployed))
+        lines: list[str] = []
+        ok = await deploy._verify_after_put(
+            fake, self.MASKED, self.MASKED_PATH, sent, kind="template", lines=lines
+        )
+        assert not ok
+        assert any("priority" in l for l in lines)
+
+    async def test_index_patterns_drift_still_fails(self) -> None:
+        # A different index_patterns is real drift and must fail.
+        sent = self._template()
+        deployed = self._template()
+        deployed["index_patterns"] = ["other-tenant-v5*"]
+        fake = FakeIndexer(template_normalize=True)
+        await fake.put(self.MASKED_PATH, content=json.dumps(deployed))
+        lines: list[str] = []
+        ok = await deploy._verify_after_put(
+            fake, self.MASKED, self.MASKED_PATH, sent, kind="template", lines=lines
+        )
+        assert not ok
+        assert any("index_patterns" in l for l in lines)
+
+    async def test_number_of_shards_drift_still_fails(self) -> None:
+        # The settings canonicalization must never hide a real value change:
+        # sent 1 vs deployed 2 -> FAILS at the settings path.
+        sent = self._template()
+        deployed = self._template()
+        deployed["template"]["settings"]["number_of_shards"] = 2
+        fake = FakeIndexer(template_normalize=True)
+        await fake.put(self.MASKED_PATH, content=json.dumps(deployed))
+        lines: list[str] = []
+        ok = await deploy._verify_after_put(
+            fake, self.MASKED, self.MASKED_PATH, sent, kind="template", lines=lines
+        )
+        assert not ok
+        assert any("number_of_shards" in l for l in lines)
+
+    async def test_explicit_data_stream_timestamp_field_is_respected(self) -> None:
+        # Sent EXPLICITLY sets data_stream.timestamp_field; deployed matches ->
+        # PASSES (the default logic must not clobber an explicit value).
+        sent = self._template()
+        sent["data_stream"] = {"timestamp_field": {"name": "custom_ts"}}
+        fake = FakeIndexer(template_normalize=True)
+        await fake.put(self.MASKED_PATH, content=json.dumps(sent))
+        lines: list[str] = []
+        ok = await deploy._verify_after_put(
+            fake, self.MASKED, self.MASKED_PATH, sent, kind="template", lines=lines
+        )
+        assert ok
+
+    def test_template_server_defaults_constant_is_the_single_source(self) -> None:
+        defaults = deploy.TEMPLATE_SERVER_DEFAULTS
+        assert defaults["composed_of"] == []
+        assert defaults["timestamp_field"] == {"name": "@timestamp"}
+
+    def test_normalize_settings_shape_and_values(self) -> None:
+        # Bare index settings vs nested settings.index.* with stringified
+        # values compare equal after normalization; a real value change does
+        # not.
+        sent = {
+            "index_patterns": ["x*"],
+            "priority": 200,
+            "template": {
+                "settings": {
+                    "index.default_pipeline": "p",
+                    "number_of_shards": 1,
+                    "number_of_replicas": 1,
+                }
+            },
+            "data_stream": {},
+        }
+        deployed = {
+            "composed_of": [],
+            "index_patterns": ["x*"],
+            "priority": 200,
+            "template": {
+                "settings": {
+                    "index": {
+                        "default_pipeline": "p",
+                        "number_of_shards": "1",
+                        "number_of_replicas": "1",
+                    }
+                }
+            },
+            "data_stream": {"timestamp_field": {"name": "@timestamp"}},
+        }
+        sent_n, deployed_n = deploy._normalize_template_server_defaults(sent, deployed)
+        assert sent_n == deployed_n
+        # A genuinely different shard count survives the normalization.
+        changed = {
+            **deployed,
+            "template": {
+                "settings": {
+                    "index": {
+                        "default_pipeline": "p",
+                        "number_of_shards": "2",
+                        "number_of_replicas": "1",
+                    }
+                }
+            },
+        }
+        sent_c, changed_n = deploy._normalize_template_server_defaults(sent, changed)
+        assert sent_c != changed_n
+        assert any(
+            "number_of_shards" in line
+            for line in deploy._json_diff(sent_c, changed_n)
+        )
+
+    def test_end_to_end_deploy_passes_with_normalized_templates(
+        self, env: None, run_deploy: Any, capsys: Any
+    ) -> None:
+        # The real-world re-served shape (defaults injected on GET): `masking
+        # deploy` verifies both index templates instead of reporting drift.
+        run_deploy(template_normalize=True)
+        rc = deploy.deploy_main(["--tenant", "customer-a", "--force"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "[ok] index template klaxon-masked-customer-a (verified)" in out
+        assert "[ok] index template klaxon-quarantine-customer-a (verified)" in out
+
+
+class TestRoleServerKeys:
+    """The security-plugin roles PUT API rejects the server-managed keys
+    (`reserved`/`hidden`/`static`) in the request body — they are GET-returned
+    metadata. The deploy must strip them from the PUT body and from the
+    GET-back compare (see `deploy._ROLE_SERVER_KEYS`), so the role step works
+    on a real cluster and still catches real index-permission drift. The
+    FakeIndexer models the plugin with `role_strict=True`."""
+
+    PATH = "/_plugins/_security/api/roles/klaxon_llm_report_customer-a"
+    LABEL = "role klaxon_llm_report_customer-a"
+
+    @staticmethod
+    def _role_body() -> dict[str, Any]:
+        cfg = load_tenant_config("customer-a")
+        roles, _mappings = deploy._parse_roles_fragment(cfg)
+        return dict(roles["klaxon_llm_report_customer-a"])
+
+    @staticmethod
+    def _stripped(body: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in body.items() if k not in ("reserved", "hidden", "static")}
+
+    async def test_deploy_strips_server_keys_from_put_body(self) -> None:
+        # _deploy_roles must never PUT reserved/hidden/static (the plugin
+        # rejects them: invalid_keys) — a role_strict fake 400s on them.
+        fake = FakeIndexer(role_strict=True)
+        lines: list[str] = []
+        cfg = load_tenant_config("customer-a")
+        roles, _mappings = deploy._parse_roles_fragment(cfg)
+        ok = await deploy._deploy_roles(fake, cfg, roles, lines)
+        assert ok
+        role_puts = [p for p in fake.puts if "api/roles/" in p[1]]
+        assert len(role_puts) == 3
+        for _method, _path, content, _params in role_puts:
+            body = json.loads(content)
+            assert not any(k in body for k in ("reserved", "hidden", "static"))
+
+    async def test_role_verify_passes_when_get_back_adds_server_keys(self) -> None:
+        # Sent (without the server keys) vs deployed re-served WITH
+        # reserved/hidden/static -> PASSES (they are server-managed, not
+        # drift).
+        body = self._stripped(self._role_body())
+        fake = FakeIndexer(role_strict=True)
+        await fake.put(self.PATH, content=json.dumps(body))
+        lines: list[str] = []
+        ok = await deploy._verify_after_put(
+            fake, self.LABEL, self.PATH, body, kind="role", lines=lines
+        )
+        assert ok
+        assert lines == [f"[ok] {self.LABEL} (verified)"]
+
+    async def test_role_index_permission_drift_still_fails(self) -> None:
+        # Real drift in a role (allowed_actions) must still fail with a field
+        # path even when the GET-back adds the server keys.
+        import copy
+
+        sent = self._stripped(self._role_body())
+        deployed = copy.deepcopy(sent)
+        deployed["index_permissions"][0]["allowed_actions"] = ["write"]
+        fake = FakeIndexer(role_strict=True)
+        await fake.put(self.PATH, content=json.dumps(deployed))
+        lines: list[str] = []
+        ok = await deploy._verify_after_put(
+            fake, self.LABEL, self.PATH, sent, kind="role", lines=lines
+        )
+        assert not ok
+        assert any("allowed_actions" in l for l in lines)
+
+    async def test_explicit_fls_drift_still_fails(self) -> None:
+        # Sent EXPLICITLY sets fls; deployed re-serves a different value ([]).
+        # Because sent set the key, the default-stripping must NOT hide the
+        # difference -> FAILS at the fls path.
+        import copy
+
+        sent = self._stripped(self._role_body())
+        sent["index_permissions"][0]["fls"] = ["user.name"]
+        deployed = copy.deepcopy(self._stripped(self._role_body()))
+        fake = FakeIndexer(role_strict=True)
+        await fake.put(self.PATH, content=json.dumps(deployed))
+        lines: list[str] = []
+        ok = await deploy._verify_after_put(
+            fake, self.LABEL, self.PATH, sent, kind="role", lines=lines
+        )
+        assert not ok
+        assert any("fls" in l for l in lines)
+
+    def test_normalize_drops_role_defaults_only_when_absent_in_sent(self) -> None:
+        # Sent without fls/masked_fields vs deployed re-served WITH the defaults
+        # -> equal after normalization; an explicit fls is never clobbered.
+        sent = {
+            "index_permissions": [
+                {"index_patterns": ["x*"], "allowed_actions": ["read"]}
+            ]
+        }
+        deployed = {
+            "index_permissions": [
+                {
+                    "index_patterns": ["x*"],
+                    "allowed_actions": ["read"],
+                    "fls": [],
+                    "masked_fields": [],
+                }
+            ]
+        }
+        sent_n, deployed_n = deploy._normalize_role_server_defaults(sent, deployed)
+        assert sent_n == deployed_n == sent
+        # Explicit fls survives (and a difference in it is not hidden).
+        explicit = {
+            "index_permissions": [
+                {"index_patterns": ["x*"], "allowed_actions": ["read"], "fls": ["user.name"]}
+            ]
+        }
+        explicit_n, _d = deploy._normalize_role_server_defaults(explicit, deployed)
+        assert explicit_n == explicit
+        assert any("fls" in line for line in deploy._json_diff(explicit_n, deployed))
+
+    def test_role_server_keys_constant(self) -> None:
+        assert deploy._ROLE_SERVER_KEYS == frozenset({"reserved", "hidden", "static"})
+
+    def test_end_to_end_deploy_passes_with_strict_roles(
+        self, env: None, run_deploy: Any, capsys: Any
+    ) -> None:
+        # A role_strict fake rejects any role PUT carrying the server keys and
+        # re-adds them on GET: `masking deploy` still completes (the keys are
+        # stripped at the PUT boundary and from the compare).
+        run_deploy(role_strict=True)
+        rc = deploy.deploy_main(["--tenant", "customer-a", "--force"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "[ok] role klaxon_llm_report_customer-a (verified)" in out
+
+
 class TestVerifyRegression:
-    """Pipeline and template verify must be byte-identical to before the ISM
-    envelope fix — only the ISM path normalizes/extracts differently."""
+    """Pipeline and template verify must stay byte-identical for bodies the
+    indexer echoes back unchanged — only the ISM/template/role paths normalize
+    the server-added defaults/metadata (see ISM_SERVER_DEFAULTS /
+    TEMPLATE_SERVER_DEFAULTS / _ROLE_SERVER_KEYS)."""
 
     async def test_pipeline_verify_unchanged(self) -> None:
         fake = FakeIndexer()

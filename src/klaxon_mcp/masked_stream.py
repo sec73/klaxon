@@ -47,6 +47,7 @@ Security notes (read before deploying):
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -60,9 +61,12 @@ from .painless import (
     _FREETEXT_PATTERN_ORDER as _FREETEXT_PATTERN_ORDER,  # noqa: PLC0414 — facade re-export
 )
 from .painless import (
+    _FREETEXT_VALUE_TYPES as _FREETEXT_VALUE_TYPES,  # noqa: PLC0414 — facade re-export
+)
+from .painless import (
     _MASK_FAMILY,
     _PATTERNS,
-    _active_free_text_patterns,
+    _active_username_patterns,
     _painless_script,
     _quarantine_on_failure_processors,
 )
@@ -592,32 +596,78 @@ def _compile_patterns() -> dict[str, re.Pattern[str]]:
     return {name: re.compile(source) for name, source in _PATTERNS.items()}
 
 
+def _path_get(doc: dict[str, Any], path: str) -> Any:
+    """The value at a dotted path in a doc, or None when any segment is missing.
+
+    Tries the LITERAL dotted key first (some Wazuh docs flatten `user.name`
+    into a single top-level key), then navigates the nested `user: {name: ...}`
+    form — so both representations of a real event are masked. Mirrors the
+    Painless `pathGet`.
+    """
+    if path in doc:
+        return doc[path]
+    current: Any = doc
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _path_set(doc: dict[str, Any], path: str, value: Any) -> None:
+    """Set the value at a dotted path, creating intermediate maps when absent.
+
+    If the doc already carries the literal dotted key, set it directly;
+    otherwise navigate/create the nested maps. Mirrors the Painless `pathPut`.
+    """
+    if path in doc:
+        doc[path] = value
+        return
+    current = doc
+    parts = path.split(".")
+    for part in parts[:-1]:
+        nxt = current.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            current[part] = nxt
+        current = nxt
+    current[parts[-1]] = value
+
+
 def pipeline_mask_doc(source: dict[str, Any], cfg: TenantConfig, salt: str) -> dict[str, Any]:
     """The Python twin of the Painless pipeline, so its logic is testable here.
 
-    Mirrors `_painless_script` step for step: copy, mask structured fields
-    (arrays element-wise, missing fields no-op, idempotent on tokens), then the
-    free-text pass (known-identity registry + context patterns + email/IP).
+    Mirrors `_painless_script` step for step: deep-copy, mask structured fields
+    at their (possibly NESTED) dotted path (arrays element-wise, missing fields
+    no-op, idempotent on tokens), then the free-text pass (known-identity
+    registry + context patterns + email/IP). The source is DEEP-copied first so
+    nested-path masking never mutates the raw document the free-text registry
+    reads; the registry reuses the exact structured token for a raw username in
+    prose, wherever the structured field lives.
     """
     patterns = _compile_patterns()
-    masked = dict(source)
+    masked = copy.deepcopy(source)
 
     def tok(family: str, value: str) -> str:
         return token(family, value, salt)
 
     # Structured fields.
     for spec in cfg.fields:
-        if spec.field not in masked:
+        v = _path_get(masked, spec.field)
+        if v is None:
             continue
-        v = masked[spec.field]
         if spec.array:
             if isinstance(v, list):
-                masked[spec.field] = [
-                    tok(spec.family, item) if isinstance(item, str) else item
-                    for item in v
-                ]
+                _path_set(
+                    masked,
+                    spec.field,
+                    [
+                        tok(spec.family, item) if isinstance(item, str) else item
+                        for item in v
+                    ],
+                )
         elif isinstance(v, str):
-            masked[spec.field] = tok(spec.family, v)
+            _path_set(masked, spec.field, tok(spec.family, v))
 
     # Free-text pass.
     def mask_re(text: str, name: str, family: str) -> str:
@@ -635,25 +685,35 @@ def pipeline_mask_doc(source: dict[str, Any], cfg: TenantConfig, salt: str) -> d
         if not isinstance(value, str):
             continue
         out = value
-        # Known identities first (per-document USER registry, word-boundary).
-        # The registry reads the RAW original source, not the already-tokenised
-        # `masked` map — exactly like the Painless maskRegistry(out, source).
-        for spec in cfg.fields:
-            if spec.family != "USER" or spec.field not in source:
-                continue
-            raw_values = source[spec.field]
-            if not isinstance(raw_values, list):
-                raw_values = [raw_values] if isinstance(raw_values, str) else []
-            for raw in raw_values:
-                if not isinstance(raw, str) or len(raw) < 2:
+        # Value-type passes first (EMAIL/IP), then the registry, then the
+        # username context patterns — mirrors the Painless maskFreeText and the
+        # response layer: an e-mail whose local part is a structured username
+        # masks as a WHOLE e-mail, never split by the registry.
+        for name in _FREETEXT_VALUE_TYPES:
+            out = mask_re(out, name, _MASK_FAMILY[name])
+        # Known identities reuse the exact structured token. The registry reads
+        # the RAW original source, not the already-tokenised `masked` map —
+        # exactly like the Painless maskRegistry(out, source) — at the
+        # structured field's (possibly NESTED) dotted path.
+        if cfg.mask_free_text_users:
+            for spec in cfg.fields:
+                if spec.family != "USER":
                     continue
-                replacement = tok("USER", raw)
-                if replacement == raw:
+                raw_values = _path_get(source, spec.field)
+                if raw_values is None:
                     continue
-                out = re.sub(
-                    rf"(?<!\w){re.escape(raw)}(?!\w)", replacement, out
-                )
-        for name in _active_free_text_patterns(cfg):
+                if not isinstance(raw_values, list):
+                    raw_values = [raw_values] if isinstance(raw_values, str) else []
+                for raw in raw_values:
+                    if not isinstance(raw, str) or len(raw) < 2:
+                        continue
+                    replacement = tok("USER", raw)
+                    if replacement == raw:
+                        continue
+                    out = re.sub(
+                        rf"(?<!\w){re.escape(raw)}(?!\w)", replacement, out
+                    )
+        for name in _active_username_patterns(cfg):
             out = mask_re(out, name, _MASK_FAMILY[name])
         masked[field] = out
 
