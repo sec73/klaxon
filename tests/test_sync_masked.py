@@ -697,6 +697,65 @@ class TestSyncPreflight:
         assert result == 1
         assert _reindex_call(fake) is None
 
+    def test_preflight_passes_for_correct_deployment(self, cfg: Any) -> None:
+        # The reported bug: the config's mask_fields holds ONLY the structured
+        # fields (no `message`), the pipeline FIELDS matches them, and FREE_TEXT
+        # = ["message"]. Free-text fields are NOT structured-masking fields, so
+        # this correct deployment must PASS the preflight.
+        from dataclasses import replace
+
+        deployed = build_pipeline_template(cfg)
+        config = replace(
+            _config(cfg),
+            anonymization=replace(
+                _config(cfg).anonymization,
+                mask_free_text_fields=(),  # reported case: no `message` in config
+            ),
+        )
+        assert sync_masked.preflight_report(cfg, deployed, config) == []
+
+    def test_preflight_fails_when_config_missing_structured_field(self, cfg: Any) -> None:
+        # Real structured drift: the config mask_fields lacks a structured field
+        # that the pipeline FIELDS (and fields.yaml) require -> FAILS.
+        from dataclasses import replace
+
+        deployed = build_pipeline_template(cfg)
+        config = replace(
+            _config(cfg),
+            anonymization=replace(
+                _config(cfg).anonymization,
+                mask_fields=tuple(
+                    f for f in cfg.all_masked_fields if f != "user.name"
+                ),
+            ),
+        )
+        problems = sync_masked.preflight_report(cfg, deployed, config)
+        assert any("mask_fields" in p and "user.name" in p for p in problems)
+
+    def test_preflight_fails_when_pipeline_free_text_missing_message(self, cfg: Any) -> None:
+        # A pipeline whose FREE_TEXT lacks the built-in `message` is a free-text
+        # default regression -> FAILS, caught separately from the structured set.
+        deployed = build_pipeline_template(cfg)
+        deployed["_meta"]["free_text_fields"] = []
+        problems = sync_masked.preflight_report(cfg, deployed, _config(cfg))
+        assert any("FREE_TEXT" in p and "message" in p for p in problems)
+
+    def test_preflight_fails_when_config_has_extra_structured_field(self, cfg: Any) -> None:
+        # The config mask_fields has a structured field the pipeline FIELDS does
+        # not -> FAILS (the config and fields.yaml are out of sync).
+        from dataclasses import replace
+
+        deployed = build_pipeline_template(cfg)
+        config = replace(
+            _config(cfg),
+            anonymization=replace(
+                _config(cfg).anonymization,
+                mask_fields=tuple((*cfg.all_masked_fields, "source.ip")),
+            ),
+        )
+        problems = sync_masked.preflight_report(cfg, deployed, config)
+        assert any("mask_fields" in p and "source.ip" in p for p in problems)
+
 
 class TestReportMaskingErrors:
     def test_warns_on_flagged_documents(self, cfg: Any, capsys: Any) -> None:

@@ -182,6 +182,24 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `tenants/customer-a/fields.yaml` no longer lists `message`; committed
   artifacts + golden regenerated. New loader + self-test guard tests
   (`tests/test_generate_masking.py`).
+
+- **`sync-masked` preflight no longer counts free-text fields as structured
+  masking fields.** The preflight compared the effective Klaxon config
+  (`mask_fields` + `mask_free_text_fields`) and the pipeline's full field list
+  (FIELDS + FREE_TEXT) against `fields.yaml`'s full list (structured +
+  `message`), so a correct deployment whose config `mask_fields` holds only the
+  structured fields (no `message`) was falsely rejected ("effective Klaxon
+  config masks [N fields] but fields.yaml requires [N+1]"). Now the STRUCTURED
+  fields are compared as equal sets — `fields.yaml` `fields:` == the deployed
+  pipeline's FIELDS table == the config's `mask_fields` — and FREE-TEXT fields
+  are checked separately: the pipeline's FREE_TEXT must contain the built-in
+  `message` plus any `free_text_fields`, and are NEVER required in
+  `mask_fields` (a free-text field is not a structured-masking field). The
+  pipeline-existence, provenance-fingerprint and quarantine-`on_failure`
+  checks are unchanged. New preflight unit tests cover: a correct deployment
+  passes (the reported bug), config missing a structured field fails, config
+  with an extra structured field fails, and a pipeline FREE_TEXT missing
+  `message` fails (`tests/test_sync_masked.py`).
 ## 0.2.0 – 2026-08-13
 
 ### Fixed

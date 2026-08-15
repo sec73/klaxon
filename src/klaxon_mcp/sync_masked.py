@@ -47,13 +47,13 @@ from .masked_stream import (
     build_quarantine_index_template,
     build_quarantine_ism_policy,
     deploy_pipeline,
-    effective_mask_fields_from_config,
     fields_yaml_sha256,
     fingerprint_matches,
     load_tenant_config,
-    pipeline_field_names,
     pipeline_has_quarantine_on_failure,
+    pipeline_provenance,
 )
+from .tenants import effective_free_text_fields
 
 
 def _iso(ts: datetime) -> str:
@@ -85,18 +85,23 @@ async def _fetch_pipeline(
     return parsed.get(cfg.pipeline_name)
 
 
-def _effective_klaxon_fields(config: Config) -> tuple[str, ...]:
-    anon = config.anonymization
-    return tuple((*anon.mask_fields, *anon.mask_free_text_fields))
-
-
 def preflight_report(
     cfg: TenantConfig, deployed: dict[str, Any] | None, config: Config
 ) -> list[str]:
-    """Compare fields.yaml -> effective config vs deployed pipeline; return problems."""
+    """Compare fields.yaml -> effective config vs deployed pipeline; return problems.
+
+    The STRUCTURED masking fields are compared as equal sets: `fields.yaml`'s
+    `fields:` table == the deployed pipeline's FIELDS table == the Klaxon
+    config's `mask_fields`. FREE-TEXT fields are handled SEPARATELY: `message`
+    (the built-in default) plus any `free_text_fields` must be present in the
+    deployed pipeline's FREE_TEXT table. Free-text fields are free-text TARGETS
+    (handled by `maskFreeText` over FREE_TEXT) — they are NEVER required to
+    appear in `mask_fields` (a free-text field is not a structured-masking
+    field).
+    """
     problems: list[str] = []
-    expected = set(effective_mask_fields_from_config(cfg))
-    klaxon = set(_effective_klaxon_fields(config))
+    structured_expected = set(cfg.all_masked_fields)
+    klaxon_structured = set(config.anonymization.mask_fields)
     if deployed is None:
         problems.append(
             f"pipeline {cfg.pipeline_name} is not deployed. Run "
@@ -110,11 +115,24 @@ def preflight_report(
             "different fields.yaml (fingerprint/sha256 or field list mismatch). "
             "Regenerate and redeploy before syncing."
         )
-    deployed_fields = set(pipeline_field_names(deployed))
-    if deployed_fields != expected:
+    meta = pipeline_provenance(deployed)
+    deployed_structured = set(meta.get("fields") or [])
+    if deployed_structured != structured_expected:
         problems.append(
-            f"deployed pipeline masks {sorted(deployed_fields)} but fields.yaml "
-            f"requires {sorted(expected)}."
+            f"deployed pipeline FIELDS {sorted(deployed_structured)} do not match "
+            f"fields.yaml {sorted(structured_expected)}."
+        )
+    # Free-text fields are NOT structured-masking fields: check them against the
+    # pipeline's FREE_TEXT only, never against mask_fields. `message` (built-in)
+    # plus any extra free_text_fields must be present in FREE_TEXT.
+    required_free_text = set(effective_free_text_fields(cfg))
+    deployed_free_text = set(meta.get("free_text_fields") or [])
+    missing_free_text = sorted(required_free_text - deployed_free_text)
+    if missing_free_text:
+        problems.append(
+            "deployed pipeline FREE_TEXT is missing "
+            f"{missing_free_text} (the built-in `message` and any "
+            "free_text_fields must be present in the pipeline's FREE_TEXT)."
         )
     if not pipeline_has_quarantine_on_failure(deployed):
         problems.append(
@@ -124,11 +142,12 @@ def preflight_report(
             f"{cfg.quarantine_stream_pattern}. Redeploy a pipeline generated "
             "with the quarantine routing before syncing."
         )
-    if klaxon != expected:
+    if klaxon_structured != structured_expected:
         problems.append(
-            f"effective Klaxon config masks {sorted(klaxon)} but fields.yaml "
-            f"requires {sorted(expected)}. The response layer and the pipeline "
-            "are out of sync — fix the Klaxon config or regenerate."
+            f"effective Klaxon config mask_fields {sorted(klaxon_structured)} do not "
+            f"match fields.yaml {sorted(structured_expected)}. The response layer "
+            "and the pipeline are out of sync — fix the Klaxon config or "
+            "regenerate."
         )
     return problems
 
