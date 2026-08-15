@@ -198,10 +198,17 @@ class TestPipelineMaskDoc:
     def test_mask_free_text_users_false_gates_broader_patterns(
         self, cfg_no_freetext: Any
     ) -> None:
-        # SSH publickey and the registry are gated; the IP still masks.
+        # SSH publickey AND the known-identity registry are gated; the IP still
+        # masks. USER_NOUN is always-on but needs its `:`/`=` separator, so a
+        # BARE username mention ("user jdoe") stays raw while "user: jdoe"
+        # tokenises — exactly like the Painless maskFreeText and the response
+        # layer (the registry is gated on mask_free_text_users there too).
         doc = {
             "user.name": "jdoe",
-            "message": "Accepted publickey for jsmith from 10.0.0.9; user jdoe",
+            "message": (
+                "Accepted publickey for jsmith from 10.0.0.9; user jdoe; "
+                "user: jdoe"
+            ),
         }
         out = pipeline_mask_doc(doc, cfg_no_freetext, SALT)
         msg = out["message"]
@@ -209,9 +216,12 @@ class TestPipelineMaskDoc:
         assert "10.0.0.9" not in msg
         # SSH_PUBKEY gated off: the raw username stays in free text.
         assert "jsmith" in msg
-        # USER_NOUN is always-on: "user jdoe" still tokenises.
+        # The registry is gated off: a bare "user jdoe" mention stays raw.
+        assert "user jdoe" in msg
+        # USER_NOUN is always-on: "user: jdoe" (the `:` separator) tokenises
+        # even with the registry off.
         assert token("USER", "jdoe", SALT) in msg
-        assert "user jdoe" not in msg
+        assert "user: jdoe" not in msg
 
     def test_token_matches_structured_value(self, cfg: Any) -> None:
         """The free-text token for a username equals its structured token."""
@@ -223,6 +233,77 @@ class TestPipelineMaskDoc:
         structured = out["user.name"]
         assert structured == token("USER", "jdoe", SALT)
         assert structured in out["message"]
+
+    # -- NESTED structured fields (the real Wazuh shape) ------------------- #
+
+    def test_nested_structured_fields_masked(self, cfg: Any) -> None:
+        # Real Wazuh events are NESTED (`user: {name: ...}`, `destination: {ip:
+        # ...}`). A structured field at a dotted path must be masked wherever
+        # it lives.
+        doc = {
+            "user": {"name": "jdoe", "effective": {"name": "jsmith"}},
+            "destination": {"ip": "10.0.0.5"},
+            "host": {"hostname": "web01"},
+            "message": "user jdoe logged in from 10.0.0.5",
+        }
+        out = pipeline_mask_doc(doc, cfg, SALT)
+        assert out["user"]["name"] == token("USER", "jdoe", SALT)
+        assert out["user"]["effective"]["name"] == token("USER", "jsmith", SALT)
+        assert out["destination"]["ip"] == token("IP", "10.0.0.5", SALT)
+        assert out["host"]["hostname"] == token("HOST", "web01", SALT)
+        msg = out["message"]
+        assert token("USER", "jdoe", SALT) in msg
+        assert token("IP", "10.0.0.5", SALT) in msg
+        assert "jdoe" not in msg
+        assert "10.0.0.5" not in msg
+
+    def test_nested_free_text_reuses_structured_token(self, cfg: Any) -> None:
+        # The per-document registry reads the RAW nested source, so uid=<name>
+        # in prose maps to the exact structured token.
+        doc = {
+            "user": {"name": "marcomoenig"},
+            "message": "login failed for uid=marcomoenig from 10.20.30.40",
+        }
+        out = pipeline_mask_doc(doc, cfg, SALT)
+        assert out["user"]["name"] == token("USER", "marcomoenig", SALT)
+        assert token("USER", "marcomoenig", SALT) in out["message"]
+        assert "marcomoenig" not in out["message"]
+        assert token("IP", "10.20.30.40", SALT) in out["message"]
+
+    def test_nested_input_source_is_not_mutated(self, cfg: Any) -> None:
+        # pipeline_mask_doc deep-copies: the free-text registry must still see
+        # the RAW source after structured masking, so the input is untouched.
+        doc = {"user": {"name": "jdoe"}, "message": "user jdoe did a thing"}
+        pipeline_mask_doc(doc, cfg, SALT)
+        assert doc == {"user": {"name": "jdoe"}, "message": "user jdoe did a thing"}
+
+    def test_nested_array_fields_masked_elementwise(self, cfg: Any) -> None:
+        doc = {
+            "related": {"ip": ["1.2.3.4", "5.6.7.8"], "user": ["alice", "bob"]},
+            "message": "users alice and bob from 1.2.3.4",
+        }
+        out = pipeline_mask_doc(doc, cfg, SALT)
+        assert out["related"]["ip"] == [
+            token("IP", "1.2.3.4", SALT),
+            token("IP", "5.6.7.8", SALT),
+        ]
+        assert out["related"]["user"] == [
+            token("USER", "alice", SALT),
+            token("USER", "bob", SALT),
+        ]
+        assert token("USER", "alice", SALT) in out["message"]
+        assert token("IP", "1.2.3.4", SALT) in out["message"]
+
+    def test_flat_and_nested_forms_are_equivalent(self, cfg: Any) -> None:
+        # Some Wazuh docs flatten a field into a single dotted key; real events
+        # nest it. Both must produce the SAME token.
+        flat = {"user.name": "jdoe", "message": "uid=jdoe"}
+        nested = {"user": {"name": "jdoe"}, "message": "uid=jdoe"}
+        out_flat = pipeline_mask_doc(flat, cfg, SALT)
+        out_nested = pipeline_mask_doc(nested, cfg, SALT)
+        expected = token("USER", "jdoe", SALT)
+        assert out_flat["user.name"] == out_nested["user"]["name"] == expected
+        assert out_flat["message"] == out_nested["message"]
 
 
 # --------------------------------------------------------------------------- #

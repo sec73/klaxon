@@ -124,6 +124,12 @@ _PAINLESS_FUNCTIONS: tuple[tuple[str, str], ...] = (
     ("replaceWordBoundary", "String"),
     ("maskRegistry", "String"),
     ("maskFreeText", "String"),
+    # Nested-path helpers: structured fields may be NESTED in real Wazuh docs
+    # (`user: {name: ...}`), so masking walks/creates dotted paths and the
+    # free-text registry reads them (deepCopy keeps `ctx` pristine).
+    ("deepCopy", "def"),
+    ("pathGet", "def"),
+    ("pathPut", "boolean"),
 ) + tuple((name, "Pattern") for name in _FREETEXT_PATTERN_ORDER)
 
 # The top-level declarations the script emits (functions must precede these).
@@ -134,7 +140,7 @@ _PAINLESS_TOP_DECLS: tuple[str, ...] = (
 )
 
 # The first statement of the main logic, which must follow every declaration.
-_MAIN_LOGIC_MARKER = "Map masked = new HashMap();"
+_MAIN_LOGIC_MARKER = "Map masked = deepCopy(ctx);"
 
 
 def verify_script_structure(script: str) -> list[str]:

@@ -30,9 +30,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="klaxon-mcp",
         description="Klaxon MCP — MCP server for Wazuh 5.x.",
         epilog=(
-            "Every flag has an environment equivalent (WAZUH_MCP_TRANSPORT, "
-            "WAZUH_MCP_HOST, WAZUH_MCP_PORT, WAZUH_MCP_PATH, "
-            "WAZUH_MCP_AUTH_TOKEN, WAZUH_MCP_ALLOWED_HOSTS). Flags win."
+            "Every flag has an environment equivalent (KLAXON_MCP_TRANSPORT, "
+            "KLAXON_MCP_HOST, KLAXON_MCP_PORT, KLAXON_MCP_PATH, "
+            "KLAXON_MCP_AUTH_TOKEN, KLAXON_MCP_ALLOWED_HOSTS). Flags win."
         ),
     )
     parser.add_argument(
@@ -97,20 +97,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "of truth, e.g. customer-a.",
     )
     masked_stream.add_argument(
-        "--generate-masking",
-        action="store_true",
-        help="DEPRECATED — use `masking generate`. Regenerate the config "
-        "fragment + pipeline template from tenants/<tenant>/fields.yaml "
-        "(writes files; no Wazuh needed).",
-    )
-    masked_stream.add_argument(
-        "--generate-masking-check",
-        action="store_true",
-        help="DEPRECATED — use `masking generate --check`. Verify committed "
-        "generated artifacts match fields.yaml (no writes); exit non-zero on "
-        "drift. Used by CI and pre-commit.",
-    )
-    masked_stream.add_argument(
         "--sync-masked",
         action="store_true",
         help="Reindex the recent window from wazuh-events-v5-* through the "
@@ -159,7 +145,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     gdpr = parser.add_argument_group(
         "gdpr check",
         "The DSGVO plausibility checker. Needs the Wazuh indexer "
-        "(WAZUH_INDEXER_URL) and exits after running — it does not serve.",
+        "(KLAXON_INDEXER_URL) and exits after running — it does not serve.",
     )
     gdpr.add_argument(
         "--gdpr-check",
@@ -221,7 +207,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     masking_parser = subparsers.add_parser(
         "masking",
         help="Generate / verify the Option B masking artifacts (offline) and "
-        "check the deployed salt. Supersedes the old --generate-masking flags.",
+        "check the deployed salt.",
     )
     masking_sub = masking_parser.add_subparsers(
         dest="masking_command", metavar="SUBCOMMAND"
@@ -421,6 +407,53 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Re-deploy the last snapshot (tenants/<tenant>/generated/backup/"
         "<ts>/) via the same ordered path. Pipeline rollback is safe: no data "
         "loss, the sync job can simply re-run.",
+    )
+
+    teardown_parser = masking_sub.add_parser(
+        "teardown",
+        help="Remove the Option B masked-stream infrastructure for a tenant "
+        "(data stream, sync checkpoint marker [with --purge-sync-state], index "
+        "template, ISM policy, ingest pipeline) in dependency order, then "
+        "verify nothing klaxon-* is left and the raw Wazuh streams are "
+        "untouched. Destructive — preview with --dry-run. Needs admin indexer "
+        "credentials (KLAXON_INDEXER_URL/USER/PASSWORD).",
+    )
+    teardown_parser.add_argument(
+        "--tenant",
+        metavar="TENANT",
+        required=True,
+        help="Tenant (directory under tenants/) whose Option B resources are "
+        "removed, e.g. customer-a.",
+    )
+    teardown_parser.add_argument(
+        "--root", type=Path, default=None, help="Repo root (default: auto)."
+    )
+    teardown_parser.add_argument(
+        "--env",
+        metavar="FILE",
+        default=None,
+        help="Local dotenv file with KLAXON_INDEXER_* vars (default: first "
+        "existing of .env.live, tests/live/.env).",
+    )
+    teardown_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the plan without contacting the indexer or changing "
+        "anything. Safe default: without --yes the command never changes "
+        "anything without confirmation.",
+    )
+    teardown_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm and execute the teardown without prompting.",
+    )
+    teardown_parser.add_argument(
+        "--purge-sync-state",
+        action="store_true",
+        help="Also delete the sync checkpoint marker "
+        "(klaxon-sync-state/_doc/klaxon-sync-<tenant> and the marker index "
+        "once empty). Default: keep the marker so a future re-setup can "
+        "resume from the last checkpoint.",
     )
     return parser.parse_args(argv)
 
@@ -841,24 +874,33 @@ def main(argv: list[str] | None = None) -> int:
             if args.rollback:
                 argv.append("--rollback")
             return deploy.deploy_main(argv)
+        if args.masking_command == "teardown":
+            if not args.tenant:
+                print(
+                    "--tenant is required for `masking teardown`",
+                    file=sys.stderr,
+                )
+                return 2
+            from . import teardown
+
+            argv = ["--tenant", args.tenant]
+            if args.root is not None:
+                argv += ["--root", str(args.root)]
+            if args.env:
+                argv += ["--env", args.env]
+            if args.dry_run:
+                argv.append("--dry-run")
+            if args.yes:
+                argv.append("--yes")
+            if args.purge_sync_state:
+                argv.append("--purge-sync-state")
+            return teardown.teardown_main(argv)
         print(
             "masking: missing subcommand "
-            "(generate|selftest|salt-check|test|migrate|deploy)",
+            "(generate|selftest|salt-check|test|migrate|deploy|teardown)",
             file=sys.stderr,
         )
         return 2
-
-    # Deprecated legacy aliases for the generator — superseded by
-    # `masking generate` / `masking generate --check` (same code path).
-    if args.generate_masking or args.generate_masking_check:
-        from . import masking
-
-        argv = []
-        if args.tenant:
-            argv += ["--tenant", args.tenant]
-        if args.generate_masking_check:
-            argv.append("--check")
-        return masking.generate_main(argv)
 
     # The DSGVO plausibility check needs the Wazuh indexer but not the MCP
     # listener; it runs and exits.

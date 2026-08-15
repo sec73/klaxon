@@ -25,18 +25,22 @@ environment > YAML > default.**
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `WAZUH_INDEXER_URL` | — (required) | The Wazuh 5.x indexer (OpenSearch) endpoint |
-| `WAZUH_INDEXER_USER` / `WAZUH_INDEXER_PASSWORD` | empty | Basic auth against the security index |
-| `WAZUH_MANAGER_URL` | empty (disables `manager`) | Wazuh 5.x manager API (JWT auth) |
-| `WAZUH_MANAGER_USER` / `WAZUH_MANAGER_PASSWORD` | empty | Credentials for manager JWT login |
-| `WAZUH_ENGINE_URL` | empty (disables `tester_sessions`) | The engine's own HTTP server (a different port from the manager API) |
-| `WAZUH_VERIFY_SSL` | `true` | TLS verification for all three endpoints; `false` logs a startup warning |
-| `WAZUH_TIMEOUT` | `60` | HTTP timeout (s) for indexer + manager requests |
-| `WAZUH_SEARCH_MAX_SIZE` | `100` | Hard cap on a search body's `size`; `0` disables the cap |
-| `WAZUH_SCHEMA_FIELD_LIMIT` | `200` | Cap on an unfiltered `schema` listing (the schema has 2351 fields) |
-| `WAZUH_SCHEMA_PROBE_BATCH` | `100` | Exists-aggregations packed into one request by `schema`/`field_coverage` |
-| `WAZUH_LOGTEST_SPACE` | `custom` | Default logtest tester-session space |
-| `WAZUH_LOGTEST_TRACE_LEVEL` | `ASSET_ONLY` | Default logtest trace level |
+| `KLAXON_INDEXER_URL` | — (required) | The Wazuh 5.x indexer (OpenSearch) endpoint |
+| `KLAXON_INDEXER_USER` / `KLAXON_INDEXER_PASSWORD` | empty | Basic auth against the security index |
+| `KLAXON_MANAGER_URL` | empty (disables `manager`) | Wazuh 5.x manager API (JWT auth) |
+| `KLAXON_MANAGER_USER` / `KLAXON_MANAGER_PASSWORD` | empty | Credentials for manager JWT login |
+| `KLAXON_ENGINE_URL` | empty (disables `tester_sessions`) | The engine's own HTTP server (a different port from the manager API) |
+| `KLAXON_VERIFY_SSL` | `true` | TLS verification for all three endpoints; `false` logs a startup warning |
+| `KLAXON_TIMEOUT` | `60` | HTTP timeout (s) for indexer + manager requests |
+| `KLAXON_SEARCH_MAX_SIZE` | `100` | Hard cap on a search body's `size`; `0` disables the cap |
+| `KLAXON_SCHEMA_FIELD_LIMIT` | `200` | Cap on an unfiltered `schema` listing (the schema has 2351 fields) |
+| `KLAXON_SCHEMA_PROBE_BATCH` | `100` | Exists-aggregations packed into one request by `schema`/`field_coverage` |
+| `KLAXON_LOGTEST_SPACE` | `custom` | Default logtest tester-session space |
+| `KLAXON_LOGTEST_TRACE_LEVEL` | `ASSET_ONLY` | Default logtest trace level |
+
+> **Namespace.** Klaxon is configured by its own name: every variable above is
+> `KLAXON_*`. All reads go through one loader (`envutil._get_env`), and there is
+> no other namespace — the legacy `WAZUH_*` spellings were removed.
 
 Those are three separate endpoints: the indexer, the manager API, and the
 engine's own HTTP server — the last runs inside the manager container but on a
@@ -47,22 +51,22 @@ different port from the manager API.
 ## HTTP serving (transport)
 
 Klaxon defaults to **stdio**, spawned by your MCP client as a child process. To
-serve it over a network, set `WAZUH_MCP_TRANSPORT=http` (or `sse`) — see
+serve it over a network, set `KLAXON_MCP_TRANSPORT=http` (or `sse`) — see
 [TOOLS.md → Transport options](TOOLS.md#transport-options) before doing so; a
 listening socket holds SIEM credentials.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `WAZUH_MCP_TRANSPORT` | `stdio` | One of `stdio`, `http`, `sse` |
-| `WAZUH_MCP_HOST` | `127.0.0.1` | Bind address |
-| `WAZUH_MCP_PORT` | `8000` | Listen port |
-| `WAZUH_MCP_PATH` | `/mcp` | MCP endpoint path |
-| `WAZUH_MCP_AUTH_TOKEN` | empty | Shared secret required as `Authorization: Bearer <token>` (constant-time compare). Without it the server logs `SERVING WITHOUT AUTHENTICATION` and serves anyone |
-| `WAZUH_MCP_ALLOWED_HOSTS` | empty | DNS-rebinding protection allowlist (comma-separated) |
-| `WAZUH_MCP_ALLOWED_ORIGINS` | empty | Origin allowlist for rebinding protection |
-| `WAZUH_MCP_CORS_ORIGINS` | empty | CORS grant for browser-based MCP clients; `*` is refused |
-| `WAZUH_MCP_JSON_RESPONSE` | `false` | JSON-RPC response mode |
-| `WAZUH_MCP_STATELESS` | `false` | Stateless session mode |
+| `KLAXON_MCP_TRANSPORT` | `stdio` | One of `stdio`, `http`, `sse` |
+| `KLAXON_MCP_HOST` | `127.0.0.1` | Bind address |
+| `KLAXON_MCP_PORT` | `8000` | Listen port |
+| `KLAXON_MCP_PATH` | `/mcp` | MCP endpoint path |
+| `KLAXON_MCP_AUTH_TOKEN` | empty | Shared secret required as `Authorization: Bearer <token>` (constant-time compare). Without it the server logs `SERVING WITHOUT AUTHENTICATION` and serves anyone |
+| `KLAXON_MCP_ALLOWED_HOSTS` | empty | DNS-rebinding protection allowlist (comma-separated) |
+| `KLAXON_MCP_ALLOWED_ORIGINS` | empty | Origin allowlist for rebinding protection |
+| `KLAXON_MCP_CORS_ORIGINS` | empty | CORS grant for browser-based MCP clients; `*` is refused |
+| `KLAXON_MCP_JSON_RESPONSE` | `false` | JSON-RPC response mode |
+| `KLAXON_MCP_STATELESS` | `false` | Stateless session mode |
 
 The CLI flags `--transport`, `--host`, `--port`, `--path` and `--allowed-host`
 override these for a single run.

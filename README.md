@@ -41,14 +41,14 @@ docker build -t klaxon-mcp .
 ### 2. Point it at your indexer
 
 ```bash
-export WAZUH_INDEXER_URL=https://indexer.example:9200
-export WAZUH_INDEXER_USER=wazuh-readonly
-export WAZUH_INDEXER_PASSWORD=...
+export KLAXON_INDEXER_URL=https://indexer.example:9200
+export KLAXON_INDEXER_USER=wazuh-readonly
+export KLAXON_INDEXER_PASSWORD=...
 ```
 
-`WAZUH_INDEXER_URL` is the only required variable. Add `WAZUH_MANAGER_URL` for
-`manager`/`detectors` and `WAZUH_ENGINE_URL` for `tester_sessions`; set
-`WAZUH_VERIFY_SSL=false` only for a self-signed lab cluster.
+`KLAXON_INDEXER_URL` is the only required variable. Add `KLAXON_MANAGER_URL` for
+`manager`/`detectors` and `KLAXON_ENGINE_URL` for `tester_sessions`; set
+`KLAXON_VERIFY_SSL=false` only for a self-signed lab cluster.
 
 ### 3. Enable masking (recommended for external LLMs)
 
@@ -131,15 +131,15 @@ The keys a normal user changes day to day. Full reference: [`docs/configuration.
 
 | Variable / key | What it does | Default |
 |---|---|---|
-| `WAZUH_INDEXER_URL` | Indexer endpoint | — (required) |
-| `WAZUH_INDEXER_USER` / `WAZUH_INDEXER_PASSWORD` | Basic-auth credentials | empty |
+| `KLAXON_INDEXER_URL` | Indexer endpoint | — (required) |
+| `KLAXON_INDEXER_USER` / `KLAXON_INDEXER_PASSWORD` | Basic-auth credentials | empty |
 | `KLAXON_ANONYMIZE_EXTERNAL_LLM` | Master masking switch | `false` |
 | `KLAXON_ANONYMIZATION_SALT` | Secret for token derivation (stable tokens) | random+persisted |
 | `KLAXON_ANONYMIZATION_MASK_FIELDS` | Fields masked wholesale (`user.name`, `source.ip`, …) | built-in list |
 | `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS` | Mask aggregation bucket keys too | `true` (fail-closed) |
 | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS` | Mask usernames inside free text | `true` |
-| `WAZUH_VERIFY_SSL` | TLS verification | `true` |
-| `WAZUH_MCP_AUTH_TOKEN` | Required bearer token when serving over HTTP | empty |
+| `KLAXON_VERIFY_SSL` | TLS verification | `true` |
+| `KLAXON_MCP_AUTH_TOKEN` | Required bearer token when serving over HTTP | empty |
 
 ---
 
@@ -182,6 +182,19 @@ test; `--dry-run` / `--rollback`):
 ```bash
 klaxon masking deploy --tenant customer-a --dry-run   # plan only, no writes
 klaxon masking deploy --tenant customer-a             # needs KLAXON_INDEXER_*
+```
+
+Remove the Option B masking infrastructure from the indexer cleanly, leaving the
+raw Wazuh streams untouched (destructive — preview with `--dry-run`; a
+mandatory verification phase proves nothing `klaxon-*` is left and the raw
+streams are intact):
+
+```bash
+klaxon masking teardown --tenant customer-a --dry-run       # plan only, no writes
+klaxon masking teardown --tenant customer-a --yes           # needs KLAXON_INDEXER_*
+klaxon masking teardown --tenant customer-a --yes --purge-sync-state
+#   ^ also delete the sync checkpoint marker (default: keep it so a future
+#     re-setup can resume from the last checkpoint)
 ```
 
 The live integration test (`klaxon masking test`) needs real indexer credentials —

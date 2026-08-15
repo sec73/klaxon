@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .envutil import _get_env
+
 # The credential env vars — the ONLY source of live-test credentials.
 LIVE_ENV_URL = "KLAXON_INDEXER_URL"
 LIVE_ENV_USER = "KLAXON_INDEXER_USER"
@@ -27,7 +29,7 @@ LIVE_ENV_PASSWORD = "KLAXON_INDEXER_PASSWORD"
 LIVE_ENV_NAMES: tuple[str, ...] = (LIVE_ENV_URL, LIVE_ENV_USER, LIVE_ENV_PASSWORD)
 
 # Optional, NON-credential TLS knob (default true = verify, the secure default;
-# mirror of the WAZUH_VERIFY_SSL used by the main clients). Set false only for
+# mirror of the KLAXON_VERIFY_SSL used by the main clients). Set false only for
 # a self-signed lab cluster — the test warns. The skip gate depends ONLY on the
 # three credential vars above.
 LIVE_ENV_VERIFY_SSL = "KLAXON_INDEXER_VERIFY_SSL"
@@ -102,7 +104,7 @@ def _env_bool(name: str, default: bool) -> bool:
     keeps its historical fail-safe: `KLAXON_INDEXER_VERIFY_SSL=bogus` must fall
     back to the secure default (verify), not to no-verify.
     """
-    raw = os.environ.get(name, "").strip().lower()
+    raw = (_get_env(name) or "").strip().lower()
     if raw in {"1", "true", "yes", "on"}:
         return True
     if raw in {"0", "false", "no", "off"}:
@@ -139,15 +141,15 @@ def resolve_live_config(
     if dotenv_path is not None:
         load_dotenv_file(dotenv_path)
     missing = tuple(
-        name for name in LIVE_ENV_NAMES if not os.environ.get(name, "").strip()
+        name for name in LIVE_ENV_NAMES if not (_get_env(name) or "").strip()
     )
     if missing:
         return None, missing
     return (
         LiveIndexerConfig(
-            url=os.environ[LIVE_ENV_URL].strip(),
-            user=os.environ[LIVE_ENV_USER].strip(),
-            password=os.environ[LIVE_ENV_PASSWORD],
+            url=(_get_env(LIVE_ENV_URL) or "").strip(),
+            user=(_get_env(LIVE_ENV_USER) or "").strip(),
+            password=_get_env(LIVE_ENV_PASSWORD) or "",
             verify_ssl=_env_bool(LIVE_ENV_VERIFY_SSL, default=True),
         ),
         (),

@@ -97,7 +97,7 @@ class StubEngine:
 
 @pytest.fixture
 def engine() -> Iterator[Any]:
-    """Install a stub engine client and a config that has WAZUH_ENGINE_URL set."""
+    """Install a stub engine client and a config that has KLAXON_ENGINE_URL set."""
     previous_client = server._engine
     previous_config = server._config
     server._config = config_with("https://manager.example:5000")
@@ -250,7 +250,7 @@ class TestHttpFailures:
         assert "HTTP 403" in tags(await tester_sessions())
 
     async def test_404_suggests_the_wrong_host(self, engine: Any) -> None:
-        """Pointing WAZUH_ENGINE_URL at the indexer is the likely cause."""
+        """Pointing KLAXON_ENGINE_URL at the indexer is the likely cause."""
         engine({"error": "not found"}, status=404)
         out = await tester_sessions()
         assert "HTTP 404" in tags(out)
@@ -276,16 +276,16 @@ class TestMissingConfiguration:
             server._engine, server._config = previous_client, previous_config
 
         message = str(exc.value)
-        assert "WAZUH_ENGINE_URL" in message
+        assert "KLAXON_ENGINE_URL" in message
         assert "tester_sessions" in message
         # The most likely misconfiguration is pointing it at one of the other two.
-        assert "WAZUH_INDEXER_URL" in message
-        assert "WAZUH_MANAGER_URL" in message
+        assert "KLAXON_INDEXER_URL" in message
+        assert "KLAXON_MANAGER_URL" in message
 
     async def test_client_refuses_before_opening_a_connection(self) -> None:
         with pytest.raises(TransportError) as exc:
             await EngineClient(config_with("")).post(TESTER_TABLE_GET)
-        assert "WAZUH_ENGINE_URL" in str(exc.value)
+        assert "KLAXON_ENGINE_URL" in str(exc.value)
 
 
 class TestReadOnly:

@@ -6,8 +6,162 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## released
+
 ## Unreleased
 
+### Added
+
+- **`klaxon masking teardown --tenant <tenant>` — cleanly remove the Option B
+  masked-stream infrastructure from the indexer, leaving the raw Wazuh streams
+  untouched.** New module `src/klaxon_mcp/teardown.py`, wired into the
+  `masking` subcommand. Removes, in dependency order: the masked data stream
+  `klaxon-masked-<tenant>-v5` (plus any orphaned `.ds-klaxon-masked-<tenant>
+  -v5-*` backing indices), the sync checkpoint marker
+  (`klaxon-sync-state/_doc/klaxon-sync-<tenant>`, only with
+  `--purge-sync-state` — the default keeps it so a future re-setup can resume),
+  the index template `klaxon-masked-<tenant>`, the ISM policy
+  `klaxon-masked-retention-<tenant>` and the ingest pipeline
+  `klaxon-mask-<tenant>`. A mandatory verification phase then proves no
+  `klaxon-*` index/template/policy/pipeline is left (including hidden
+  `.ds-klaxon-*` backing indices) and that `wazuh-events-v5-*` /
+  `wazuh-findings-v5-*` still exist with unchanged doc counts; any leftover is
+  reported and the command exits non-zero, so a partial teardown is never
+  reported as success. Hard safety: only `klaxon-*`-namespaced resources are
+  ever deleted (a guard refuses anything else, e.g. `wazuh-*`), a missing
+  resource (404) is treated as already-removed (idempotent), credentials come
+  only from `KLAXON_INDEXER_URL/USER/PASSWORD` (or a local `.env`), and the
+  log contains only resource names and statuses — never the password, salt,
+  tokens or raw data. `--dry-run` prints the plan offline (no credentials
+  needed); without `--yes` the command prompts with the full list and aborts
+  with no changes on non-interactive input. The response-layer masking config
+  and `tenants/<tenant>/fields.yaml` are not touched. New unit tests
+  (`tests/test_teardown.py`, 23) cover dependency order, the backing-index
+  sweep, idempotency, dry-run no-op, confirmation gating, sync-state
+  keep-vs-purge, verification-failure non-zero, no-secret output and the
+  never-touches-`wazuh-*` guarantee.
+
+### Fixed
+
+- **`klaxon masking deploy` no longer fails verifying a correctly-deployed ISM
+  policy ("deployed resource does not match what was sent (verify) — fingerprint
+  differs").** The real ISM GET returns the policy DOUBLE-nested —
+  `response["policy"]["policy"]` — next to the `_id`/`_version`/`_seq_no`/
+  `_primary_term` metadata, but the deploy fingerprinted the raw response, so
+  the envelope wrapper always differed from the bare policy that was sent (and
+  the metadata changes on every PUT). In `deploy.py`: new
+  `_ism_policy_from_envelope` extracts the innermost policy (accepting both the
+  double-nested live shape and the single-nested shape of older versions / test
+  doubles); `_extract_resource("ism", ...)` and `_get_ism_policy` both use it,
+  so the verify AND the skip-if-identical re-run compare see the real policy
+  (also fixes the `--rollback` snapshot, which previously saved the wrapper).
+  ISM durations (`min_index_age` / `min_rollover_age`) are canonicalized on
+  BOTH sides of the fingerprint (`_normalize_ism_durations`) so the indexer
+  re-serving e.g. `30d` as `43200m` still verifies, while a genuinely different
+  duration still differs; size/count fields are untouched. A fingerprint
+  mismatch now prints the differing JSON paths (`_json_diff`, e.g.
+  `$.states[0].transitions[0].conditions.min_index_age: '30d' != '90d'`) instead
+  of a bare "fingerprint differs". Pipeline and template verify are unchanged
+  (regression tests). New tests in `tests/test_deploy.py`
+  (`TestIsmEnvelope`/`TestVerifyRegression`, 11) + a skippable live test
+  `tests/test_live_deploy.py` that checks the real envelope on a live indexer.
+
+### Changed
+
+- **Breaking: `WAZUH_*` env vars and the deprecated `--generate-masking` flags
+  are removed; use `KLAXON_*` and `masking generate`.** Klaxon is configured by
+  its own name: the infrastructure layer (indexer/manager/engine connections,
+  TLS, tuning and the MCP transport) now reads ONLY the canonical `KLAXON_*`
+  namespace — `KLAXON_INDEXER_URL/USER/PASSWORD`,
+  `KLAXON_MANAGER_URL/USER/PASSWORD`, `KLAXON_ENGINE_URL`, `KLAXON_VERIFY_SSL`,
+  `KLAXON_TIMEOUT`, `KLAXON_SEARCH_MAX_SIZE`, `KLAXON_SCHEMA_FIELD_LIMIT`,
+  `KLAXON_SCHEMA_PROBE_BATCH`, `KLAXON_LOGTEST_SPACE`,
+  `KLAXON_LOGTEST_TRACE_LEVEL`, and the `KLAXON_MCP_*` transport family
+  (`TRANSPORT/HOST/PORT/PATH/AUTH_TOKEN/ALLOWED_HOSTS/ALLOWED_ORIGINS/
+  CORS_ORIGINS/JSON_RESPONSE/STATELESS`). All reads go through one loader
+  (`envutil._get_env`); the legacy `WAZUH_*` fallback, its one-time deprecation
+  warning and the deprecated `--generate-masking` / `--generate-masking-check`
+  CLI flags (superseded by `masking generate` / `masking generate --check`)
+  are DELETED, not just deprecated — a missing `KLAXON_*` var raises the
+  standard missing-env error even when the old `WAZUH_*` name is set.
+  `KLAXON_ANONYMIZATION_*` / `KLAXON_GDPR_*` / `KLAXON_ANONYMIZATION_SALT` are
+  unchanged. `.env.example`, README, `docs/configuration.md`, `docs/TOOLS.md`
+  and CLI help show only `KLAXON_*`. Tests: `tests/test_envutil.py` pins the
+  loader and adds a grep-based CI guard that FAILS the build if `WAZUH_LEGACY`,
+  `WAZUH_INDEXER`, `WAZUH_MCP`, `--generate-masking` or a `deprecated` marker
+  reappears in `src/`; `tests/test_config.py` asserts a missing
+  `KLAXON_INDEXER_URL` raises even when `WAZUH_INDEXER_URL` is set (no
+  fallback). The pre-commit hook (`klaxon-env-namespace`) runs the guard.
+
+### Fixed
+
+- **`masking deploy` no longer reports OpenSearch ISM's own defaults/metadata
+  as drift when verifying a correctly-deployed ISM policy.** Beyond the
+  double-nested envelope, ISM re-serves a policy with resolved values the PUT
+  body omitted — a `retry: {count: 3, backoff: "exponential", delay: "1m"}`
+  block on every action, `rollover.copy_alias: false`, a
+  `last_updated_time` timestamp on every `ism_template[]` entry, and
+  `ism_template` itself re-served as a LIST (the artifact uses a single dict).
+  The verify was reporting all of these as `[fail] ... fingerprint differs`.
+  In `deploy.py`: a new data-driven `ISM_SERVER_DEFAULTS` constant (the single
+  place to add future ISM defaults) plus `_normalize_ism_server_defaults`
+  applied to BOTH sides of the ISM verify and the skip-if-identical compare:
+  pure metadata (`last_updated_time`) is stripped everywhere, the
+  `ism_template` dict/list shape is canonicalized, and a default-valued key
+  (`retry`, `copy_alias`) that is ABSENT in the sent body is dropped from the
+  deployed side — while an EXPLICIT value in the sent body is never touched,
+  so genuine drift (a changed `min_index_age`, a removed state, a different
+  `index_patterns`) still fails with a field-level diff. Envelope extraction
+  and canonicalization are unchanged. New tests
+  (`tests/test_deploy.py::TestIsmServerDefaults`, 12) cover defaults-injected
+  pass, metadata ignored, explicit values respected, explicit-vs-default drift
+  fails, changed duration/removed state still fail, and the end-to-end deploy +
+  re-run-no-op with injected defaults; the live test
+  (`tests/test_live_deploy.py`) now routes the comparison through the full
+  defaults normalization.
+- **`masking deploy` no longer reports OpenSearch's own index-template and
+  security-role defaults/metadata as drift either.** The index-template GET
+  re-serves `composed_of: []`, a default `data_stream.timestamp_field`, moves
+  bare index settings (`number_of_shards`, ...) under `settings.index.*` and
+  stringifies numeric values (`1` -> `"1"`); the security-plugin roles PUT API
+  REJECTS `static`/`hidden`/`reserved` in the request body (`invalid_keys`),
+  and the role GET re-adds them plus `fls: []` / `masked_fields: []` to every
+  `index_permissions[]` entry. In `deploy.py`: data-driven `TEMPLATE_SERVER_
+  DEFAULTS` and `_ROLE_SERVER_DEFAULTS` constants (the single place to add
+  future defaults), `_canonical_settings` (settings shape/value canonicalization
+  — deliberately an allowlist so an unknown server behavior fails loud rather
+  than passing silently), `_ROLE_SERVER_KEYS` (stripped from the PUT body and
+  the compare), and a shared `_drop_server_defaults` helper (generalized from
+  the ISM one) that drops a default-valued key only when it is ABSENT in the
+  sent body — explicit sent values are never touched, so genuine drift (changed
+  `priority`/`index_patterns`/`number_of_shards`, different role `allowed_
+  actions`/`fls`) still fails with a field-level diff. New tests
+  (`tests/test_deploy.py::TestTemplateServerDefaults`, `TestRoleServerKeys`)
+  cover the normalized re-served shapes end to end.
+
+- **The Option B pipeline now masks NESTED structured fields — the real Wazuh
+  shape.** Real Wazuh events store their fields nested (`user: {name: ...}`,
+  `source: {ip: ...}`, `destination: {ip: ...}`, `related: {user: [...]}`), but
+  the generated Painless script (and its Python twin `pipeline_mask_doc`)
+  looked fields up as a FLAT top-level `user.name` key — so on a real indexer
+  the structured pass silently no-oped and personal data was left unmasked
+  (only the free-text pass and the flat-key live-test documents worked). In
+  `painless.py`: new `deepCopy`/`pathGet`/`pathPut` navigate dotted paths (both
+  the nested form and a flattened literal key) and the document is deep-copied
+  so the free-text registry still reads the RAW source; `masked_stream.py`
+  mirrors them (`_path_get`/`_path_set`). The free-text pass order now matches
+  the response layer — e-mails/IPs first, then the known-identity registry,
+  then the username context patterns — so an e-mail whose local part is a
+  structured username masks as ONE `[EMAIL_...]` (never `[USER_...]@example.
+  com`), and the twin's registry is now correctly gated on
+  `mask_free_text_users` (it ran unconditionally before, diverging from the
+  deployed script). `live_test.py` docs/checks and the HMAC-vector docs use the
+  NESTED shape, so `klaxon masking test` proves nested masking on a live
+  indexer, and the deploy smoke test (`user.name` + free-text `uid=` share one
+  token) passes on real nested documents. `selftest.py` registers the new
+  functions. Committed artifacts and the golden master regenerated; the
+  twin-masked-doc golden now masks the nested fields and matches the
+  response-layer golden exactly.
 ## 0.2.0 – 2026-08-13
 
 ### Fixed

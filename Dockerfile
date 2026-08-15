@@ -3,35 +3,64 @@
 #
 # Author: Marco Moenig <marco.moenig@sec73.io>
 
-FROM python:3.12-slim
-
-# Two ways to run this image:
-#   stdio (default) — docker run --rm -i --env-file .env klaxon-mcp
-#   http            — docker run --rm -p 8000:8000 --env-file .env klaxon-mcp \
-#                       --transport http --host 0.0.0.0
-# stdio needs -i and no published port; http needs a published port and no -i.
+# ---------------------------------------------------------------------------
+# builder — Python 3.13 + Build-Toolchain
+# ---------------------------------------------------------------------------
+FROM cgr.dev/chainguard/wolfi-base AS builder
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-WORKDIR /app
+# Wolfi  Python 3.13 + Build-Dependencies
+RUN apk add --no-cache \
+        python-3.13 \
+        py3.13-pip \
+        python-3.13-dev \
+        build-base \
+    && ln -sf /usr/bin/python3.13 /usr/bin/python3
 
-# pyproject.toml and README.md are both build inputs (readme = "README.md").
-# Note: editing anything under src/ invalidates the install layer below — the
-# dependency set is small enough that splitting it into its own layer would cost
-# more in duplication drift than it saves in build time.
+WORKDIR /build
+
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
-RUN pip install --no-cache-dir . \
-    && useradd --create-home --uid 10001 klaxon-mcp
+
+RUN python3 -m pip wheel --no-cache-dir --wheel-dir /wheels .
+
+# ---------------------------------------------------------------------------
+# final 
+# ---------------------------------------------------------------------------
+FROM cgr.dev/chainguard/wolfi-base AS final
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+
+RUN apk add --no-cache \
+        python-3.13 \
+        py3.13-pip \
+    && ln -sf /usr/bin/python3.13 /usr/bin/python3
+
+WORKDIR /app
+
+
+COPY --from=builder /wheels /wheels
+RUN python3 -m pip install --no-cache-dir --no-index /wheels/*.whl \
+    && rm -rf /wheels
+
+
+RUN apk add --no-cache shadow \
+    && useradd --create-home --uid 10001 --system klaxon-mcp \
+    && chown -R klaxon-mcp:klaxon-mcp /app
 
 USER klaxon-mcp
 
-# Only relevant for the http/sse transports; ignored on stdio.
+
 EXPOSE 8000
 
-# No credentials are baked in; supply them at run time via --env-file.
-# Defaults to stdio; append --transport http to serve over the network.
+
 ENTRYPOINT ["klaxon-mcp"]

@@ -5,45 +5,45 @@
   },
   "client": {
     "user": {
-      "name": "carol"
+      "name": "[USER_1c74a31f210e350a]"
     }
   },
   "destination": {
-    "ip": "10.20.30.4"
+    "ip": "[IP_3ceb0fa852b7f5e4]"
   },
   "event": {
-    "original": "Aug 12 10:00:01 web-01 sshd[1234]: Accepted publickey for alice from 192.168.1.50 port 22 ssh2"
+    "original": "[USER_97ad76ad013f41ce]"
   },
   "host": {
-    "hostname": "web-01"
+    "hostname": "[HOST_aaa52efeb8357afb]"
   },
   "log": {
-    "logger": "sshd"
+    "logger": "[HOST_2682a7f0761593b2]"
   },
-  "message": "user alice logged in [USER_48b2ae95c14b03db] from [IP_35fb288370686e3c]; contact [EMAIL_001f07de3c40b09f]",
+  "message": "user [USER_48b2ae95c14b03db] logged in as [USER_48b2ae95c14b03db](uid=1001) from [IP_35fb288370686e3c]; contact [EMAIL_001f07de3c40b09f]",
   "related": {
     "hash": [
       "abc123def456"
     ],
     "hosts": [
-      "host-a",
-      "host-b"
+      "[HOST_8e2827990cc0f353]",
+      "[HOST_bf7ec94a20570433]"
     ],
     "user": [
-      "alice",
-      "bob"
+      "[USER_48b2ae95c14b03db]",
+      "[USER_fc0491da16d40b68]"
     ]
   },
   "source": {
-    "address": "192.168.1.50",
-    "domain": "internal.example",
-    "ip": "192.168.1.50"
+    "address": "[IP_35fb288370686e3c]",
+    "domain": "[HOST_5c1738acd2ebf303]",
+    "ip": "[IP_35fb288370686e3c]"
   },
   "user": {
     "effective": {
-      "name": "alice(uid=1001)"
+      "name": "[USER_6eef36d61eb9ccd2]"
     },
     "id": 1001,
-    "name": "alice"
+    "name": "[USER_48b2ae95c14b03db]"
   }
 }

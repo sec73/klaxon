@@ -19,7 +19,7 @@ response including `aggregations`.
 Index names are validated before interpolation: charset `[a-z0-9-_.*,]` only,
 no `..`, no leading `/` or `_`, max 255 characters.
 
-`size` is capped at `WAZUH_SEARCH_MAX_SIZE` (default 100). A larger value is
+`size` is capped at `KLAXON_SEARCH_MAX_SIZE` (default 100). A larger value is
 lowered **before** the query is sent and reported as `[SIZE CAPPED]`, naming
 both the requested and effective value. `"size": 0` is never touched; a body
 without `size` is left to the OpenSearch default of 10. Set the variable to `0`
@@ -28,7 +28,7 @@ to disable the cap — the server logs a warning at startup when you do.
 The same cap applies to the `size` of bucketed aggregations (`terms`,
 `significant_terms`, `significant_text`, `multi_terms`, `composite`,
 `top_hits`): an oversized aggregation `size` is lowered to
-`WAZUH_SEARCH_MAX_SIZE` before the query is sent and reported as
+`KLAXON_SEARCH_MAX_SIZE` before the query is sent and reported as
 `[AGG SIZE CAPPED]`, naming each affected aggregation and its requested size —
 so a lowered bucket count is never read as the real one.
 
@@ -63,7 +63,7 @@ aggregations and returns only fields with `doc_count > 0`. Output is name, type
 and document count per field.
 
 Without a `prefix` and with `only_populated=false`, the listing is capped at
-`WAZUH_SCHEMA_FIELD_LIMIT` (default 200) and says so.
+`KLAXON_SCHEMA_FIELD_LIMIT` (default 200) and says so.
 
 ---
 
@@ -126,7 +126,7 @@ value is stored in `_source` but not indexed, so `exists` misses it. Coverage
 for a field with occasional long values is a slight underestimate. Not currently
 detected.
 
-Cost scales with field count; the run is capped at `WAZUH_SCHEMA_FIELD_LIMIT`
+Cost scales with field count; the run is capped at `KLAXON_SCHEMA_FIELD_LIMIT`
 and the cap is reported. Pass a `prefix` to measure a namespace instead of a
 truncation.
 
@@ -210,7 +210,7 @@ GET only, with a path allowlist against traversal. Non-2xx responses are passed
 through unchanged, including 404 — a 404 on `/rules` is correct in Wazuh 5, not
 an error to swallow.
 
-Requires `WAZUH_MANAGER_URL` and credentials.
+Requires `KLAXON_MANAGER_URL` and credentials.
 
 ---
 
@@ -244,8 +244,8 @@ Which logtest environments exist — the usual cause of a failing `logtest`.
 `entry_status`, lifetime and last use.
 
 **These routes are not on the indexer.** The engine runs its own HTTP server
-inside the **manager** container, on its own port — neither `WAZUH_INDEXER_URL`
-nor `WAZUH_MANAGER_URL`. Hence `WAZUH_ENGINE_URL`; without it the tool names the
+inside the **manager** container, on its own port — neither `KLAXON_INDEXER_URL`
+nor `KLAXON_MANAGER_URL`. Hence `KLAXON_ENGINE_URL`; without it the tool names the
 variable instead of failing inside the HTTP client. Pointed at the wrong
 endpoint, the route answers 404, which the tool reports with that cause named.
 
@@ -481,7 +481,7 @@ is the operator's/CI's job). `klaxon` and `klaxon-mcp` are the same binary.
 | `masking selftest [--tenant X]` | prove the generated Painless token scheme == `derive_token` byte-for-byte AND that the script is structurally compilable (functions before statements, no `ctx['_source']`, FAIL-CLOSED quarantine `on_failure` present); runs inside every `generate`; a mismatch aborts and emits nothing |
 | `masking test --tenant X` | LIVE integration test: Stage A verifies the ingest Painless allowlist has the APIs the script needs (`GET /_scripts/painless/_context`), Stage B simulates it via `POST /_ingest/pipeline/_simulate` (authoritative compile + behaviour), Stage C forces a masking failure and asserts the doc is rerouted to the quarantine stream (fail-closed) — no writes, nothing deployed (skips cleanly when credentials are missing) |
 | `masking salt-check --tenant X` | compare the DEPLOYED pipeline's `params.salt` with the current env salt (needs the indexer) |
-| `masking deploy --tenant X` | deploy the generated artifacts to the indexer in ONE idempotent, ordered, self-verifying step (pipeline → ISM policies → index templates → masked data stream → security roles), with preflight (drift / credentials / salt-match / running-sync), GET-back verification after every PUT, a final `_simulate` smoke test, `--dry-run` (plan only, no writes), `--force` and `--rollback` (re-deploys the last snapshot). Roles YAML → JSON in code (no `yq`). Needs admin `KLAXON_INDEXER_URL/USER/PASSWORD`; never logs the password, salt, tokens or raw data |
+| `masking deploy --tenant X` | deploy the generated artifacts to the indexer in ONE idempotent, ordered, self-verifying step (pipeline → ISM policies → index templates → masked data stream → security roles), with preflight (drift / credentials / salt-match / running-sync), GET-back verification after every PUT (the indexer's own ISM/template/role defaults & metadata are ignored — see `ISM_SERVER_DEFAULTS`/`TEMPLATE_SERVER_DEFAULTS`/`_ROLE_SERVER_DEFAULTS` in `deploy.py`), a final `_simulate` smoke test, `--dry-run` (plan only, no writes), `--force` and `--rollback` (re-deploys the last snapshot). Roles YAML → JSON in code (no `yq`). Needs admin `KLAXON_INDEXER_URL/USER/PASSWORD`; never logs the password, salt, tokens or raw data |
 | `masking migrate --tenant X` | **ONE-TIME, destructive, never automated**: move legacy `klaxon.masking_error` docs from the masked stream into the quarantine stream and delete them from the masked stream (idempotent; `--dry-run` to preview) |
 
 Flags: `--tenant`, `--out`, `--stdout`, `--check`, `--retention-days`, `--root`,
@@ -513,23 +513,23 @@ prefer trusting the cluster CA (`SSL_CERT_FILE`/system trust store) instead.
 
 | Variable | Flag | Default |
 |---|---|---|
-| `WAZUH_MCP_TRANSPORT` | `--transport` | `stdio` (`http`, `sse`) |
-| `WAZUH_MCP_HOST` | `--host` | `127.0.0.1` |
-| `WAZUH_MCP_PORT` | `--port` | `8000` |
-| `WAZUH_MCP_PATH` | `--path` | `/mcp` |
-| `WAZUH_MCP_AUTH_TOKEN` | — | empty (no auth) |
-| `WAZUH_MCP_ALLOWED_HOSTS` | `--allowed-host` | empty |
-| `WAZUH_MCP_ALLOWED_ORIGINS` | — | empty |
-| `WAZUH_MCP_CORS_ORIGINS` | — | empty (no CORS headers) |
-| `WAZUH_MCP_JSON_RESPONSE` | — | `false` |
-| `WAZUH_MCP_STATELESS` | — | `false` |
+| `KLAXON_MCP_TRANSPORT` | `--transport` | `stdio` (`http`, `sse`) |
+| `KLAXON_MCP_HOST` | `--host` | `127.0.0.1` |
+| `KLAXON_MCP_PORT` | `--port` | `8000` |
+| `KLAXON_MCP_PATH` | `--path` | `/mcp` |
+| `KLAXON_MCP_AUTH_TOKEN` | — | empty (no auth) |
+| `KLAXON_MCP_ALLOWED_HOSTS` | `--allowed-host` | empty |
+| `KLAXON_MCP_ALLOWED_ORIGINS` | — | empty |
+| `KLAXON_MCP_CORS_ORIGINS` | — | empty (no CORS headers) |
+| `KLAXON_MCP_JSON_RESPONSE` | — | `false` |
+| `KLAXON_MCP_STATELESS` | — | `false` |
 
 Flags override environment variables. `sse` is the legacy MCP HTTP transport and
 warns on startup; prefer `http` unless a client requires SSE. Behind a load
-balancer without session affinity, set `WAZUH_MCP_STATELESS=true`.
+balancer without session affinity, set `KLAXON_MCP_STATELESS=true`.
 
-The two origin settings do different jobs. `WAZUH_MCP_ALLOWED_ORIGINS` is a
-filter — which `Origin` values are not rejected. `WAZUH_MCP_CORS_ORIGINS` is a
+The two origin settings do different jobs. `KLAXON_MCP_ALLOWED_ORIGINS` is a
+filter — which `Origin` values are not rejected. `KLAXON_MCP_CORS_ORIGINS` is a
 grant — which browser origins may call the endpoint with `fetch` at all. Only
 the latter emits `Access-Control-Allow-Origin`, and setting it also adds those
 origins to the filter so the two cannot contradict each other. Leave it empty
@@ -538,7 +538,7 @@ its backend. `*` is refused.
 
 Origin filtering cannot be enabled on its own: it is part of the same DNS
 rebinding protection as the `Host` check, and turning that on with an empty
-`WAZUH_MCP_ALLOWED_HOSTS` would reject every request. Set the host allowlist too,
+`KLAXON_MCP_ALLOWED_HOSTS` would reject every request. Set the host allowlist too,
 or the origin list is logged as unenforced.
 
 See [README.md](../README.md#read-this-before-opening-the-port) before exposing

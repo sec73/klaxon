@@ -195,7 +195,7 @@ below it is never modified.
 | `[ZERO HITS]` | No hits — names the pattern queried so a typo stays visible |
 | `[EMPTY AGGREGATION]` | Zero buckets with a non-empty scope — field mapped, never populated |
 | `[PARTIAL AGGREGATION COVERAGE]` | Buckets cover only part of the scope — how decoder gaps surface |
-| `[SIZE CAPPED]` | `size` lowered to `WAZUH_SEARCH_MAX_SIZE`, naming both values |
+| `[SIZE CAPPED]` | `size` lowered to `KLAXON_SEARCH_MAX_SIZE`, naming both values |
 | `[TOTAL HITS CAPPED]` | `hits.total.relation == "gte"` — OpenSearch caps at 10,000 without `track_total_hits` |
 | `[LEGACY INDEX PATTERN]` | Query against a 4.x index that does not exist in 5.x |
 | `[LOGTEST NORMALIZATION FAILED]` | HTTP 200 with `normalization.status = "error"` nested in the body |
@@ -232,7 +232,7 @@ Index names are validated before interpolation: charset `[a-z0-9-_.*,]` only, no
 `..`, no leading `/` or `_`, max 255 characters — so the parameter cannot be
 used to address a different endpoint.
 
-`size` is capped at `WAZUH_SEARCH_MAX_SIZE` (default 100) **before** the query is
+`size` is capped at `KLAXON_SEARCH_MAX_SIZE` (default 100) **before** the query is
 sent. A Wazuh 5 event carries around 40 fields, so `"size": 10000` returns more
 document than any caller can hold. The cap is reported as `[SIZE CAPPED]` naming
 both the requested and effective value — a shortened result the caller never
@@ -243,12 +243,12 @@ is never touched.
 ### `schema`
 
 `_field_caps` reports only what is *mapped*. `only_populated=true` adds a second
-pass of `exists` aggregations, batched via `WAZUH_SCHEMA_PROBE_BATCH`, and
+pass of `exists` aggregations, batched via `KLAXON_SCHEMA_PROBE_BATCH`, and
 returns only fields with `doc_count > 0`.
 
 With 2,351 fields in the schema, an unfiltered `fields=*` is unusable — without
 a `prefix` and with `only_populated=false` the listing is hard-capped
-(`WAZUH_SCHEMA_FIELD_LIMIT`, default 200) and says so.
+(`KLAXON_SCHEMA_FIELD_LIMIT`, default 200) and says so.
 
 ### `logtest`
 
@@ -303,7 +303,7 @@ deliberately not implemented: a hand-created session is replaced at the next
 policy import, so exposing them would invite a workaround that does not hold.
 
 The engine's HTTP routes live inside the **manager** container, not on the
-indexer — hence the separate `WAZUH_ENGINE_URL`.
+indexer — hence the separate `KLAXON_ENGINE_URL`.
 
 ### `findings_overview`
 

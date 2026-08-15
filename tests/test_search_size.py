@@ -110,7 +110,7 @@ class TestCapApplied:
         assert "[SIZE CAPPED]" in out
         assert "500" in out
         assert "100" in out
-        assert "WAZUH_SEARCH_MAX_SIZE" in out
+        assert "KLAXON_SEARCH_MAX_SIZE" in out
 
     async def test_notice_survives_an_error_response(
         self, indexer: RecordingIndexer, limit: Any
@@ -265,25 +265,25 @@ class TestAggSizeCap:
 
 class TestConfiguration:
     def test_default_is_one_hundred(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("WAZUH_INDEXER_URL", "https://indexer.example:9200")
-        monkeypatch.delenv("WAZUH_SEARCH_MAX_SIZE", raising=False)
+        monkeypatch.setenv("KLAXON_INDEXER_URL", "https://indexer.example:9200")
+        monkeypatch.delenv("KLAXON_SEARCH_MAX_SIZE", raising=False)
         assert Config.from_env().search_max_size == 100
 
     def test_disabling_the_cap_warns_at_startup(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Running without the cap is a choice, not a state to discover later."""
-        monkeypatch.setenv("WAZUH_INDEXER_URL", "https://indexer.example:9200")
-        monkeypatch.setenv("WAZUH_SEARCH_MAX_SIZE", "0")
+        monkeypatch.setenv("KLAXON_INDEXER_URL", "https://indexer.example:9200")
+        monkeypatch.setenv("KLAXON_SEARCH_MAX_SIZE", "0")
         with caplog.at_level("WARNING", logger="klaxon_mcp.config"):
             assert Config.from_env().search_max_size == 0
-        assert "WAZUH_SEARCH_MAX_SIZE" in caplog.text
+        assert "KLAXON_SEARCH_MAX_SIZE" in caplog.text
 
     def test_valid_value_is_silent(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        monkeypatch.setenv("WAZUH_INDEXER_URL", "https://indexer.example:9200")
-        monkeypatch.setenv("WAZUH_SEARCH_MAX_SIZE", "250")
+        monkeypatch.setenv("KLAXON_INDEXER_URL", "https://indexer.example:9200")
+        monkeypatch.setenv("KLAXON_SEARCH_MAX_SIZE", "250")
         with caplog.at_level("WARNING", logger="klaxon_mcp.config"):
             assert Config.from_env().search_max_size == 250
         assert caplog.text == ""
@@ -291,8 +291,8 @@ class TestConfiguration:
     def test_non_integer_value_is_a_config_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("WAZUH_INDEXER_URL", "https://indexer.example:9200")
-        monkeypatch.setenv("WAZUH_SEARCH_MAX_SIZE", "many")
+        monkeypatch.setenv("KLAXON_INDEXER_URL", "https://indexer.example:9200")
+        monkeypatch.setenv("KLAXON_SEARCH_MAX_SIZE", "many")
         with pytest.raises(ConfigError) as exc:
             Config.from_env()
-        assert "WAZUH_SEARCH_MAX_SIZE" in str(exc.value)
+        assert "KLAXON_SEARCH_MAX_SIZE" in str(exc.value)

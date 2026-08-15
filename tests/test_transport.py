@@ -518,28 +518,28 @@ class TestTransportConfigFromEnv:
         assert c.auth_token == ""
 
     def test_rejects_unknown_transport(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("WAZUH_MCP_TRANSPORT", "websocket")
-        with pytest.raises(Exception, match="WAZUH_MCP_TRANSPORT must be one of"):
+        monkeypatch.setenv("KLAXON_MCP_TRANSPORT", "websocket")
+        with pytest.raises(Exception, match="KLAXON_MCP_TRANSPORT must be one of"):
             TransportConfig.from_env()
 
     def test_parses_allowlists_and_normalises_path(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("WAZUH_MCP_TRANSPORT", "http")
-        monkeypatch.setenv("WAZUH_MCP_PATH", "wazuh")
-        monkeypatch.setenv("WAZUH_MCP_ALLOWED_HOSTS", "a.example:8000, b.example:8000")
+        monkeypatch.setenv("KLAXON_MCP_TRANSPORT", "http")
+        monkeypatch.setenv("KLAXON_MCP_PATH", "wazuh")
+        monkeypatch.setenv("KLAXON_MCP_ALLOWED_HOSTS", "a.example:8000, b.example:8000")
         c = TransportConfig.from_env()
         assert c.path == "/wazuh"
         assert c.allowed_hosts == ("a.example:8000", "b.example:8000")
 
     def test_no_cors_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("WAZUH_MCP_CORS_ORIGINS", raising=False)
+        monkeypatch.delenv("KLAXON_MCP_CORS_ORIGINS", raising=False)
         assert TransportConfig.from_env().cors_origins == ()
 
     def test_trailing_slash_is_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An Origin header never carries a path, so `https://x/` would match
         nothing — and the miss surfaces as a generic browser CORS error."""
-        monkeypatch.setenv("WAZUH_MCP_CORS_ORIGINS", "https://a.example/, https://b.example")
+        monkeypatch.setenv("KLAXON_MCP_CORS_ORIGINS", "https://a.example/, https://b.example")
         assert TransportConfig.from_env().cors_origins == (
             "https://a.example",
             "https://b.example",
@@ -548,19 +548,19 @@ class TestTransportConfigFromEnv:
     def test_wildcard_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every tool here runs with the Wazuh credentials, so a wildcard lets
         any page a browser loads read the SIEM from that browser's position."""
-        monkeypatch.setenv("WAZUH_MCP_CORS_ORIGINS", "*")
+        monkeypatch.setenv("KLAXON_MCP_CORS_ORIGINS", "*")
         with pytest.raises(Exception, match="is refused"):
             TransportConfig.from_env()
 
 
 def os_environ_keys() -> list[str]:
     return [
-        "WAZUH_MCP_TRANSPORT",
-        "WAZUH_MCP_HOST",
-        "WAZUH_MCP_PORT",
-        "WAZUH_MCP_PATH",
-        "WAZUH_MCP_AUTH_TOKEN",
-        "WAZUH_MCP_ALLOWED_HOSTS",
-        "WAZUH_MCP_ALLOWED_ORIGINS",
-        "WAZUH_MCP_CORS_ORIGINS",
+        "KLAXON_MCP_TRANSPORT",
+        "KLAXON_MCP_HOST",
+        "KLAXON_MCP_PORT",
+        "KLAXON_MCP_PATH",
+        "KLAXON_MCP_AUTH_TOKEN",
+        "KLAXON_MCP_ALLOWED_HOSTS",
+        "KLAXON_MCP_ALLOWED_ORIGINS",
+        "KLAXON_MCP_CORS_ORIGINS",
     ]

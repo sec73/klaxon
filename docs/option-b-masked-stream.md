@@ -150,18 +150,24 @@ artifacts, including the quarantine ISM/template and the roles fragment.
 
 ## The pipeline
 
-`klaxon-mask-<tenant>` is a Painless script processor. It copies `_source`,
-masks the structured fields from the table (arrays element-wise, missing fields
-no-op, already-tokenised values passed through unchanged), then runs a
-free-text pass over `message` and any other `free_text_fields`:
+`klaxon-mask-<tenant>` is a Painless script processor. It deep-copies `_source`,
+masks the structured fields from the table at their dotted paths — real Wazuh
+events NEST their fields (`user: {name: ...}`, `source: {ip: ...}`), and some
+flatten them into a single `user.name` key; both forms are masked, arrays
+element-wise, missing fields no-op, already-tokenised values passed through
+unchanged — then runs a free-text pass over `message` and any other
+`free_text_fields`:
 
-1. Known identities first — a raw username from a structured `USER` field is
-   replaced wherever it appears in free text, **reusing the exact structured
-   token** (the registry reads the raw document, not the already-masked map).
-2. Value types: e-mails and IP addresses anywhere.
-3. Username context patterns (`user=...`, `Accepted publickey for ...`,
-   `uid=...` with a leading letter, `... (uid=N)`, bare `user <name>`).
-4. When `mask_free_text_users: false`, steps 1 and 3's broader patterns are
+1. Value types first: e-mails and IP addresses anywhere. An e-mail whose local
+   part is a structured username masks as ONE `[EMAIL_...]` (never split into
+   `[USER_...]@example.com`).
+2. Known identities — a raw username from a structured `USER` field is replaced
+   wherever it appears in free text, **reusing the exact structured token** (the
+   registry reads the raw document, not the already-masked map).
+3. Username context patterns (`user: <name>` / `user=<name>`, `Accepted
+   publickey for ...`, `uid=...` with a leading letter, `... (uid=N)`); a bare
+   `user <name>` is masked via the step-2 registry when the username is known.
+4. When `mask_free_text_users: false`, steps 2 and 3's broader patterns are
    skipped; e-mails, IPs and the two basic `user`-noun/auth forms still mask.
 
 ### The `on_failure` block — FAIL-CLOSED (quarantine routing)
@@ -329,6 +335,60 @@ pipeline would silently write unmasked data and leave failures in the masked
 stream. Run `klaxon-mcp --verify-config --tenant X` to audit all drift sources
 at once.
 
+### Teardown (`klaxon masking teardown`)
+
+Removing Option B for a tenant is a single, ordered, self-verifying command —
+the exact inverse of `klaxon masking deploy`:
+
+```console
+klaxon masking teardown --tenant customer-a --dry-run        # plan only, no writes
+klaxon masking teardown --tenant customer-a --yes            # needs KLAXON_INDEXER_*
+klaxon masking teardown --tenant customer-a --yes --purge-sync-state
+#   ^ also delete the sync checkpoint marker (default: keep it so a future
+#     re-setup can resume from the last checkpoint)
+```
+
+It deletes, in dependency order, only `klaxon-*`-namespaced resources:
+
+1. the masked data stream `klaxon-masked-<tenant>-v5` (removing its backing
+   indices; any orphaned `.ds-klaxon-masked-<tenant>-v5-*` backing indices are
+   swept too),
+2. the sync checkpoint marker `klaxon-sync-state/_doc/klaxon-sync-<tenant>`
+   (only with `--purge-sync-state`; the marker index itself is deleted once it
+   holds no other tenants' markers),
+3. the index template `klaxon-masked-<tenant>`,
+4. the ISM policy `klaxon-masked-retention-<tenant>`,
+5. the ingest pipeline `klaxon-mask-<tenant>`.
+
+A mandatory verification phase then proves the teardown is complete and safe:
+`GET /_cat/indices/klaxon-*` (and hidden `.ds-klaxon-*` backing indices) is
+empty, the template / ISM policy / pipeline return 404, and
+`wazuh-events-v5-*` / `wazuh-findings-v5-*` still exist with **unchanged** doc
+counts (compared before/after the removal). Any leftover is reported explicitly
+and the command exits non-zero — a partial teardown is never reported as
+success.
+
+Safety contract:
+
+* Only `klaxon-*`-namespaced resources are ever deleted. A guard refuses any
+  other name (in particular anything starting with `wazuh-`), so the raw
+  streams and every Wazuh template/policy/pipeline are untouchable by this
+  command.
+* A missing resource (404) is "already removed" — logged, and the teardown
+  continues (idempotent).
+* Credentials come only from `KLAXON_INDEXER_URL/USER/PASSWORD` (optionally a
+  local `.env` via `--env`); the password, the salt, tokens and raw data are
+  never logged — only resource names and HTTP statuses.
+* `--dry-run` prints the full plan offline (no credentials needed). Without
+  `--yes` the command prompts with every resource to be deleted and aborts with
+  no changes on non-interactive input.
+* The Klaxon response-layer masking config (`mask_fields`,
+  `mask_aggregation_keys`, `gdpr_checker.custom_patterns`) is NOT touched, and
+  neither is `tenants/<tenant>/fields.yaml` — this tool removes indexer
+  resources only. Repo-side cleanup (removing `tenants/<tenant>/generated/`,
+  the generated config fragment, the security roles, the sync cron) is a
+  separate manual step.
+
 ### The live integration test (`klaxon masking test`)
 
 Before deploying, prove the generated pipeline actually compiles and masks
@@ -419,7 +479,7 @@ avoids that whole class of failure.
 
 * The reindex POST and each task-poll GET use a **generous per-request timeout**
   (`KLAXON_SYNC_REINDEX_TIMEOUT`, seconds, default `1800` = 30 min) instead of
-  the default short `WAZUH_TIMEOUT`; the overall deadline for the task to
+  the default short `KLAXON_TIMEOUT`; the overall deadline for the task to
   complete is `KLAXON_SYNC_TASK_TIMEOUT` (seconds, default `3600` = 60 min).
 * **Transport-level failures** (connect/read timeout, connection reset, protocol
   errors — the `httpx.TransportError` family) are **transient** and retried with

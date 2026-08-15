@@ -61,11 +61,30 @@ _FREETEXT_PATTERN_ORDER = (
 # `mask_free_text_users` while these always run.
 _FREETEXT_ALWAYS_ON = ("EMAIL", "IPV6", "IPV4", "USER_NOUN", "USER_AUTH")
 
+# Value-type passes (EMAIL/IP) run BEFORE the known-identity registry and the
+# username context patterns, exactly like the response layer's `mask_text`: an
+# e-mail whose local part is a structured username must mask as a WHOLE e-mail
+# (`[EMAIL_...]`), never split into `[USER_...]@example.com` by the registry.
+_FREETEXT_VALUE_TYPES = _FREETEXT_PATTERN_ORDER[:3]
+
+# Username context patterns, applied AFTER the registry.
+_FREETEXT_USERNAME_PATTERNS = _FREETEXT_PATTERN_ORDER[3:]
+
+# Username context patterns that ALWAYS run (mask_free_text_users: false still
+# masks "user X" / "login as X", mirroring the response layer).
+_FREETEXT_USERNAME_ALWAYS = ("USER_NOUN", "USER_AUTH")
+
 
 def _active_free_text_patterns(cfg: TenantConfig) -> tuple[str, ...]:
     if cfg.mask_free_text_users:
         return _FREETEXT_PATTERN_ORDER
     return _FREETEXT_ALWAYS_ON
+
+
+def _active_username_patterns(cfg: TenantConfig) -> tuple[str, ...]:
+    if cfg.mask_free_text_users:
+        return _FREETEXT_USERNAME_PATTERNS
+    return _FREETEXT_USERNAME_ALWAYS
 
 
 # --------------------------------------------------------------------------- #
@@ -293,15 +312,21 @@ def _painless_script(cfg: TenantConfig) -> str:
         f'Pattern {name}() {{ return /{_painless_regex(name)}/; }}'
         for name in _FREETEXT_PATTERN_ORDER
     )
-    pattern_uses = "\n".join(
+    value_uses = "\n".join(
         f'        out = maskPattern({name}(), out, "{_MASK_FAMILY[name]}", SALT);'
-        for name in _active_free_text_patterns(cfg)
+        for name in _FREETEXT_VALUE_TYPES
+    )
+    username_uses = "\n".join(
+        f'        out = maskPattern({name}(), out, "{_MASK_FAMILY[name]}", SALT);'
+        for name in _active_username_patterns(cfg)
     )
     registry_line = (
-        "    // Known identities first, so free text reuses the exact structured token.\n"
-        "    out = maskRegistry(out, source, FIELDS, SALT);"
+        "        // Known identities reuse the exact structured token AFTER the\n"
+        "        // value-type passes (mirrors the response layer: a username\n"
+        "        // inside an e-mail never splits the e-mail).\n"
+        "        out = maskRegistry(out, source, FIELDS, SALT);"
         if cfg.mask_free_text_users
-        else "    // mask_free_text_users: false -> registry + broader username patterns skipped."
+        else "        // mask_free_text_users: false -> registry + broader username patterns skipped."
     )
     return f"""// Generated from {cfg.source_rel} — do not edit by hand.
 // klaxon-mask-{cfg.tenant}: deterministic masking for {cfg.masked_stream_pattern}.
@@ -382,9 +407,9 @@ String maskRegistry(String text, Map source, List FIELDS, String SALT) {{
     String out = text;
     for (def entry : FIELDS) {{
         if (entry[1] != "USER") continue;
-        String f = entry[0];
-        if (!source.containsKey(f)) continue;
-        def v = source.get(f);
+        // The structured USER field may be a FLAT dotted key or NESTED —
+        // pathGet handles both (real Wazuh events are nested).
+        def v = pathGet(source, entry[0]);
         List vals = new ArrayList();
         if (v instanceof List) {{ for (item in v) {{ if (item instanceof String) vals.add(item); }} }}
         else if (v instanceof String) vals.add(v);
@@ -402,9 +427,79 @@ String maskRegistry(String text, Map source, List FIELDS, String SALT) {{
 String maskFreeText(String text, Map source, List FIELDS, String SALT) {{
     if (text == null) return text;
     String out = text;
+    // Value-type passes first (EMAIL/IP) — mirrors the response layer: an
+    // e-mail whose local part is a structured username masks as a WHOLE
+    // e-mail, never split by the registry.
+{value_uses}
 {registry_line}
-{pattern_uses}
+{username_uses}
     return out;
+}}
+
+// Deep-copy: structured masking writes into a COPY so the raw document `ctx`
+// (which the free-text registry reads) stays pristine until the atomic commit.
+// A shallow copy would share the nested maps and the registry would see tokens
+// instead of the raw usernames.
+def deepCopy(def v) {{
+    if (v instanceof Map) {{
+        Map out = new HashMap();
+        for (k in ((Map) v).keySet()) {{ out.put(k, deepCopy(((Map) v).get(k))); }}
+        return out;
+    }}
+    if (v instanceof List) {{
+        List out = new ArrayList();
+        for (item in (List) v) {{ out.add(deepCopy(item)); }}
+        return out;
+    }}
+    return v;
+}}
+
+// The value at a dotted path in a nested doc, or null when any segment is
+// missing. Tries the LITERAL dotted key first (some docs flatten a field into
+// one dotted key), then walks the nested form. Manual dot scan — no
+// String.split (regex) to keep off the restricted ingest allowlist.
+def pathGet(Map doc, String path) {{
+    if (doc.containsKey(path)) return doc.get(path);
+    def current = doc;
+    int start = 0;
+    for (int i = 0; i <= path.length(); i++) {{
+        // Single-quoted '.' is a STRING in Painless, so compare the char to
+        // its ASCII int (46) — charAt returns a char and char != String.
+        if (i == path.length() || path.charAt(i) == 46) {{
+            String part = path.substring(start, i);
+            if (!(current instanceof Map)) return null;
+            Map m = (Map) current;
+            if (!m.containsKey(part)) return null;
+            current = m.get(part);
+            start = i + 1;
+        }}
+    }}
+    return current;
+}}
+
+// Set the value at a dotted path, creating intermediate maps when absent.
+// Returns false when a non-map blocks the path (caller keeps the old value).
+// NOTE: dot is compared to the ASCII int 46 (single-quoted '.' is a String in
+// Painless, and charAt returns a char — char != String).
+boolean pathPut(Map doc, String path, def value) {{
+    if (doc.containsKey(path)) {{ doc.put(path, value); return true; }}
+    def current = doc;
+    int start = 0;
+    for (int i = 0; i <= path.length(); i++) {{
+        // Single-quoted '.' is a STRING in Painless, so compare the char to
+        // its ASCII int (46) — charAt returns a char and char != String.
+        if (i == path.length() || path.charAt(i) == 46) {{
+            String part = path.substring(start, i);
+            boolean last = (i == path.length());
+            if (!(current instanceof Map)) return false;
+            Map m = (Map) current;
+            if (last) {{ m.put(part, value); return true; }}
+            if (!(m.get(part) instanceof Map)) m.put(part, new HashMap());
+            current = m.get(part);
+            start = i + 1;
+        }}
+    }}
+    return false;
 }}
 
 // Free-text regexes as Pattern functions (regex literals). The free-text pass
@@ -426,15 +521,16 @@ def FREE_TEXT = [
 // ---- Main logic. In an ingest script processor `ctx` IS the document (the
 // root map) — there is no nested `_source` object. ----
 
-Map masked = new HashMap();
-for (key in ctx.keySet()) {{ masked.put(key, ctx.get(key)); }}
+Map masked = deepCopy(ctx);
 
 for (def entry : FIELDS) {{
     String f = entry[0];
     String family = entry[1];
     boolean array = entry[2];
-    if (!masked.containsKey(f)) continue;            // missing field: no-op
-    def v = masked.get(f);
+    // Structured fields live at a dotted path that may be NESTED in a real
+    // Wazuh doc or a FLAT dotted key — pathGet handles both; missing no-ops.
+    def v = pathGet(masked, f);
+    if (v == null) continue;            // missing field: no-op
     if (array) {{
         if (v instanceof List) {{
             List out = new ArrayList();
@@ -442,10 +538,10 @@ for (def entry : FIELDS) {{
                 if (item instanceof String) out.add(token(family, item, SALT));
                 else out.add(item);
             }}
-            masked.put(f, out);
+            pathPut(masked, f, out);
         }}
     }} else {{
-        if (v instanceof String) masked.put(f, token(family, v, SALT));
+        if (v instanceof String) pathPut(masked, f, token(family, v, SALT));
     }}
 }}
 
