@@ -329,14 +329,28 @@ async def _poll_reindex_task(
 def _reindex_task_result(completed: dict[str, Any]) -> dict[str, Any] | None:
     """The reindex result of a completed task body, normalised to the top level.
 
-    GET /_tasks/<id> nests the reindex result (failures/created/total/...) under
-    task.status, whereas a synchronous _reindex response carries it at the top
-    level. Returns None when the result cannot be read — the caller treats that
-    as FAIL-CLOSED (success not confirmed, checkpoint not advanced).
+    GET /_tasks/<id> for a completed reindex returns BOTH `task.status` (the
+    running counters: total/created/updated/batches/...) AND `response` (the
+    final body a synchronous `_reindex` returns, whose `failures` list lives
+    HERE — NOT under `task.status`). Reading only `task.status` misses the
+    failures, so a reindex that ABORTED on a bulk error would be mistaken for
+    success. Merge `response` fields (failures/took/timed_out) into the status;
+    a synchronous _reindex response already carries everything at the top level
+    (completed has no `response` key, the merge is a no-op). Returns None when
+    the result cannot be read — the caller treats that as FAIL-CLOSED (success
+    not confirmed, checkpoint not advanced).
     """
     task = completed.get("task")
     status = task.get("status") if isinstance(task, dict) else None
-    return status if isinstance(status, dict) else None
+    if not isinstance(status, dict):
+        return None
+    result = dict(status)
+    response = completed.get("response")
+    if isinstance(response, dict):
+        for key in ("failures", "took", "timed_out"):
+            if key in response:
+                result[key] = response[key]
+    return result
 
 
 # --------------------------------------------------------------------------- #

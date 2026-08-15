@@ -320,6 +320,10 @@ class FakeIndexer:
         self.reindex_ok = True
         self.reindex_failures: list[Any] | None = None
         self.reindex_created = 0
+        # When True, the completed async reindex task reports its failures under
+        # the top-level `response` key (the real shape OpenSearch returns for a
+        # completed task) instead of under `task.status`.
+        self.reindex_failures_in_response = False
         # Number of /_reindex posts that raise a transport-level error before
         # the request succeeds (retry path). 0 = never fail at transport level.
         self.reindex_transport_errors = 0
@@ -343,20 +347,25 @@ class FakeIndexer:
         if path.startswith("/_tasks/"):
             if self.task_pending:
                 return self._resp(200, {"completed": False}, path)
-            return self._resp(
-                200,
-                {
-                    "completed": True,
-                    "task": {
-                        "status": {
-                            "total": self.reindex_created,
-                            "created": self.reindex_created,
-                            "failures": self.reindex_failures or [],
-                        }
-                    },
-                },
-                path,
-            )
+            status = {
+                "total": self.reindex_created,
+                "created": self.reindex_created,
+            }
+            if not self.reindex_failures_in_response:
+                status["failures"] = self.reindex_failures or []
+            body: dict[str, Any] = {"completed": True, "task": {"status": status}}
+            if self.reindex_failures_in_response:
+                # A completed async task reports the FINAL response (with
+                # failures) under the top-level `response` key, NOT under
+                # task.status — the exact shape that exposed the bug.
+                body["response"] = {
+                    "took": 1,
+                    "timed_out": False,
+                    "total": self.reindex_created,
+                    "created": self.reindex_created,
+                    "failures": self.reindex_failures or [],
+                }
+            return self._resp(200, body, path)
         if path.startswith("/_ingest/pipeline/"):
             if self.deployed_pipeline is None:
                 return self._resp(404, {}, path)
@@ -463,6 +472,30 @@ def _checkpoint_puts(fake: FakeIndexer) -> list[dict[str, Any]]:
             assert isinstance(body, dict)
             puts.append(body)
     return puts
+
+
+def test_reindex_task_result_merges_response_failures() -> None:
+    """`_reindex_task_result` must surface failures from `task.response` — the
+    real location in a completed async task — not only `task.status`."""
+    completed = {
+        "completed": True,
+        "task": {"status": {"total": 5, "created": 3, "batches": 1}},
+        "response": {
+            "took": 5,
+            "timed_out": False,
+            "failures": [{"index": "q", "cause": {"type": "boom"}}],
+        },
+    }
+    result = sync_masked._reindex_task_result(completed)
+    assert result is not None
+    assert result["created"] == 3
+    assert result["failures"] == [{"index": "q", "cause": {"type": "boom"}}]
+    # Status-only task (or a synchronous response, which has no `response` key):
+    # still works, no crash, failures simply absent.
+    status_only = {"completed": True, "task": {"status": {"created": 3}}}
+    assert sync_masked._reindex_task_result(status_only) == {"created": 3}
+    # Unreadable result -> None (caller treats as fail-closed).
+    assert sync_masked._reindex_task_result({"completed": True}) is None
 
 
 @pytest.fixture(autouse=True)
@@ -639,6 +672,31 @@ class TestSyncReindexTaskPoll:
         fake = FakeIndexer()
         fake.deployed_pipeline = build_pipeline_template(cfg)
         fake.reindex_failures = [{"index": "x", "reason": "boom"}]
+        assert _run_sync(cfg, fake) == 1
+        assert _checkpoint_puts(fake) == []
+        assert "failure(s)" in capsys.readouterr().err
+
+    def test_task_failures_in_response_checkpoint_not_advanced(
+        self, cfg: Any, capsys: Any
+    ) -> None:
+        """A completed async reindex reports failures under `task.response`
+        (the final body), NOT under `task.status`. Reading only `task.status`
+        misses them and would advance the checkpoint on an aborted reindex —
+        the exact bug a real backfill hit (strict_dynamic_mapping_exception on
+        the quarantine routing). The checkpoint must NOT advance."""
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.reindex_created = 991
+        fake.reindex_failures = [
+            {
+                "index": ".ds-klaxon-quarantine-test-a-v5-raw-000001",
+                "cause": {
+                    "type": "strict_dynamic_mapping_exception",
+                    "reason": "dynamic introduction of [klaxon] ... not allowed",
+                },
+            }
+        ]
+        fake.reindex_failures_in_response = True
         assert _run_sync(cfg, fake) == 1
         assert _checkpoint_puts(fake) == []
         assert "failure(s)" in capsys.readouterr().err
