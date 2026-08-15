@@ -154,7 +154,7 @@ The deep material lives in dedicated docs — linked, not duplicated:
 - **Token scheme & security model** (HMAC, salt, self-test, why 16 hex) → [`docs/security-model.md`](docs/security-model.md)
 - **Security concept: brute-force re-identification risk** (pseudonymization vs anonymization, salt as secret) → [`docs/security-concept.md`](docs/security-concept.md)
 - **Salt rotation runbook** (no scheduled rotation; only on suspicion; response-layer + masked-stream paths) → [`docs/salt-rotation-runbook.md`](docs/salt-rotation-runbook.md)
-- **LLM-safety guarantees & limits** (pseudonymization caveat, residual gate) → [`docs/llm-safety.md`](docs/llm-safety.md)
+- **LLM safety: using Klaxon safely with an LLM** (masked-stream-first routing, ready-to-copy system prompt, pseudonymization boundary, residual gate) → [`docs/llm-safety.md`](docs/llm-safety.md)
 - **Running it on another machine** (HTTP transport, auth, TLS, CORS) → [`docs/TOOLS.md`](docs/TOOLS.md#transport-options), [`ARCHITECTURE.md`](ARCHITECTURE.md)
 
 ---

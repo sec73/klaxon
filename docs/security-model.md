@@ -26,6 +26,7 @@ produce the **same** token.
 - [Generic labels (`use_hash: false`)](#generic-labels-use_hash-false)
 - [Deployment note: the salt is visible in the cluster](#deployment-note-the-salt-is-visible-in-the-cluster)
 - [Brute-force re-identification risk](#brute-force-re-identification-risk)
+- [LLM-safety operational layer](#llm-safety-operational-layer)
 
 ---
 
@@ -134,3 +135,10 @@ re-identifiable by dictionary/brute force (the 16-hex token has 64 bits, but
 the *value* space — usernames, internal IPs, hostnames — is small). Mitigations
 and the accepted residual risk are documented in
 [`docs/security-concept.md`](security-concept.md).
+
+## LLM-safety operational layer
+
+The operational side of the token scheme — masked-stream-first routing (the
+masked stream is the only LLM/report source), the ready-to-copy system-prompt
+section, and the pseudonymization boundary in practice — is documented in
+[`docs/llm-safety.md`](llm-safety.md).
