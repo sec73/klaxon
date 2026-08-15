@@ -162,6 +162,26 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   functions. Committed artifacts and the golden master regenerated; the
   twin-masked-doc golden now masks the nested fields and matches the
   response-layer golden exactly.
+
+- **`message` is now the BUILT-IN default free-text field of the generated
+  pipeline.** Previously the `FREE_TEXT` table was populated solely from
+  `free_text_fields` in `fields.yaml`, so a tenant without that section emitted
+  an EMPTY `def FREE_TEXT = [ ];` and the free-text pass (`maskFreeText`) never
+  ran — raw usernames/IPs/e-mails in `message` would reach the masked stream
+  unmasked (the `klaxon masking test` free-text assertions failed). Now the
+  generator ALWAYS emits `message` (plus any extra `free_text_fields`), so the
+  list is never empty; the fields.yaml validator REJECTS `message` in
+  `free_text_fields` ("message is the built-in default free-text field and
+  must not be listed" — list only extra fields); and the script-structure
+  self-test asserts the rendered `FREE_TEXT` is non-empty and contains
+  `message`, aborting generation (no artifacts) if it would be empty. The
+  Python twin, the pipeline `_meta` provenance and the config fragment
+  (`mask_free_text_fields`) all route through the same
+  `effective_free_text_fields` helper, so the response layer keeps masking
+  `message` free text and the drift fingerprints stay in sync.
+  `tenants/customer-a/fields.yaml` no longer lists `message`; committed
+  artifacts + golden regenerated. New loader + self-test guard tests
+  (`tests/test_generate_masking.py`).
 ## 0.2.0 – 2026-08-13
 
 ### Fixed

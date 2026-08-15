@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from typing import Any
 
 from .hmac_vectors import ALL_HMAC_VECTORS, KLAXON_VECTORS
@@ -142,6 +143,21 @@ _PAINLESS_TOP_DECLS: tuple[str, ...] = (
 # The first statement of the main logic, which must follow every declaration.
 _MAIN_LOGIC_MARKER = "Map masked = deepCopy(ctx);"
 
+# The FREE_TEXT table of a rendered script: `def FREE_TEXT = [ ... ];`
+_FREE_TEXT_RE = re.compile(r"def FREE_TEXT = \[(.*?)\];", re.DOTALL)
+
+
+def _free_text_list(script: str) -> list[str]:
+    """The free-text field names in a rendered script's FREE_TEXT table."""
+    match = _FREE_TEXT_RE.search(script)
+    if not match:
+        return []
+    return [
+        item.strip().strip('"')
+        for item in match.group(1).split(",")
+        if item.strip()
+    ]
+
 
 def verify_script_structure(script: str) -> list[str]:
     """Structural compile-safety problems in a rendered Painless script.
@@ -209,6 +225,23 @@ def verify_script_structure(script: str) -> list[str]:
                 "no free-text Pattern functions found — the free-text pass "
                 "references them by name and the script would fail to compile."
             )
+
+    # The free-text pass must ALWAYS run over the built-in `message` field: an
+    # empty FREE_TEXT list would silently skip every free-text assertion (raw
+    # usernames/IPs/e-mails would reach the masked stream unmasked). Abort
+    # generation rather than ship a pipeline that leaks raw prose.
+    free_text = _free_text_list(script)
+    if not free_text:
+        problems.append(
+            "FREE_TEXT is empty — the free-text pass would never run; the "
+            "built-in `message` field (plus any extra free_text_fields) must "
+            "be present in the table."
+        )
+    elif "message" not in free_text:
+        problems.append(
+            "FREE_TEXT does not contain the built-in `message` field — the "
+            "free-text pass must always run over `message`."
+        )
 
     return problems
 

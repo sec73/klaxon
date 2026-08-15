@@ -21,9 +21,9 @@ mask_free_text_users: true
 
 # Free-text fields carry raw log lines; the pipeline runs the username pass
 # (context patterns + per-document identity registry) over them so usernames,
-# e-mails and IPs inside prose are tokenised too.
-free_text_fields:
-  - field: message
+# e-mails and IPs inside prose are tokenised too. `message` is the BUILT-IN
+# default free-text field and must NOT be listed here (the loader rejects it);
+# the free-text pass always runs over it. List only EXTRA fields.
 
 # Structured fields whose whole value is replaced with a deterministic token.
 # `related.hash` is deliberately NOT listed — file hashes are security IOCs,

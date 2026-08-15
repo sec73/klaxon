@@ -36,6 +36,7 @@ from klaxon_mcp.masked_stream import (
     pipeline_mask_doc,
     token,
 )
+from klaxon_mcp.tenants import effective_free_text_fields
 
 SALT = "test-salt"
 
@@ -43,8 +44,6 @@ FIELDS_YAML = """\
 tenant: test-a
 salt_env: KLAXON_ANONYMIZATION_SALT
 mask_free_text_users: true
-free_text_fields:
-  - field: message
 fields:
   - field: destination.ip
     family: IP
@@ -444,7 +443,8 @@ def _config(cfg: Any) -> Config:
         logtest_default_space="custom",
         anonymization=AnonymizationConfig(
             mask_fields=cfg.all_masked_fields,
-            mask_free_text_fields=cfg.free_text_fields,
+            # Mirrors the generated config fragment: message (built-in) + extras.
+            mask_free_text_fields=effective_free_text_fields(cfg),
         ),
     )
 

@@ -25,7 +25,7 @@ from klaxon_mcp import posture, server
 from klaxon_mcp.clients import Response, TransportError
 from klaxon_mcp.config import AnonymizationConfig, Config
 from klaxon_mcp.masked_stream import fields_yaml_sha256
-from klaxon_mcp.tenants import load_tenant_config
+from klaxon_mcp.tenants import effective_free_text_fields, load_tenant_config
 
 TEST_SALT = "0123456789abcdef0123456789abcdef"
 # Exactly 64 hex chars = 256 bits (the recommended length).
@@ -153,7 +153,7 @@ def matching_pipeline(cfg: Any) -> dict[str, Any]:
     meta = {
         "sha256": fields_yaml_sha256(cfg),
         "fields": list(cfg.all_masked_fields),
-        "free_text_fields": list(cfg.free_text_fields),
+        "free_text_fields": list(effective_free_text_fields(cfg)),
     }
     return {
         "description": "\nklaxon-provenance: " + json.dumps(meta),
@@ -201,7 +201,7 @@ class TestPostureChecks:
         # pipeline-drift check passes (response layer == pipeline field list).
         a = anon(
             mask_fields=tenant.all_masked_fields,
-            mask_free_text_fields=tenant.free_text_fields,
+            mask_free_text_fields=effective_free_text_fields(tenant),
             salt=SECRET_SALT,
         )
         fake = FakeIndexer(roles=set(ALL_ROLES), pipeline=matching_pipeline(tenant))

@@ -50,8 +50,6 @@ LIVE_TEST_FIELDS = """\
 tenant: test-live
 salt_env: KLAXON_ANONYMIZATION_SALT
 mask_free_text_users: true
-free_text_fields:
-  - field: message
 fields:
   - field: destination.ip
     family: IP

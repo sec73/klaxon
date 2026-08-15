@@ -29,7 +29,7 @@
   ],
   "_meta": {
     "source": "tenants/customer-a/fields.yaml",
-    "sha256": "57779b1435c6f56b08a399efc85fce103a78457a86fbe29b8d72f2670900408f",
+    "sha256": "27e5f3025e3b69727150753f3240ea3c1d722fcdf401b9da783d529b36eaa0fa",
     "tenant": "customer-a",
     "generator_version": "0.1.9",
     "generated_by": "klaxon masking generate",

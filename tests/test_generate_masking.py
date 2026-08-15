@@ -78,8 +78,6 @@ MINIMAL_FIELDS = """\
 tenant: test-a
 salt_env: KLAXON_ANONYMIZATION_SALT
 mask_free_text_users: true
-free_text_fields:
-  - field: message
 fields:
   - field: destination.ip
     family: IP
@@ -144,8 +142,10 @@ def test_loader_rejects_duplicate_field(tmp_path: Any) -> None:
 def test_loader_rejects_field_also_in_free_text(tmp_path: Any) -> None:
     tenant_dir = tmp_path / "tenants" / "test-a"
     tenant_dir.mkdir(parents=True)
+    # `destination.ip` is a structured field AND listed as a free_text_field ->
+    # the loader must reject the overlap.
     (tenant_dir / "fields.yaml").write_text(
-        MINIMAL_FIELDS + "  - field: message\n    family: USER\n",
+        MINIMAL_FIELDS + "\nfree_text_fields:\n  - field: destination.ip\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="both field and free_text_field"):
@@ -169,11 +169,25 @@ def test_loader_rejects_malformed_free_text_field_name(tmp_path: Any) -> None:
     tenant_dir = tmp_path / "tenants" / "test-a"
     tenant_dir.mkdir(parents=True)
     bad = MINIMAL_FIELDS.replace(
-        "free_text_fields:\n  - field: message",
-        "free_text_fields:\n  - field: 'message# x'",
+        "mask_free_text_users: true",
+        "mask_free_text_users: true\nfree_text_fields:\n  - field: 'message# x'",
     )
     (tenant_dir / "fields.yaml").write_text(bad, encoding="utf-8")
     with pytest.raises(ValueError, match="invalid field name"):
+        load_tenant_config("test-a", root=tmp_path)
+
+
+def test_loader_rejects_message_in_free_text_fields(tmp_path: Any) -> None:
+    # `message` is the built-in default free-text field; listing it is a
+    # configuration error (the generator always emits it).
+    tenant_dir = tmp_path / "tenants" / "test-a"
+    tenant_dir.mkdir(parents=True)
+    bad = MINIMAL_FIELDS.replace(
+        "mask_free_text_users: true",
+        "mask_free_text_users: true\nfree_text_fields:\n  - field: message",
+    )
+    (tenant_dir / "fields.yaml").write_text(bad, encoding="utf-8")
+    with pytest.raises(ValueError, match="built-in default free-text"):
         load_tenant_config("test-a", root=tmp_path)
 
 
@@ -370,6 +384,52 @@ def test_verify_script_structure_catches_missing_function(cfg: Any) -> None:
     tampered = source[:start] + source[end:]
     problems = verify_script_structure(tampered)
     assert any("missing function" in p and "hmacSha256Hex" in p for p in problems)
+
+
+def test_verify_script_structure_catches_empty_free_text(cfg: Any) -> None:
+    """An empty FREE_TEXT list would silently skip the whole free-text pass
+    (raw usernames/IPs/e-mails unmasked); the structure check must reject it."""
+    source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
+    tampered = source.replace(
+        'def FREE_TEXT = [\n    "message"\n];',
+        "def FREE_TEXT = [\n];",
+    )
+    assert "message" not in tampered.split("def FREE_TEXT")[1].split("];")[0]
+    problems = verify_script_structure(tampered)
+    assert any("FREE_TEXT is empty" in p for p in problems)
+
+
+def test_verify_script_structure_requires_message_in_free_text(cfg: Any) -> None:
+    """The built-in `message` field must stay in FREE_TEXT (the free-text pass
+    always runs over it, even when fields.yaml lists only extra fields)."""
+    source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
+    tampered = source.replace(
+        'def FREE_TEXT = [\n    "message"\n];',
+        'def FREE_TEXT = [\n    "extra"\n];',
+    )
+    problems = verify_script_structure(tampered)
+    assert any("built-in `message`" in p for p in problems)
+
+
+def test_generator_selftest_fails_on_empty_free_text(
+    cfg: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generator change that empties FREE_TEXT must abort generation: the
+    self-test reports it, so `generate` emits NO artifacts."""
+    real_build = masking.build_pipeline
+
+    def broken(tenant_cfg: Any, salt: str) -> dict[str, Any]:
+        pipeline = real_build(tenant_cfg, salt)
+        script = pipeline["processors"][0]["script"]
+        script["source"] = script["source"].replace(
+            'def FREE_TEXT = [\n    "message"\n];',
+            "def FREE_TEXT = [\n];",
+        )
+        return pipeline
+
+    monkeypatch.setattr(masking, "build_pipeline", broken)
+    problems = run_generator_selftest(cfg, SALT)
+    assert any("FREE_TEXT is empty" in p for p in problems)
 
 
 def test_generator_selftest_includes_structure_check(

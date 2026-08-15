@@ -74,6 +74,7 @@ from .tenants import (
     FieldSpec,
     TenantConfig,
     build_config_fragment,
+    effective_free_text_fields,
     fields_yaml_sha256,
     find_repo_root,
     find_tenant_dir,
@@ -263,7 +264,10 @@ def build_pipeline(cfg: TenantConfig, salt: str) -> dict[str, Any]:
             "generator_version": generator_version(),
             "generated_by": "klaxon masking generate",
             "fields": list(cfg.all_masked_fields),
-            "free_text_fields": list(cfg.free_text_fields),
+            # Effective = the built-in `message` + extra free_text_fields; the
+            # provenance must match what the FREE_TEXT table emits, or the
+            # drift fingerprint would diverge.
+            "free_text_fields": list(effective_free_text_fields(cfg)),
         },
     }
 
@@ -680,7 +684,7 @@ def pipeline_mask_doc(source: dict[str, Any], cfg: TenantConfig, salt: str) -> d
 
         return pattern.sub(repl, text)
 
-    for field in cfg.free_text_fields:
+    for field in effective_free_text_fields(cfg):
         value = masked.get(field)
         if not isinstance(value, str):
             continue
@@ -751,8 +755,12 @@ def pipeline_field_names(pipeline: dict[str, Any]) -> tuple[str, ...]:
 
 
 def effective_mask_fields_from_config(cfg: TenantConfig) -> tuple[str, ...]:
-    """What the Klaxon config MUST mask for this tenant (field + free text)."""
-    return tuple((*cfg.all_masked_fields, *cfg.free_text_fields))
+    """What the Klaxon config MUST mask for this tenant (field + free text).
+
+    Uses the effective free-text set (built-in `message` + extras) so it
+    matches the pipeline's provenance fingerprint (`pipeline_field_names`).
+    """
+    return tuple((*cfg.all_masked_fields, *effective_free_text_fields(cfg)))
 
 
 def fingerprint_matches(pipeline: dict[str, Any], cfg: TenantConfig) -> bool:
