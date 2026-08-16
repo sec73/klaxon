@@ -1382,6 +1382,211 @@ class TestAggregationKeyMasking:
             "cloud-services",
         ]
 
+    def test_multi_terms_key_as_string_rebuilt_from_masked_key(self) -> None:
+        """multi_terms on a masked + an unmasked field: key_as_string is REBUILT
+        from the masked key list — the leak (a raw hostname inside
+        key_as_string) is gone, and key_as_string == "|".join(key)."""
+        body = {
+            "aggs": {
+                "pairs": {
+                    "multi_terms": {
+                        "terms": [
+                            {"field": "related.hosts"},
+                            {"field": "wazuh.integration.category"},
+                        ]
+                    }
+                }
+            }
+        }
+        response = {
+            "aggregations": {
+                "pairs": {
+                    "buckets": [
+                        {
+                            "key": ["brummfidel.sec73.io", "system-activity"],
+                            "key_as_string": "brummfidel.sec73.io|system-activity",
+                            "doc_count": 3,
+                        }
+                    ]
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        bucket = masked["aggregations"]["pairs"]["buckets"][0]
+        assert bucket["key"] == [ph("HOST", "brummfidel.sec73.io"), "system-activity"]
+        assert bucket["key_as_string"] == "|".join(bucket["key"])
+        assert "brummfidel.sec73.io" not in bucket["key_as_string"]
+
+    def test_multi_terms_key_as_string_same_family_for_ip(self) -> None:
+        """An IP-valued masked field in multi_terms: key and key_as_string use
+        the SAME family (no [IP_] inside key_as_string when key is [HOST_])."""
+        body = {
+            "aggs": {
+                "pairs": {
+                    "multi_terms": {
+                        "terms": [
+                            {"field": "related.hosts"},
+                            {"field": "wazuh.integration.category"},
+                        ]
+                    }
+                }
+            }
+        }
+        response = {
+            "aggregations": {
+                "pairs": {
+                    "buckets": [
+                        {
+                            "key": ["10.0.0.1", "system-activity"],
+                            "key_as_string": "10.0.0.1|system-activity",
+                            "doc_count": 3,
+                        }
+                    ]
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        bucket = masked["aggregations"]["pairs"]["buckets"][0]
+        # related.hosts -> HOST family, not the IP pass.
+        assert bucket["key"][0] == ph("HOST", "10.0.0.1")
+        assert bucket["key_as_string"].startswith("[HOST_")
+        assert "[IP_" not in bucket["key_as_string"]
+        assert bucket["key_as_string"] == "|".join(bucket["key"])
+
+    def test_terms_key_as_string_equals_key_token(self) -> None:
+        """terms with key_as_string (e.g. a request `format` that reformats the
+        key): key_as_string equals the masked KEY token. Pre-fix the raw
+        key_as_string was re-tokenised on its own — a DIFFERENT token — so this
+        FAILS before the fix and passes after."""
+        body = {
+            "aggs": {
+                "hosts": {"terms": {"field": "related.hosts", "format": "..."}}
+            }
+        }
+        response = {
+            "aggregations": {
+                "hosts": {
+                    "buckets": [
+                        {
+                            "key": "nc02web",
+                            "key_as_string": "nc02web (formatted)",
+                            "doc_count": 5,
+                        }
+                    ]
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        bucket = masked["aggregations"]["hosts"]["buckets"][0]
+        assert bucket["key"] == ph("HOST", "nc02web")
+        assert bucket["key_as_string"] == ph("HOST", "nc02web")
+
+    def test_terms_unmasked_field_key_as_string_untouched(self) -> None:
+        """An unmasked terms field with a formatted key_as_string (e.g. a date):
+        both key and key_as_string stay untouched — the formatted value is not
+        replaced by the raw key."""
+        body = {
+            "aggs": {"t": {"terms": {"field": "@timestamp"}}}
+        }
+        response = {
+            "aggregations": {
+                "t": {
+                    "buckets": [
+                        {
+                            "key": 1754697600000,
+                            "key_as_string": "2026-08-09T00:00:00.000Z",
+                            "doc_count": 4,
+                        }
+                    ]
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        bucket = masked["aggregations"]["t"]["buckets"][0]
+        assert bucket["key"] == 1754697600000
+        assert bucket["key_as_string"] == "2026-08-09T00:00:00.000Z"
+
+    def test_multi_terms_already_tokenized_passes_through(self) -> None:
+        """Masked-stream shape: multi_terms keys are already tokens, so the
+        rebuilt key_as_string (joined from the unchanged keys) is identical —
+        no double-masking."""
+        body = {
+            "aggs": {
+                "pairs": {
+                    "multi_terms": {
+                        "terms": [
+                            {"field": "related.hosts"},
+                            {"field": "wazuh.integration.category"},
+                        ]
+                    }
+                }
+            }
+        }
+        response = {
+            "aggregations": {
+                "pairs": {
+                    "buckets": [
+                        {
+                            "key": ["[HOST_aaaaaaaaaaaaaaaa]", "system-activity"],
+                            "key_as_string": "[HOST_aaaaaaaaaaaaaaaa]|system-activity",
+                            "doc_count": 3,
+                        }
+                    ]
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        bucket = masked["aggregations"]["pairs"]["buckets"][0]
+        assert bucket["key"] == ["[HOST_aaaaaaaaaaaaaaaa]", "system-activity"]
+        assert bucket["key_as_string"] == "[HOST_aaaaaaaaaaaaaaaa]|system-activity"
+
+    def test_nested_multi_terms_key_as_string_rebuilt(self) -> None:
+        """The key_as_string fix also applies at depth (Teil-11 walker): a
+        nested multi_terms key_as_string is rebuilt from its masked key list."""
+        body = {
+            "aggs": {
+                "hosts": {
+                    "terms": {"field": "related.hosts"},
+                    "aggs": {
+                        "pairs": {
+                            "multi_terms": {
+                                "terms": [
+                                    {"field": "related.user"},
+                                    {"field": "wazuh.integration.category"},
+                                ]
+                            }
+                        }
+                    },
+                }
+            }
+        }
+        response = {
+            "aggregations": {
+                "hosts": {
+                    "buckets": [
+                        {
+                            "key": "nc02web",
+                            "doc_count": 1,
+                            "pairs": {
+                                "buckets": [
+                                    {
+                                        "key": ["root", "system-activity"],
+                                        "key_as_string": "root|system-activity",
+                                        "doc_count": 3,
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            }
+        }
+        masked, _ = self.mask(response, body)
+        bucket = masked["aggregations"]["hosts"]["buckets"][0]["pairs"]["buckets"][0]
+        assert bucket["key"] == [ph("USER", "root"), "system-activity"]
+        assert bucket["key_as_string"] == "|".join(bucket["key"])
+        assert "root" not in bucket["key_as_string"]
+
     def test_filters_named_keys_untouched(self) -> None:
         body = {
             "aggs": {

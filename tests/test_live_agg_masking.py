@@ -7,13 +7,17 @@
 
 Proves on a real OpenSearch/Wazuh 5 indexer that the response walker tokenises
 sub-aggregation bucket keys at EVERY depth — the regression where a nested
-`terms related.user` under `terms related.hosts` came back RAW. It queries the
-RAW stream (`wazuh-events-v5-*`) so the walker itself is exercised, runs the
-real `Anonymizer` over the live response, and asserts:
+`terms related.user` under `terms related.hosts` came back RAW — and that
+`multi_terms` `key_as_string` is rebuilt from the masked key list (the
+`related.hosts` raw-value leak inside key_as_string). It queries the RAW stream
+(`wazuh-events-v5-*`) so the walker itself is exercised, runs the real
+`Anonymizer` over the live response, and asserts:
 
   * the nested `related.user` sub-bucket keys are tokens (the exact leak);
   * a nested UNMASKED field (`wazuh.integration.category` under
     `wazuh.agent.name`) stays readable;
+  * `multi_terms` key_as_string == "|".join(masked key list), so no raw
+    hostname survives inside it and the token family is consistent;
   * `doc_count` / `sum_other_doc_count` are byte-identical raw vs masked.
 
 Non-destructive: read-only `_search`. Skips cleanly when the credentials are
@@ -79,6 +83,24 @@ CATEGORY_BODY: dict[str, Any] = {
                     "terms": {"field": "wazuh.integration.category", "size": 20}
                 }
             },
+        }
+    },
+}
+
+# multi_terms [related.hosts, wazuh.integration.category]: related.hosts is
+# masked (HOST), category is unmasked — the key_as_string leak scenario.
+MULTI_TERMS_BODY: dict[str, Any] = {
+    "size": 0,
+    "query": {"bool": {"filter": [_WINDOW]}},
+    "aggs": {
+        "pairs": {
+            "multi_terms": {
+                "size": 20,
+                "terms": [
+                    {"field": "related.hosts"},
+                    {"field": "wazuh.integration.category"},
+                ],
+            }
         }
     },
 }
@@ -230,3 +252,47 @@ async def test_live_nested_unmasked_category_keys_stay_raw(
             "nested wazuh.integration.category key was tokenised — an unmasked "
             "field must stay readable"
         )
+
+
+async def test_live_multi_terms_key_as_string_has_no_raw_value(
+    live_config: tuple[live_test.LiveIndexerConfig, Any],
+) -> None:
+    """multi_terms [related.hosts, wazuh.integration.category] on the RAW
+    stream: the masked hostname appears in key AND in the REBUILT key_as_string
+    (== "|".join(key)), so the joined key_as_string can never carry a raw
+    remnant of the masked field and the token family is consistent. Counts are
+    byte-identical raw vs masked."""
+    live, cfg = live_config
+    anon = _anonymizer(cfg)
+    agg_map = parse_agg_fields(MULTI_TERMS_BODY)
+
+    async with _client(live) as client:
+        raw = await _live_search(client, MULTI_TERMS_BODY)
+
+    masked = anon.mask_response(
+        Response(200, json.dumps(raw), "https://indexer/_search"), agg_map=agg_map
+    ).json()
+
+    if "aggregations" not in masked or "pairs" not in masked["aggregations"]:
+        pytest.skip(
+            "live multi_terms test skipped: no data in the 24h window"
+        )
+    buckets = masked["aggregations"]["pairs"].get("buckets", [])
+    if not buckets:
+        pytest.skip("live multi_terms test skipped: no buckets in the 24h window")
+
+    raw_buckets = raw["aggregations"]["pairs"]["buckets"]
+    for bucket, r_bucket in zip(buckets, raw_buckets):
+        key = bucket["key"]
+        assert isinstance(key, list) and key, "multi_terms bucket has no key list"
+        # related.hosts (the first field) is masked -> its key element is a token.
+        assert _TOKEN_RE.fullmatch(str(key[0])), (
+            "multi_terms related.hosts key element leaked RAW"
+        )
+        # key_as_string is REBUILT from the masked key list -> joined exactly.
+        if "key_as_string" in bucket:
+            assert bucket["key_as_string"] == "|".join(str(k) for k in key), (
+                "key_as_string not rebuilt from the masked key list"
+            )
+        # Counts are never modified by the walker.
+        assert bucket["doc_count"] == r_bucket["doc_count"]

@@ -695,11 +695,18 @@ class Anonymizer:
         if not isinstance(bucket, dict):
             return bucket
         out: dict[str, Any] = {}
+        # The masked `key` is computed once up front so `key_as_string` can be
+        # REBUILT from it (never segment-wise): the masked key list is the
+        # source of truth, so the joined `key_as_string` can carry no raw
+        # remnant and never mixes token families for one raw value.
+        masked_key = self._mask_key(bucket["key"], spec) if "key" in bucket else None
         for key, value in bucket.items():
             if key == "key":
-                out[key] = self._mask_key(value, spec)
+                out[key] = masked_key
             elif key == "key_as_string":
-                out[key] = self._mask_key_as_string(value, spec)
+                out[key] = self._mask_key_as_string(
+                    value, spec, masked_key=masked_key
+                )
             elif key == "aggregations":
                 # The "aggregations"-wrapper shape (some proxies nest sub-aggs
                 # under it); real OpenSearch nests them directly, handled below.
@@ -737,15 +744,36 @@ class Anonymizer:
         field = spec.fields[0] if spec.fields else ""
         return self._mask_key_value(field, value)
 
-    def _mask_key_as_string(self, value: Any, spec: AggSpec | None) -> Any:
-        """Keep `key_as_string` consistent with a tokenised `key` when present."""
-        if (
-            spec is None
-            or spec.agg_type not in {"terms", "significant_terms", "significant_text"}
-            or not spec.fields
-        ):
+    def _mask_key_as_string(
+        self, value: Any, spec: AggSpec | None, masked_key: Any = None
+    ) -> Any:
+        """Rebuild `key_as_string` from the already-masked `key`.
+
+        The masked key list is the source of truth — never mask `key_as_string`
+        segment-wise (fragile when a raw value contains "|", and the token
+        family would only be guessable). For `multi_terms` the masked keys are
+        joined with "|"; for the terms family `key_as_string` equals the masked
+        key token. A `key_as_string` therefore can never carry a raw remnant
+        (the leak) and always shares the key's token family — no more `[IP_]`
+        vs `[HOST_]` for the same raw value. Unmasked fields' values stay
+        verbatim (an original formatted value, e.g. a date, is preserved).
+        """
+        if spec is None or spec.agg_type is None:
             return value
-        return self._mask_key_value(spec.fields[0], value)
+        if spec.agg_type == "multi_terms":
+            if masked_key is None or not isinstance(masked_key, list):
+                return value
+            return "|".join(str(item) for item in masked_key)
+        if (
+            spec.agg_type in {"terms", "significant_terms", "significant_text"}
+            and spec.fields
+        ):
+            if self._field_for_path(spec.fields[0]) is None:
+                # Unmasked field: key AND key_as_string stay untouched.
+                return value
+            if masked_key is not None:
+                return masked_key
+        return value
 
     def _mask_composite_key(self, value: Any, spec: AggSpec) -> Any:
         """Tokenise the named entries of a composite `key` / `after_key`."""

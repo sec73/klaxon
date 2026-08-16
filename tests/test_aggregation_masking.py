@@ -236,6 +236,26 @@ TOKENISED_PAYLOAD: dict[str, Any] = {
     },
 }
 
+# multi_terms [related.hosts, wazuh.integration.category] with OpenSearch's
+# generated key_as_string (fields joined with "|") carrying a RAW hostname —
+# the exact leak under test.
+MULTI_TERMS_PAYLOAD: dict[str, Any] = {
+    "took": 3,
+    "timed_out": False,
+    "hits": {"total": {"value": 1, "relation": "eq"}, "hits": []},
+    "aggregations": {
+        "pairs": {
+            "buckets": [
+                {
+                    "key": ["brummfidel.sec73.io", "system-activity"],
+                    "key_as_string": "brummfidel.sec73.io|system-activity",
+                    "doc_count": 3,
+                }
+            ]
+        }
+    },
+}
+
 
 class TestSearchNestedAggregationMasking:
     async def test_nested_sub_agg_keys_are_tokenised_on_raw_stream(
@@ -312,3 +332,30 @@ class TestSearchNestedAggregationMasking:
         # No double-masking: the exact token (16 hex) appears, not a re-hash.
         assert "[HOST_aaaaaaaaaaaaaaaa]" in out
         assert "[USER_bbbbbbbbbbbbbbbb]" in out
+
+    async def test_multi_terms_key_as_string_has_no_raw_value_on_raw_stream(
+        self, run_search: Any
+    ) -> None:
+        """multi_terms [related.hosts, wazuh.integration.category] on the raw
+        stream: the OpenSearch-generated key_as_string is rebuilt from the
+        masked key list — no raw hostname survives (the leak), and key_as_string
+        equals "|".join(key)."""
+        run_search(True, True, MULTI_TERMS_PAYLOAD)
+        out = await run(
+            {
+                "size": 0,
+                "aggs": {
+                    "pairs": {
+                        "multi_terms": {
+                            "terms": [
+                                {"field": "related.hosts"},
+                                {"field": "wazuh.integration.category"},
+                            ]
+                        }
+                    }
+                },
+            }
+        )
+        assert ph("HOST", "brummfidel.sec73.io") in out
+        assert '"key_as_string": "[HOST_' in out
+        assert "brummfidel.sec73.io" not in out
