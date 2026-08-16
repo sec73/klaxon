@@ -65,9 +65,12 @@ LLM/report queries.**
   (`user: {name: …}`) or a flat dotted key (`user.name`).
 - **Aggregation keys are masked too (fail-closed).** Bucket keys of
   terms/composite aggregations on a configured field are tokenised with the
-  same tokens as `_source`; `composite` `after_key` stays consistent, so
-  pagination keeps working. **ON by default**; `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS=false`
-  turns it off (aggregation output can then carry raw values).
+  same tokens as `_source` — at every nesting depth, because the response
+  walker descends through the request-built aggregation hierarchy (OpenSearch
+  nests sub-aggregations directly inside buckets); `composite` `key` and
+  `after_key` stay consistent, so pagination keeps working. **ON by default**;
+  `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS=false` turns it off (aggregation
+  output can then carry raw values).
 - **Free-text usernames reuse the structured tokens.** With
   `mask_free_text_users` on (default), usernames inside free-text fields are
   masked with the same tokens as the structured fields — `uid=alice` inside a

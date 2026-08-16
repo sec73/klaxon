@@ -58,6 +58,7 @@ def config_with(*, enabled: bool, mask_agg_keys: bool) -> Config:
             mask_fields=(
                 "source.ip",
                 "related.hosts",
+                "related.user",
                 "user.name",
                 "wazuh.agent.name",
             ),
@@ -84,8 +85,11 @@ PAYLOAD: dict[str, Any] = {
 
 
 class RecordingIndexer:
+    def __init__(self, payload: dict[str, Any] | None = None) -> None:
+        self.payload = payload if payload is not None else PAYLOAD
+
     async def post(self, path: str, body: Any = None) -> Response:
-        return Response(200, json.dumps(PAYLOAD), f"https://indexer.example{path}")
+        return Response(200, json.dumps(self.payload), f"https://indexer.example{path}")
 
 
 @pytest.fixture
@@ -95,11 +99,13 @@ def run_search() -> Iterator[Any]:
     previous_config = server._config
     previous_anon = server._anonymizer
 
-    def install(enabled: bool, mask_agg_keys: bool) -> None:
+    def install(
+        enabled: bool, mask_agg_keys: bool, payload: dict[str, Any] | None = None
+    ) -> None:
         server._config = config_with(enabled=enabled, mask_agg_keys=mask_agg_keys)
         # Rebuild the cached anonymizer from the config above.
         server._anonymizer = None  # type: ignore[assignment]
-        server._indexer = RecordingIndexer()  # type: ignore[assignment]
+        server._indexer = RecordingIndexer(payload)  # type: ignore[assignment]
 
     install(True, True)
     try:
@@ -153,3 +159,156 @@ class TestSearchAggregationMasking:
         )
         assert "nc02web" in out
         assert "[HOST_" not in out
+
+
+# A response shaped EXACTLY like OpenSearch serves it: the nested sub-agg sits
+# DIRECTLY in the bucket (siblings of `key`/`doc_count`), with no
+# "aggregations" wrapper.
+NESTED_PAYLOAD: dict[str, Any] = {
+    "took": 3,
+    "timed_out": False,
+    "hits": {
+        "total": {"value": 1, "relation": "eq"},
+        "hits": [],
+    },
+    "aggregations": {
+        "hosts": {
+            "doc_count_error_upper_bound": 0,
+            "sum_other_doc_count": 1,
+            "buckets": [
+                {
+                    "key": "nc02web",
+                    "doc_count": 3,
+                    "users": {
+                        "buckets": [
+                            {"key": "root", "doc_count": 2},
+                            {"key": "podomoro", "doc_count": 1},
+                        ]
+                    },
+                }
+            ],
+        }
+    },
+}
+
+# agents -> categories: the nested category field is NOT in mask_fields.
+NESTED_CATEGORY_PAYLOAD: dict[str, Any] = {
+    "took": 3,
+    "timed_out": False,
+    "hits": {"total": {"value": 1, "relation": "eq"}, "hits": []},
+    "aggregations": {
+        "agents": {
+            "buckets": [
+                {
+                    "key": "web-server-01",
+                    "doc_count": 3,
+                    "categories": {
+                        "buckets": [
+                            {"key": "cloud-services", "doc_count": 2},
+                            {"key": "security", "doc_count": 1},
+                        ]
+                    },
+                }
+            ]
+        }
+    },
+}
+
+# Masked stream: keys are ALREADY tokens (ingest-time masking).
+TOKENISED_PAYLOAD: dict[str, Any] = {
+    "took": 3,
+    "timed_out": False,
+    "hits": {"total": {"value": 1, "relation": "eq"}, "hits": []},
+    "aggregations": {
+        "hosts": {
+            "buckets": [
+                {
+                    "key": "[HOST_aaaaaaaaaaaaaaaa]",
+                    "doc_count": 3,
+                    "users": {
+                        "buckets": [
+                            {"key": "[USER_bbbbbbbbbbbbbbbb]", "doc_count": 2}
+                        ]
+                    },
+                }
+            ]
+        }
+    },
+}
+
+
+class TestSearchNestedAggregationMasking:
+    async def test_nested_sub_agg_keys_are_tokenised_on_raw_stream(
+        self, run_search: Any
+    ) -> None:
+        """The regression: `terms related.hosts -> terms related.user` on the
+        RAW stream (wazuh-events-v5-*). The walker must tokenise the top-level
+        AND the nested sub-agg keys — before the fix the nested `related.user`
+        keys came back RAW. Run against a raw-stream-shaped index so the
+        response walker itself is exercised."""
+        run_search(True, True, NESTED_PAYLOAD)
+        out = await run(
+            {
+                "size": 0,
+                "aggs": {
+                    "hosts": {
+                        "terms": {"field": "related.hosts"},
+                        "aggs": {"users": {"terms": {"field": "related.user"}}},
+                    }
+                },
+            }
+        )
+        assert ph("HOST", "nc02web") in out
+        assert ph("USER", "root") in out
+        assert ph("USER", "podomoro") in out
+        assert "nc02web" not in out
+        assert '"key": "root"' not in out
+        assert '"key": "podomoro"' not in out
+
+    async def test_nested_unmasked_category_keys_stay_raw(
+        self, run_search: Any
+    ) -> None:
+        """`terms wazuh.agent.name -> terms wazuh.integration.category`: the top
+        key is masked, the nested category keys remain readable (regression)."""
+        run_search(True, True, NESTED_CATEGORY_PAYLOAD)
+        out = await run(
+            {
+                "size": 0,
+                "aggs": {
+                    "agents": {
+                        "terms": {"field": "wazuh.agent.name"},
+                        "aggs": {
+                            "categories": {
+                                "terms": {"field": "wazuh.integration.category"}
+                            }
+                        },
+                    }
+                },
+            }
+        )
+        assert ph("HOST", "web-server-01") in out
+        assert '"key": "cloud-services"' in out
+        assert '"key": "security"' in out
+
+    async def test_masked_stream_sub_agg_tokens_pass_through(
+        self, run_search: Any
+    ) -> None:
+        """Masked stream: sub-agg keys are already tokens; they pass through
+        unchanged (idempotent), never re-tokenised."""
+        run_search(True, True, TOKENISED_PAYLOAD)
+        out = await run(
+            {
+                "size": 0,
+                "aggs": {
+                    "hosts": {
+                        "terms": {"field": "related.hosts"},
+                        "aggs": {"users": {"terms": {"field": "related.user"}}},
+                    }
+                },
+            }
+        )
+        assert "[HOST_aaaaaaaaaaaaaaaa]" in out
+        assert "[USER_bbbbbbbbbbbbbbbb]" in out
+        # No double-masking: the exact token (16 hex) appears, not a re-hash.
+        assert "[HOST_aaaaaaaaaaaaaaaa]" in out
+        assert "[USER_bbbbbbbbbbbbbbbb]" in out

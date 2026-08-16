@@ -121,11 +121,27 @@ class AggSpec:
     (date_histogram, histogram, range, filters, metrics, scripted aggs) is
     `agg_type=None`, and its keys are never tokenised — a key is masked only when
     its recorded source field is in `mask_fields`.
+
+    `children` records the nested sub-aggregations declared in the request's
+    `aggs` tree (name -> spec, in declaration order). OpenSearch nests these
+    DIRECTLY inside each bucket — siblings of `key`/`doc_count`, with no
+    `aggregations` wrapper — so the response walker needs this per-parent
+    hierarchy to find them, and to resolve same-named sub-aggregations under
+    different parents to the field of *that* level (a flat name map would pick
+    the wrong field on a collision).
     """
 
     agg_type: str | None
     fields: tuple[str, ...] = ()
     sources: tuple[tuple[str, str], ...] = ()
+    children: tuple[tuple[str, AggSpec], ...] = ()
+
+    def child(self, name: str) -> AggSpec | None:
+        """The spec of a nested sub-aggregation of this aggregation, by name."""
+        for child_name, child in self.children:
+            if child_name == name:
+                return child
+        return None
 
 
 def parse_agg_fields(body: Any) -> dict[str, AggSpec]:
@@ -153,7 +169,23 @@ def _walk_aggs(aggs: dict[str, Any], specs: dict[str, AggSpec]) -> None:
 
 
 def _agg_spec(agg: Any) -> AggSpec:
-    """The AggSpec for one request-body aggregation object."""
+    """The AggSpec for one request-body aggregation object.
+
+    Records the aggregation's own type/field mapping AND the nested
+    sub-aggregations declared under its `aggs` key (`children`), so the
+    response walker can descend through buckets at every depth.
+    """
+    body = _agg_body_spec(agg)
+    return AggSpec(
+        body.agg_type,
+        body.fields,
+        body.sources,
+        children=_child_specs(agg),
+    )
+
+
+def _agg_body_spec(agg: Any) -> AggSpec:
+    """Aggregation type/field mapping only (no `children`) for one request agg."""
     if not isinstance(agg, dict):
         return AggSpec(None)
     for kind in ("terms", "significant_terms", "significant_text"):
@@ -188,6 +220,22 @@ def _agg_spec(agg: Any) -> AggSpec:
         # `_source` must run through the normal document-masking path.
         return AggSpec("top_hits")
     return AggSpec(None)
+
+
+def _child_specs(agg: Any) -> tuple[tuple[str, AggSpec], ...]:
+    """(name, spec) pairs for the nested sub-aggregations of one request agg.
+
+    OpenSearch nests these DIRECTLY inside each response bucket (siblings of
+    `key`/`doc_count`), so the walker needs the per-parent hierarchy — a flat
+    name map would resolve same-named sub-aggregations under different parents
+    to the wrong field.
+    """
+    if not isinstance(agg, dict):
+        return ()
+    nested = agg.get("aggs")
+    if not isinstance(nested, dict):
+        return ()
+    return tuple((name, _agg_spec(sub)) for name, sub in nested.items())
 
 
 # --------------------------------------------------------------------------- #
@@ -530,7 +578,12 @@ class Anonymizer:
         Only fires when `mask_aggregation_keys` is on. Returns a copy of the
         parsed response with every bucket key whose source field is in
         `mask_fields` replaced by the deterministic token the `_source` pass
-        produces. Counts and metadata — `doc_count`,
+        produces — at EVERY nesting depth. OpenSearch nests sub-aggregations
+        DIRECTLY inside buckets (siblings of `key`/`doc_count`, no
+        `aggregations` wrapper); the walker descends through them via the
+        request-built agg hierarchy, so a nested `terms` on `related.user`
+        under a top-level `terms` on `related.hosts` gets its keys tokenised
+        exactly like the top-level ones. Counts and metadata — `doc_count`,
         `doc_count_error_upper_bound`, `sum_other_doc_count` — and the keys of
         non-field aggregations (date_histogram, histogram, range, filters,
         metrics) are left byte-identical. Embedded `top_hits` documents run
@@ -569,7 +622,12 @@ class Anonymizer:
         agg_map: Mapping[str, AggSpec],
         identities: Mapping[str, str] | None = None,
     ) -> Any:
-        """Mask one aggregation object: buckets, after_key, nested aggs, top_hits."""
+        """Mask one aggregation object: buckets, after_key, nested aggs, top_hits.
+
+        Reached both for top-level aggregations (with `spec` from the flat
+        `agg_map`) and for nested sub-aggregations (with `spec` resolved from the
+        parent's `children`, so the field is correct for THIS level).
+        """
         if not isinstance(agg_obj, dict):
             return agg_obj
         out: dict[str, Any] = {}
@@ -616,10 +674,13 @@ class Anonymizer:
                 for bucket in buckets
             ]
         if isinstance(buckets, dict):
-            # Named `filters` buckets: filter names are labels, not field values,
-            # and are never tokenised — only their sub-aggregations are walked.
+            # Named `filters` buckets: the dict key is a filter label, never a
+            # field value, so it is not tokenised. The spec still flows through
+            # (a keyed agg's agg_type is None, so `_mask_key` never fires) so
+            # sub-aggregations nested inside each named bucket are walked with
+            # the correct child field.
             return {
-                name: self._mask_bucket(bucket, None, agg_map, identities=identities)
+                name: self._mask_bucket(bucket, spec, agg_map, identities=identities)
                 for name, bucket in buckets.items()
             }
         return buckets
@@ -640,10 +701,24 @@ class Anonymizer:
             elif key == "key_as_string":
                 out[key] = self._mask_key_as_string(value, spec)
             elif key == "aggregations":
+                # The "aggregations"-wrapper shape (some proxies nest sub-aggs
+                # under it); real OpenSearch nests them directly, handled below.
                 out[key] = self._mask_agg_map(value, agg_map, identities=identities)
             else:
-                # doc_count and any bucket metadata are never touched.
-                out[key] = value
+                # Nested sub-aggregations sit DIRECTLY in the bucket, siblings of
+                # `key`/`doc_count`, with no "aggregations" wrapper. A direct
+                # child whose name is a known sub-aggregation of THIS aggregation
+                # (from the request tree) is a nested agg node: mask its buckets
+                # and recurse deeper — at every depth, with the field for this
+                # level (name collisions across parents resolve per level).
+                child_spec = spec.child(key) if spec is not None else None
+                if child_spec is not None:
+                    out[key] = self._mask_agg_obj(
+                        value, child_spec, agg_map, identities=identities
+                    )
+                else:
+                    # doc_count and any bucket metadata are never touched.
+                    out[key] = value
         return out
 
     def _mask_key(self, value: Any, spec: AggSpec | None) -> Any:

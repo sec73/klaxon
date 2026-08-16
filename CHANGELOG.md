@@ -200,6 +200,39 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   passes (the reported bug), config missing a structured field fails, config
   with an extra structured field fails, and a pipeline FREE_TEXT missing
   `message` fails (`tests/test_sync_masked.py`).
+
+### Fixed
+
+- **Aggregation-key masking now reaches NESTED sub-aggregations — the keys of
+  every level are tokenised, not just the top level.** OpenSearch nests
+  sub-aggregations DIRECTLY inside each bucket — siblings of `key`/`doc_count`,
+  with no `aggregations` wrapper — but the response walker only descended when
+  a bucket contained an `aggregations` key (a shape real responses never have),
+  so a nested `terms related.user` under `terms related.hosts` came back RAW
+  (a verified leak: nested user/agent-host keys were unmasked on the raw
+  stream even though their fields are in `mask_fields`). The walker is now
+  driven by the REQUEST-built agg hierarchy: `AggSpec` records its nested
+  sub-aggregations (`children`, name → spec), and `_mask_bucket` treats any
+  direct child whose name is a known sub-aggregation of THAT aggregation as a
+  nested agg node — masking its buckets with the field of that level and
+  recursing, depth-agnostically. Same-named sub-aggregations under different
+  parents resolve per level (the flat name map is only a top-level fallback).
+  Every agg shape works at every depth: terms/significant_terms/significant_
+  text (key + `key_as_string`), multi_terms (aligned with its field list),
+  composite (`key` AND `after_key`, so pagination stays consistent), keyed
+  aggs (filters/range/date_histogram/histogram: keys never tokenised, only
+  walked), and top_hits (embedded `_source` through the document-masking
+  path). Idempotency holds at depth — already-tokenized sub-agg keys
+  (masked stream) pass through unchanged. Counts
+  (`doc_count`/`sum_other_doc_count`/`doc_count_error_upper_bound`) and the
+  `mask_aggregation_keys: false` byte-identical path are untouched. New unit
+  tests (`tests/test_anonymization.py` — direct-sibling nested masked/masked,
+  masked-top/unmasked-below, depth-3, per-level collision resolution, nested
+  composite after_key, nested multi_terms, nested top_hits, nested idempotency,
+  children hierarchy) + raw-stream regression tests
+  (`tests/test_aggregation_masking.py`, fail before / pass after the fix) + a
+  skippable live test (`tests/test_live_agg_masking.py`) that checks the leak
+  case and the unmasked-below case against the real raw stream.
 ## 0.2.0 – 2026-08-13
 
 ### Fixed

@@ -310,13 +310,17 @@ masking pass a `terms` agg on `related.hosts` returns raw hostnames even when
 fail-closed; `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS=false` restores raw
 keys), the `search` response walker tokenises the `key` of `terms` / `significant_terms` /
 `significant_text` / `multi_terms` / `composite` buckets whose source field is
-in `mask_fields`, using the same deterministic tokens as `_source`. `composite`
-`after_key` is tokenised the same way so pagination stays consistent.
-`date_histogram`, `histogram`, `range`, `filters` and metric aggs are never
-touched; `doc_count` and aggregation metadata survive unchanged; `top_hits`
-embedded documents go through the normal `_source` masking. Aggregations whose
-request could not be mapped to fields (saved searches, scripted aggs) are left
-alone.
+in `mask_fields`, using the same deterministic tokens as `_source`. The walker
+descends through the request-built aggregation hierarchy, so NESTED
+sub-aggregations — which OpenSearch serves directly inside each bucket, as
+siblings of `key`/`doc_count` — have their keys tokenised at every depth with
+the field of that level (same-named sub-aggregations under different parents
+resolve per level). `composite` `key` AND `after_key` are tokenised the same
+way so pagination stays consistent. `date_histogram`, `histogram`, `range`,
+`filters` and metric aggs are never touched; `doc_count` and aggregation
+metadata survive unchanged; `top_hits` embedded documents go through the normal
+`_source` masking. Aggregations whose request could not be mapped to fields
+(saved searches, scripted aggs) are left alone.
 
 **Free-text usernames.** A `message` line can name a user without the structured
 `user.name` being present (`uid=marcomoenig,ou=users,dc=sec73,dc=io`,
