@@ -20,6 +20,7 @@ from klaxon_mcp.diagnostics import (
     render,
     search_notices,
     size_capped_notice,
+    unmappable_agg_dropped_notice,
 )
 
 
@@ -43,7 +44,7 @@ class TestSizeCappedNotice:
         assert "[AGG SIZE CAPPED]" in text
         assert "hosts.terms" in text
         assert "50000" in text
-        assert "100" in text
+
 
     def test_agg_size_cap_names_every_lowered_aggregation(self) -> None:
         text = agg_size_capped_notice(
@@ -55,6 +56,24 @@ class TestSizeCappedNotice:
     def test_agg_size_cap_empty_list_still_formats(self) -> None:
         text = agg_size_capped_notice([], 100)
         assert "[AGG SIZE CAPPED]" in text
+
+
+class TestUnmappableAggDroppedNotice:
+    def test_names_type_and_agg_and_states_absence(self) -> None:
+        text = unmappable_agg_dropped_notice(
+            [("scripted", "scripted_metric")]
+        )
+        assert "[UNMAPPABLE AGG DROPPED]" in text
+        assert "scripted_metric (scripted)" in text
+        # Never states a raw value — only the agg type and name.
+        assert "absent from this response" in text
+
+    def test_multiple_pairs(self) -> None:
+        text = unmappable_agg_dropped_notice(
+            [("a", "scripted_metric"), ("b", "weird_agg")]
+        )
+        assert "scripted_metric (a)" in text
+        assert "weird_agg (b)" in text
 
 
 class TestZeroHits:

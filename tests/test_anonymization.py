@@ -33,6 +33,8 @@ from klaxon_mcp.anonymization import (
     IP,
     USER,
     Anonymizer,
+    drop_unmappable_aggs,
+    find_unmappable_aggs,
     parse_agg_fields,
 )
 from klaxon_mcp.clients import Response
@@ -2005,3 +2007,355 @@ class TestServerIntegration:
         out = await search(index="wazuh-events-v5-*", body='{"size": 1}')
         assert "admin" in out
         assert "192.168.1.100" in out
+
+
+# --------------------------------------------------------------------------- #
+# Teil 12.3 — fail-closed gate on unmappable aggregations + deep value pass
+# --------------------------------------------------------------------------- #
+
+
+class TestFindUnmappableAggs:
+    """Request-side detection of aggregation types the walker cannot map.
+
+    `scripted_metric` (and any unknown/unhandled type) is served with an OPAQUE
+    output the response walker cannot map — its script can read ANY field and
+    the values reach the consumer RAW. `find_unmappable_aggs` detects them so
+    `server.search` can reject (default) or drop the request.
+    """
+
+    def test_scripted_metric_top_level_detected(self) -> None:
+        body = {
+            "size": 0,
+            "aggs": {
+                "scripted": {
+                    "scripted_metric": {
+                        "init_script": "x",
+                        "map_script": "y",
+                        "combine_script": "z",
+                    }
+                }
+            },
+        }
+        assert find_unmappable_aggs(body) == [("scripted", "scripted_metric")]
+
+    def test_unknown_agg_type_detected(self) -> None:
+        body = {"size": 0, "aggs": {"weird": {"weird_agg": {"x": 1}}}}
+        assert find_unmappable_aggs(body) == [("weird", "weird_agg")]
+
+    def test_nested_scripted_metric_reports_top_level_name(self) -> None:
+        """An opaque sub-agg under a safe parent is reported with the TOP-LEVEL
+        name, so a drop can remove the whole offending subtree."""
+        body = {
+            "size": 0,
+            "aggs": {
+                "hosts": {
+                    "terms": {"field": "related.hosts"},
+                    "aggs": {"sm": {"scripted_metric": {"map_script": "x"}}},
+                }
+            },
+        }
+        assert find_unmappable_aggs(body) == [("hosts", "scripted_metric")]
+
+    def test_multiple_unmappable_reported_in_order(self) -> None:
+        body = {
+            "size": 0,
+            "aggs": {
+                "a": {"scripted_metric": {"map_script": "x"}},
+                "b": {"unknown_thing": {}},
+                "a2": {"scripted_metric": {"map_script": "x"}},
+            },
+        }
+        assert find_unmappable_aggs(body) == [
+            ("a", "scripted_metric"),
+            ("b", "unknown_thing"),
+            ("a2", "scripted_metric"),
+        ]
+
+    def test_safe_aggs_not_detected(self) -> None:
+        body = {
+            "size": 0,
+            "aggs": {
+                "hosts": {"terms": {"field": "related.hosts"}},
+                "sig": {"significant_terms": {"field": "user.name"}},
+                "multi": {
+                    "multi_terms": {
+                        "terms": [
+                            {"field": "related.hosts"},
+                            {"field": "user.name"},
+                        ]
+                    }
+                },
+                "comp": {
+                    "composite": {
+                        "sources": [
+                            {"h": {"terms": {"field": "related.hosts"}}}
+                        ]
+                    }
+                },
+                "th": {"top_hits": {"size": 1}},
+                "dates": {
+                    "date_histogram": {
+                        "field": "@timestamp",
+                        "calendar_interval": "day",
+                    }
+                },
+                "hist": {"histogram": {"field": "bytes", "interval": 100}},
+                "rng": {"range": {"field": "bytes", "ranges": [{"to": 100}]}},
+                "f": {"filters": {"filters": {"a": {"match_all": {}}}}},
+                "avg": {"avg": {"field": "bytes"}},
+                "card": {"cardinality": {"field": "user.name"}},
+                "nested_safe": {
+                    "terms": {"field": "related.hosts"},
+                    "aggs": {"users": {"terms": {"field": "related.user"}}},
+                },
+            },
+        }
+        assert find_unmappable_aggs(body) == []
+
+    def test_aggs_and_meta_keys_are_not_agg_types(self) -> None:
+        body = {
+            "size": 0,
+            "aggs": {
+                "hosts": {
+                    "terms": {"field": "related.hosts"},
+                    "meta": {"label": "hosts"},
+                }
+            },
+        }
+        assert find_unmappable_aggs(body) == []
+
+    def test_non_dict_body_is_empty(self) -> None:
+        assert find_unmappable_aggs(None) == []
+        assert find_unmappable_aggs({"query": {"match_all": {}}}) == []
+        assert find_unmappable_aggs({"aggs": "nope"}) == []
+
+    def test_opaque_flag_on_parsed_specs(self) -> None:
+        """The parsed spec carries the opaque flag so the walker can serve an
+        opaque aggregation through the deep value pass."""
+        specs = parse_agg_fields(
+            {"aggs": {"sm": {"scripted_metric": {"map_script": "x"}}}}
+        )
+        assert specs["sm"].opaque is True
+        specs = parse_agg_fields(
+            {"aggs": {"f": {"filters": {"filters": {}}}}}
+        )
+        assert specs["f"].opaque is False
+        specs = parse_agg_fields(
+            {"aggs": {"hosts": {"terms": {"field": "related.hosts"}}}}
+        )
+        assert specs["hosts"].opaque is False
+
+    def test_drop_removes_offending_top_level(self) -> None:
+        body = {
+            "size": 0,
+            "aggs": {
+                "hosts": {"terms": {"field": "related.hosts"}},
+                "scripted": {"scripted_metric": {"map_script": "x"}},
+            },
+        }
+        dropped = drop_unmappable_aggs(body, {"scripted"})
+        assert dropped["aggs"] == {"hosts": {"terms": {"field": "related.hosts"}}}
+        # The original is not mutated.
+        assert "scripted" in body["aggs"]
+
+    def test_drop_removes_nested_offending_subtree(self) -> None:
+        body = {
+            "size": 0,
+            "aggs": {
+                "hosts": {
+                    "terms": {"field": "related.hosts"},
+                    "aggs": {"sm": {"scripted_metric": {"map_script": "x"}}},
+                }
+            },
+        }
+        dropped = drop_unmappable_aggs(body, {"hosts"})
+        assert dropped["aggs"] == {}
+
+    def test_drop_unknown_name_is_noop(self) -> None:
+        body = {"size": 0, "aggs": {"hosts": {"terms": {"field": "related.hosts"}}}}
+        assert drop_unmappable_aggs(body, {"nope"})["aggs"] == body["aggs"]
+
+
+class TestDeepValuePass:
+    """Defense-in-depth: opaque aggregation outputs are masked by VALUE.
+
+    A `scripted_metric` (or any opaque container) can emit ANY field value its
+    script read. The deep value pass masks those string leaves by value pattern
+    (e-mail, IP, FQDN hostname, UUID) and by the response's known-value registry
+    (so a raw hostname/username in the opaque output reuses the exact `_source`
+    token). Existing tokens pass through unchanged (idempotent); non-personal
+    free text (category labels) is untouched.
+    """
+
+    def deep_anon(self, **overrides: Any) -> Anonymizer:
+        return anon(
+            mask_aggregation_keys=True,
+            mask_fields=MASK_FIELDS_18,
+            **overrides,
+        )
+
+    def mask(self, response_body: Any, request_body: Any) -> tuple[Any, Anonymizer]:
+        a = self.deep_anon()
+        response = Response(
+            200, json.dumps(response_body), "https://indexer.example/_search"
+        )
+        masked = a.mask_response(response, agg_map=parse_agg_fields(request_body))
+        return masked.json(), a
+
+    OPAQUE_BODY = {"size": 0, "aggs": {"scripted": {"scripted_metric": {"map_script": "x"}}}}
+
+    def _opaque_response(self, value: list[str]) -> dict[str, Any]:
+        return {
+            "hits": {
+                "total": {"value": 1, "relation": "eq"},
+                "hits": [
+                    {
+                        "_source": {
+                            "wazuh": {
+                                "agent": {"host": {"hostname": "Supergrobi.intern.moenig.it"}}
+                            },
+                            "related": {"user": ["root", "marco"]},
+                            "user": {"id": "e883b765-27d5-44f5-89ba-209a31ae3b89"},
+                        }
+                    }
+                ],
+            },
+            "aggregations": {"scripted": {"value": value}},
+        }
+
+    def test_opaque_output_masks_hostname_username_ip_uuid(self) -> None:
+        masked, _ = self.mask(
+            self._opaque_response(
+                [
+                    "Supergrobi.intern.moenig.it",
+                    "root",
+                    "marco",
+                    "e883b765-27d5-44f5-89ba-209a31ae3b89",
+                    "192.168.1.10",
+                ]
+            ),
+            self.OPAQUE_BODY,
+        )
+        value = masked["aggregations"]["scripted"]["value"]
+        # The opaque echoes reuse the EXACT `_source` token (one entity -> one
+        # token everywhere), and the IP/UUID are masked by value pattern.
+        assert value[0] == ph("HOST", "Supergrobi.intern.moenig.it")
+        assert value[1] == ph("USER", "root")
+        assert value[2] == ph("USER", "marco")
+        assert value[3] == ph("USER", "e883b765-27d5-44f5-89ba-209a31ae3b89")
+        assert value[4] == ph("IP", "192.168.1.10")
+        # No raw value anywhere.
+        for raw in (
+            "Supergrobi.intern.moenig.it",
+            "root",
+            "marco",
+            "e883b765-27d5-44f5-89ba-209a31ae3b89",
+            "192.168.1.10",
+        ):
+            assert raw not in json.dumps(value)
+
+    def test_opaque_output_without_source_masks_by_pattern(self) -> None:
+        """No `_source` docs (size 0): the FQDN/UUID/IP are still masked by
+        value pattern; a bare username is NOT guessed at without an identity."""
+        body = {
+            "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+            "aggregations": {
+                "scripted": {
+                    "value": [
+                        "Supergrobi.intern.moenig.it",
+                        "e883b765-27d5-44f5-89ba-209a31ae3b89",
+                        "192.168.1.10",
+                        "system-activity",
+                    ]
+                }
+            },
+        }
+        masked, _ = self.mask(body, self.OPAQUE_BODY)
+        value = masked["aggregations"]["scripted"]["value"]
+        assert value[0] == ph("HOST", "Supergrobi.intern.moenig.it")
+        assert value[1] == ph("USER", "e883b765-27d5-44f5-89ba-209a31ae3b89")
+        assert value[2] == ph("IP", "192.168.1.10")
+        assert value[3] == "system-activity"
+
+    def test_existing_tokens_pass_through_idempotent(self) -> None:
+        masked, _ = self.mask(
+            self._opaque_response(["[HOST_aaaaaaaaaaaaaaaa]", "[USER_bbbbbbbbbbbbbbbb]"]),
+            self.OPAQUE_BODY,
+        )
+        value = masked["aggregations"]["scripted"]["value"]
+        assert value == ["[HOST_aaaaaaaaaaaaaaaa]", "[USER_bbbbbbbbbbbbbbbb]"]
+
+    def test_unmasked_free_text_category_untouched(self) -> None:
+        masked, _ = self.mask(
+            self._opaque_response(["system-activity", "cloud-services", "security"]),
+            self.OPAQUE_BODY,
+        )
+        value = masked["aggregations"]["scripted"]["value"]
+        assert value == ["system-activity", "cloud-services", "security"]
+
+    def test_opaque_output_is_deterministic_across_runs(self) -> None:
+        a = self.deep_anon()
+        response = Response(
+            200, json.dumps(self._opaque_response(["root", "marco"])),
+            "https://indexer.example/_search",
+        )
+        first = a.mask_response(
+            response, agg_map=parse_agg_fields(self.OPAQUE_BODY)
+        ).json()
+        second = a.mask_response(
+            response, agg_map=parse_agg_fields(self.OPAQUE_BODY)
+        ).json()
+        assert first == second
+
+    def test_nested_opaque_sub_agg_is_masked(self) -> None:
+        """An opaque sub-aggregation nested inside a mapped bucket (siblings of
+        key/doc_count) is served through the deep value pass too."""
+        response = {
+            "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+            "aggregations": {
+                "hosts": {
+                    "buckets": [
+                        {
+                            "key": "nc02web",
+                            "doc_count": 1,
+                            "sm": {"value": ["Supergrobi.intern.moenig.it", "system-activity"]},
+                        }
+                    ]
+                }
+            },
+        }
+        request = {
+            "size": 0,
+            "aggs": {
+                "hosts": {
+                    "terms": {"field": "related.hosts"},
+                    "aggs": {"sm": {"scripted_metric": {"map_script": "x"}}},
+                }
+            },
+        }
+        masked, _ = self.mask(response, request)
+        sm = masked["aggregations"]["hosts"]["buckets"][0]["sm"]["value"]
+        assert sm[0] == ph("HOST", "Supergrobi.intern.moenig.it")
+        assert sm[1] == "system-activity"
+
+    def test_mapped_agg_keys_not_touched_by_deep_pass(self) -> None:
+        """The deep pass only serves OPAQUE aggregations: a terms key on an
+        unmasked field stays raw even when it echoes a `_source` value (the
+        structured walker owns mapped keys — no behaviour change)."""
+        response = {
+            "hits": {
+                "total": {"value": 1, "relation": "eq"},
+                "hits": [{"_source": {"user": {"name": "alice"}}}],
+            },
+            "aggregations": {
+                "top_users": {
+                    "buckets": [{"key": "alice", "doc_count": 10}]
+                }
+            },
+        }
+        request = {
+            "size": 0,
+            "aggs": {"top_users": {"terms": {"field": "wazuh.integration.category"}}},
+        }
+        masked, _ = self.mask(response, request)
+        assert masked["aggregations"]["top_users"]["buckets"][0]["key"] == "alice"

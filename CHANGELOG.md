@@ -41,6 +41,45 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keep-vs-purge, verification-failure non-zero, no-secret output and the
   never-touches-`wazuh-*` guarantee.
 
+### Added
+
+- **Fail-closed gate on unmappable aggregations (`scripted_metric` & unknown
+  types) — the scripted_metric raw-value leak is now BLOCKED by default, plus a
+  deep value pass as defense-in-depth.** A `scripted_metric` (and any unknown
+  aggregation type) is served with an OPAQUE output the response walker cannot
+  map: its script can read ANY document field and the emitted values reach the
+  consumer RAW while the same values are tokenised everywhere else (live leak:
+  `wazuh.agent.host.hostname` → `Supergrobi.intern.moenig.it` ×80 in
+  `scripted_metric` output; `related.user` → `root`/`marco`/UUID in findings).
+  New `anonymization.block_unmappable_aggs` (env
+  `KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS`, default `block` — the strictest
+  behaviour) is enforced REQUEST-side in code, not by trusting the default:
+  `server.search` detects unmappable aggregation types via
+  `find_unmappable_aggs` (any type outside the walker's known-safe allowlist,
+  incl. nested sub-aggregations) and either (a) `block` — rejects the whole
+  request with a clear error naming the aggregation type ("don't serve what you
+  can't guarantee"), (b) `drop` — strips the offending top-level aggregations
+  from the request before it is executed, with an
+  `[UNMAPPABLE AGG DROPPED]` notice, or (c) `off` — serves them, an explicit
+  data-protection exception. The deep value pass (defense-in-depth, runs for
+  every OPAQUE aggregation that is served) recurses into ALL leaves of opaque
+  outputs (`scripted_metric.value`, `bucket_script` results) and masks string
+  values by VALUE pattern — the new HOSTNAME-family pass for dotted hostnames
+  (`Supergrobi.intern.moenig.it` → `[HOST_…]`), a new UUID/user-id pass, plus
+  the existing e-mail/IP passes — and by the response's known-value registry
+  (an opaque echo of a `_source` username/hostname reuses the exact `_source`
+  token; existing tokens pass through idempotently; non-personal free text like
+  `category` is untouched). Mapped aggregation types (`terms`, `multi_terms`,
+  `composite`, `top_hits`, `filters`, metrics) behave exactly as before — the
+  golden master is byte-identical. The strict default is active whenever
+  anonymization is active; a permissive mode (`drop`/`off`) requires explicit
+  opt-in and is a documented data-protection exception. The Docker image now
+  ships `tenants/` so the posture/GDPR verification chain's masking source of
+  truth (`/app/tenants/customer-a/fields.yaml`) resolves again. Tests: +43
+  offline (`TestFindUnmappableAggs`, `TestDeepValuePass`, search end-to-end
+  block/drop/off, config parsing, diagnostics notice) + a skippable live test
+  proving the exact finding query is rejected on a raw stream.
+
 ### Fixed
 
 - **`klaxon masking deploy` no longer fails verifying a correctly-deployed ISM

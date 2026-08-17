@@ -20,6 +20,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from klaxon_mcp import server
 from klaxon_mcp.clients import Response
@@ -36,7 +37,13 @@ def ph(kind: str, value: str) -> str:
     return f"[{kind}_{digest[:16]}]"
 
 
-def config_with(*, enabled: bool, mask_agg_keys: bool) -> Config:
+def config_with(
+    *,
+    enabled: bool,
+    mask_agg_keys: bool,
+    block_unmappable: str = "block",
+    mask_free_text_users: bool = True,
+) -> Config:
     return Config(
         indexer_url="https://indexer.example:9200",
         indexer_user="",
@@ -55,12 +62,17 @@ def config_with(*, enabled: bool, mask_agg_keys: bool) -> Config:
         anonymization=AnonymizationConfig(
             enabled=enabled,
             mask_aggregation_keys=mask_agg_keys,
+            block_unmappable_aggs=block_unmappable,
+            mask_free_text_users=mask_free_text_users,
             mask_fields=(
                 "source.ip",
                 "related.hosts",
                 "related.user",
                 "user.name",
                 "wazuh.agent.name",
+                "host.hostname",
+                "user.id",
+                "wazuh.agent.host.hostname",
             ),
             salt=TEST_SALT,
             log_path="/tmp/klaxon-test-agg-masking.log",
@@ -87,8 +99,10 @@ PAYLOAD: dict[str, Any] = {
 class RecordingIndexer:
     def __init__(self, payload: dict[str, Any] | None = None) -> None:
         self.payload = payload if payload is not None else PAYLOAD
+        self.last_body: Any = None
 
     async def post(self, path: str, body: Any = None) -> Response:
+        self.last_body = body
         return Response(200, json.dumps(self.payload), f"https://indexer.example{path}")
 
 
@@ -100,9 +114,18 @@ def run_search() -> Iterator[Any]:
     previous_anon = server._anonymizer
 
     def install(
-        enabled: bool, mask_agg_keys: bool, payload: dict[str, Any] | None = None
+        enabled: bool,
+        mask_agg_keys: bool,
+        payload: dict[str, Any] | None = None,
+        block_unmappable: str = "block",
+        mask_free_text_users: bool = True,
     ) -> None:
-        server._config = config_with(enabled=enabled, mask_agg_keys=mask_agg_keys)
+        server._config = config_with(
+            enabled=enabled,
+            mask_agg_keys=mask_agg_keys,
+            block_unmappable=block_unmappable,
+            mask_free_text_users=mask_free_text_users,
+        )
         # Rebuild the cached anonymizer from the config above.
         server._anonymizer = None  # type: ignore[assignment]
         server._indexer = RecordingIndexer(payload)  # type: ignore[assignment]
@@ -359,3 +382,154 @@ class TestSearchNestedAggregationMasking:
         assert ph("HOST", "brummfidel.sec73.io") in out
         assert '"key_as_string": "[HOST_' in out
         assert "brummfidel.sec73.io" not in out
+
+
+# --------------------------------------------------------------------------- #
+# Teil 12.3 — fail-closed block on unmappable aggregations + deep value pass
+# --------------------------------------------------------------------------- #
+
+
+SCRIPTED_BODY: dict[str, Any] = {
+    "size": 0,
+    "aggs": {
+        "scripted": {
+            "scripted_metric": {
+                "init_script": "state.hosts = []",
+                "map_script": "state.hosts.add(doc['wazuh.agent.host.hostname'].value)",
+                "combine_script": "return state.hosts",
+            }
+        }
+    },
+}
+
+UNKNOWN_BODY: dict[str, Any] = {"size": 0, "aggs": {"weird": {"weird_agg": {}}}}
+
+
+class TestSearchFailClosedUnmappableAggs:
+    """`block_unmappable_aggs` is an ACTIVE security control: a scripted_metric
+    (or any unknown aggregation type) request is rejected BEFORE it reaches the
+    indexer — never silently passed with HTTP 200."""
+
+    async def test_scripted_metric_request_rejected_by_default(
+        self, run_search: Any
+    ) -> None:
+        """The exact finding: scripted_metric reading wazuh.agent.host.hostname.
+        Default (block) -> ToolError naming the agg type; indexer never called."""
+        run_search(True, True)
+        indexer = server._indexer
+        assert indexer is not None and isinstance(indexer, RecordingIndexer)
+        with pytest.raises(ToolError, match="scripted_metric"):
+            await run(SCRIPTED_BODY)
+        assert indexer.last_body is None  # request-side gate: never executed
+
+    async def test_unknown_agg_type_rejected_by_default(self, run_search: Any) -> None:
+        run_search(True, True)
+        indexer = server._indexer
+        assert indexer is not None and isinstance(indexer, RecordingIndexer)
+        with pytest.raises(ToolError, match="weird_agg"):
+            await run(UNKNOWN_BODY)
+        assert indexer.last_body is None
+
+    async def test_safe_agg_request_still_served(self, run_search: Any) -> None:
+        """The gate must not reject mapped/safe aggregations."""
+        run_search(True, True)
+        out = await run(
+            {"size": 0, "aggs": {"hosts": {"terms": {"field": "related.hosts"}}}}
+        )
+        assert ph("HOST", "nc02web") in out
+
+    async def test_block_does_not_fire_when_anonymization_inactive(
+        self, run_search: Any
+    ) -> None:
+        """A local/disabled anonymizer has no masking guarantee to enforce —
+        the operator chose not to mask, so no block (request reaches indexer)."""
+        run_search(False, True)
+        indexer = server._indexer
+        assert indexer is not None and isinstance(indexer, RecordingIndexer)
+        out = await run(SCRIPTED_BODY)
+        assert "scripted_metric" in json.dumps(indexer.last_body)  # served through
+        assert "nc02web" in out  # response returned unmasked
+
+    async def test_drop_mode_strips_offending_agg(self, run_search: Any) -> None:
+        """Config-selectable "drop": the offending aggregation is removed from
+        the request before it is executed; a notice says so; safe aggs remain."""
+        run_search(True, True, block_unmappable="drop")
+        indexer = server._indexer
+        assert indexer is not None and isinstance(indexer, RecordingIndexer)
+        body = {
+            "size": 0,
+            "aggs": {
+                "hosts": {"terms": {"field": "related.hosts"}},
+                "scripted": {
+                    "scripted_metric": {"map_script": "x"}
+                },
+            },
+        }
+        out = await run(body)
+        assert "[UNMAPPABLE AGG DROPPED]" in out
+        assert indexer.last_body is not None
+        # The scripted agg never reached the indexer; the safe one did.
+        assert "scripted_metric" not in json.dumps(indexer.last_body)
+        assert "hosts" in indexer.last_body.get("aggs", {})
+
+
+# scripted_metric output echoing RAW masked-field values; `_source` carries the
+# identities so the deep value pass reuses their exact tokens.
+DEEP_PASS_PAYLOAD: dict[str, Any] = {
+    "took": 3,
+    "timed_out": False,
+    "hits": {
+        "total": {"value": 1, "relation": "eq"},
+        "hits": [
+            {
+                "_source": {
+                    "wazuh": {
+                        "agent": {
+                            "host": {"hostname": "Supergrobi.intern.moenig.it"}
+                        }
+                    },
+                    "related": {"user": ["root", "marco"]},
+                    "user": {"id": "e883b765-27d5-44f5-89ba-209a31ae3b89"},
+                }
+            }
+        ],
+    },
+    "aggregations": {
+        "scripted": {
+            "value": [
+                "Supergrobi.intern.moenig.it",
+                "root",
+                "marco",
+                "e883b765-27d5-44f5-89ba-209a31ae3b89",
+                "192.168.1.10",
+                "system-activity",
+            ]
+        }
+    },
+}
+
+
+class TestSearchDeepValuePass:
+    """Defense-in-depth: when an opaque aggregation IS served (explicit "off"),
+    its raw values are masked by value pattern + known-value registry."""
+
+    async def test_opaque_values_are_masked_via_search(self, run_search: Any) -> None:
+        run_search(True, True, DEEP_PASS_PAYLOAD, block_unmappable="off")
+        out = await run(SCRIPTED_BODY)
+        # The raw leak values never appear anywhere in the rendered output.
+        for raw in (
+            "Supergrobi.intern.moenig.it",
+            "root",
+            "marco",
+            "e883b765-27d5-44f5-89ba-209a31ae3b89",
+            "192.168.1.10",
+        ):
+            assert raw not in out
+        # The opaque echoes reuse the exact `_source` tokens.
+        assert ph("HOST", "Supergrobi.intern.moenig.it") in out
+        assert ph("USER", "root") in out
+        assert ph("USER", "marco") in out
+        assert ph("USER", "e883b765-27d5-44f5-89ba-209a31ae3b89") in out
+        assert ph("IP", "192.168.1.10") in out
+        # Unmasked free text (category) is untouched.
+        assert "system-activity" in out

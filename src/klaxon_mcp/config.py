@@ -176,6 +176,68 @@ def quarantine_pattern_overlap(pattern: str) -> bool:
 # for field classification shared with the anonymizer and the GDPR checker.
 
 
+# --------------------------------------------------------------------------- #
+# Fail-closed gate on unmappable aggregations
+#
+# A `scripted_metric` (and any unknown aggregation type) is served with an
+# OPAQUE output: its script can read ANY document field, and the emitted values
+# reach the consumer RAW while the same values are tokenised everywhere else —
+# the response walker cannot map the output, so it cannot guarantee it is
+# masked ("don't serve what you can't guarantee"). `block_unmappable_aggs`
+# selects the behaviour:
+#   "block" (default, strictest): the whole request is rejected with a clear
+#       error naming the aggregation type.
+#   "drop": the offending top-level aggregations are stripped from the request
+#       before it is executed (a notice states what was dropped).
+#   "off": the aggregation is served, with only the deep value pass as a
+#       safety net — an explicit, documented data-protection exception.
+# --------------------------------------------------------------------------- #
+
+UNMAPPABLE_AGGS_BLOCK = "block"
+UNMAPPABLE_AGGS_DROP = "drop"
+UNMAPPABLE_AGGS_OFF = "off"
+
+# Accepted spellings for the value, mapped to the canonical mode. Boolean-ish
+# spellings (`true`/`false`) are accepted so a config written for the boolean
+# form still parses; `allow` is the historical name of the permissive mode.
+_UNMAPPABLE_AGGS_ALIASES: dict[str, str] = {
+    "block": UNMAPPABLE_AGGS_BLOCK,
+    "true": UNMAPPABLE_AGGS_BLOCK,
+    "1": UNMAPPABLE_AGGS_BLOCK,
+    "yes": UNMAPPABLE_AGGS_BLOCK,
+    "drop": UNMAPPABLE_AGGS_DROP,
+    "off": UNMAPPABLE_AGGS_OFF,
+    "false": UNMAPPABLE_AGGS_OFF,
+    "0": UNMAPPABLE_AGGS_OFF,
+    "no": UNMAPPABLE_AGGS_OFF,
+    "allow": UNMAPPABLE_AGGS_OFF,
+}
+
+
+def _unmappable_agg_mode(raw: str | None, yaml_value: Any) -> str:
+    """Normalise `block_unmappable_aggs` to one of block/drop/off (strict).
+
+    Like the security-critical booleans, an invalid value refuses to start
+    rather than silently serving unmappable aggregations raw. The default is
+    the strictest behaviour (`block`); any permissive mode is explicit opt-in.
+    """
+    value = raw if raw is not None else yaml_value
+    if value is None:
+        return UNMAPPABLE_AGGS_BLOCK
+    if isinstance(value, bool):
+        return UNMAPPABLE_AGGS_BLOCK if value else UNMAPPABLE_AGGS_OFF
+    if isinstance(value, str):
+        mode = _UNMAPPABLE_AGGS_ALIASES.get(value.strip().lower())
+        if mode is not None:
+            return mode
+    raise ConfigError(
+        "anonymization.block_unmappable_aggs must be 'block' (reject requests "
+        "with unmappable aggregations — the default), 'drop' (strip the "
+        "offending aggregations from the request), or 'off' (serve them; a "
+        "data-protection exception). Got an unrecognised value."
+    )
+
+
 @dataclass(frozen=True)
 class AnonymizationConfig:
     """PII anonymization for non-local LLM clients.
@@ -211,6 +273,16 @@ class AnonymizationConfig:
     # and `_source` values use the same deterministic tokens, so the two stay
     # aligned for one entity.
     mask_aggregation_keys: bool = True
+    # Fail-closed gate on aggregation types the response walker cannot map
+    # (`scripted_metric`, bucket_script, any unknown type): their script can
+    # read ANY document field and the emitted values reach the consumer RAW
+    # while the same values are tokenised everywhere else. One of
+    # "block" (default, strictest — reject the request), "drop" (strip the
+    # offending aggregations from the request before it runs) or "off" (serve
+    # them with only the deep value pass as a safety net — an explicit,
+    # documented data-protection exception). Enforced request-side in code, not
+    # by trusting this default.
+    block_unmappable_aggs: str = UNMAPPABLE_AGGS_BLOCK
     # Mask usernames that appear inside free-text fields (message, event.original,
     # ...) using known identities from the structured fields plus precise context
     # patterns (uid=..., "for user ...", "Accepted publickey for ..."). On by
@@ -363,6 +435,10 @@ class AnonymizationConfig:
             mask_aggregation_keys=_env_bool_strict(
                 "KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS",
                 _yaml_get(anon_yaml, "mask_aggregation_keys", True),
+            ),
+            block_unmappable_aggs=_unmappable_agg_mode(
+                _env_str("KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS", None),
+                _yaml_get(anon_yaml, "block_unmappable_aggs", UNMAPPABLE_AGGS_BLOCK),
             ),
             mask_free_text_users=_env_bool_strict(
                 "KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS",

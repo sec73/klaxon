@@ -30,7 +30,13 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from . import coverage, diagnostics, gdpr, overview, posture
-from .anonymization import AggSpec, Anonymizer, parse_agg_fields
+from .anonymization import (
+    AggSpec,
+    Anonymizer,
+    drop_unmappable_aggs,
+    find_unmappable_aggs,
+    parse_agg_fields,
+)
 from .clients import (
     EngineClient,
     IndexerClient,
@@ -38,7 +44,12 @@ from .clients import (
     Response,
     TransportError,
 )
-from .config import Config, ConfigError
+from .config import (
+    UNMAPPABLE_AGGS_DROP,
+    UNMAPPABLE_AGGS_OFF,
+    Config,
+    ConfigError,
+)
 from .constants import (
     CATEGORIES,
     DETECTORS_BASE,
@@ -344,9 +355,47 @@ async def search(index: str, body: str) -> str:
 
     parsed_body = _parse_body(body)
 
+    # Fail-closed gate on unmappable aggregations — an ACTIVE security control,
+    # enforced in code, not a config default someone must trust. A
+    # `scripted_metric` (or any unknown/unhandled aggregation type) is served
+    # with an OPAQUE output the response walker cannot map: its script can read
+    # ANY document field and the emitted values reach the consumer RAW while
+    # the same values are tokenised everywhere else. Default is the strictest
+    # behaviour — reject the request, naming the aggregation type. "drop"
+    # strips the offending top-level aggregations from the request before it is
+    # executed (a notice says so); "off" serves them with only the deep value
+    # pass as a safety net (an explicit, documented data-protection exception).
+    anon = get_anonymizer()
+    unmappable_notices: list[str] = []
+    if anon.active and anon.config.block_unmappable_aggs != UNMAPPABLE_AGGS_OFF:
+        unmappable = find_unmappable_aggs(parsed_body)
+        if unmappable:
+            if anon.config.block_unmappable_aggs == UNMAPPABLE_AGGS_DROP:
+                parsed_body = drop_unmappable_aggs(
+                    parsed_body, {name for name, _ in unmappable}
+                )
+                unmappable_notices.append(
+                    diagnostics.unmappable_agg_dropped_notice(unmappable)
+                )
+            else:
+                types = sorted({agg_type for _, agg_type in unmappable})
+                raise ToolError(
+                    "search blocked: the request contains aggregation(s) whose "
+                    f"output cannot be anonymised: {', '.join(types)}. A "
+                    "scripted/unmapped aggregation can read ANY document field "
+                    "and its emitted values reach the consumer raw while the "
+                    "same values are tokenised everywhere else — Klaxon does "
+                    "not serve what it cannot guarantee to mask. Rewrite the "
+                    "query without these aggregations, or set "
+                    "anonymization.block_unmappable_aggs to 'drop'/'off' "
+                    "explicitly (a documented data-protection exception)."
+                )
+
     # Automatic safety banner (unmasked mode / raw-stream query): first line of
     # the diagnostics block, on every response, so it cannot be forgotten.
-    notices = diagnostics.safety_banner(get_anonymizer().config, safe_index)
+    notices = diagnostics.safety_banner(anon.config, safe_index)
+    if unmappable_notices:
+        notices = unmappable_notices + notices
     capped = _cap_size(parsed_body, get_config().search_max_size)
     if capped:
         notices.append(capped)
@@ -376,7 +425,6 @@ async def search(index: str, body: str) -> str:
     # Aggregation-key masking (opt-in): map agg name -> source fields from the
     # forwarded request so the response walker can tokenise bucket keys with the
     # same tokens the `_source` pass produces.
-    anon = get_anonymizer()
     agg_map = (
         parse_agg_fields(parsed_body)
         if anon.active and anon.config.mask_aggregation_keys

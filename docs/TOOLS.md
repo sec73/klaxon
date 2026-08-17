@@ -32,8 +32,22 @@ The same cap applies to the `size` of bucketed aggregations (`terms`,
 `[AGG SIZE CAPPED]`, naming each affected aggregation and its requested size —
 so a lowered bucket count is never read as the real one.
 
+**Fail-closed gate on unmappable aggregations (default).** When anonymization
+is active, a request whose aggregation types the response walker cannot map —
+`scripted_metric`, `bucket_script`, any unknown/unhandled type — is REJECTED
+before it reaches the indexer, with a clear error naming the aggregation type
+("don't serve what you can't guarantee"): a `scripted_metric` script can read
+ANY document field and its opaque output reaches the consumer RAW while the
+same values are tokenised everywhere else. This is an active security control
+enforced in code (`anonymization.block_unmappable_aggs`, default `block`), not
+a config default someone must trust. `drop` strips the offending aggregations
+from the request (an `[UNMAPPABLE AGG DROPPED]` notice says so); `off` serves
+them with only the deep value pass as a safety net — both are explicit,
+documented data-protection exceptions.
+
 Diagnostics emitted: zero hits, total-hits cap, partial aggregation coverage,
-empty aggregations, legacy 4.x index patterns, size cap, aggregation size cap.
+empty aggregations, legacy 4.x index patterns, size cap, aggregation size cap,
+unmappable-agg drop.
 
 **Automatic safety banner.** Every response is prefixed — **before** any other
 diagnostics line — with `[UNMASKED MODE]` and/or `[RAW STREAM QUERY]` whenever
@@ -281,6 +295,7 @@ the settings and what the gate does.
 | token salt (HMAC key) | `KLAXON_ANONYMIZATION_SALT` | `salt` | auto-generated + persisted (`*.salt`) |
 | masked fields | `KLAXON_ANONYMIZATION_MASK_FIELDS` | `mask_fields` | see below |
 | aggregation key masking | `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS` | `mask_aggregation_keys` | `true` (fail-closed) |
+| block unmappable aggs | `KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS` | `block_unmappable_aggs` | `block` (reject; `drop`/`off` opt-in) |
 | free-text username masking | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS` | `mask_free_text_users` | `true` |
 | extra free-text fields | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS` | `mask_free_text_fields` | empty (hint pattern) |
 | block on residual PII | `KLAXON_ANONYMIZATION_WHITELIST_ENABLED` | `whitelist_enabled` | `true` |
@@ -321,6 +336,19 @@ way so pagination stays consistent. `date_histogram`, `histogram`, `range`,
 metadata survive unchanged; `top_hits` embedded documents go through the normal
 `_source` masking. Aggregations whose request could not be mapped to fields
 (saved searches, scripted aggs) are left alone.
+
+**Opaque aggregations & the deep value pass.** `scripted_metric` and any
+unknown aggregation type are OPAQUE — the walker cannot map their output, so by
+default they are BLOCKED request-side (see the fail-closed gate above). When
+one is explicitly served (`anonymization.block_unmappable_aggs=off`), the deep
+value pass masks every string leaf of its output (`scripted_metric.value`,
+`bucket_script` results) by VALUE, not by field name: dotted hostnames
+(`Supergrobi.intern.moenig.it` → `[HOST_…]`), UUIDs/user-ids → `[USER_…]`,
+e-mails and IPs — plus a known-value registry built from the response's own
+`_source`, so an opaque echo of a username/hostname reuses the exact `_source`
+token. Existing tokens pass through unchanged (idempotent); non-personal free
+text (e.g. `category` labels) is untouched. This is defense-in-depth, not a
+replacement for the fail-closed block.
 
 **Free-text usernames.** A `message` line can name a user without the structured
 `user.name` being present (`uid=marcomoenig,ou=users,dc=sec73,dc=io`,

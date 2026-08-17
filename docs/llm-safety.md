@@ -71,6 +71,16 @@ LLM/report queries.**
   `after_key` stay consistent, so pagination keeps working. **ON by default**;
   `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS=false` turns it off (aggregation
   output can then carry raw values).
+- **Opaque aggregations are blocked (fail-closed); served ones are
+  value-masked.** A `scripted_metric` (or any unknown aggregation type) can
+  read ANY document field and emit the raw values in an opaque output — the
+  response walker cannot map it. With `block_unmappable_aggs` (**`block` by
+  default, enforced in code**), such a request is **rejected** before it
+  reaches the indexer; `drop` strips the offending aggregations. When one is
+  explicitly served (`off` — a data-protection exception), the deep value pass
+  masks every string leaf by value: dotted hostnames, UUIDs/user-ids, e-mails
+  and IPs, plus the response's own known values (an opaque echo of a `_source`
+  username/hostname reuses the exact `_source` token).
 - **Free-text usernames reuse the structured tokens.** With
   `mask_free_text_users` on (default), usernames inside free-text fields are
   masked with the same tokens as the structured fields — `uid=alice` inside a

@@ -296,3 +296,91 @@ async def test_live_multi_terms_key_as_string_has_no_raw_value(
             )
         # Counts are never modified by the walker.
         assert bucket["doc_count"] == r_bucket["doc_count"]
+
+
+# --------------------------------------------------------------------------- #
+# Teil 12.3 — live probe: the scripted_metric query is REJECTED (fail-closed)
+# --------------------------------------------------------------------------- #
+
+# The exact finding: scripted_metric reading wazuh.agent.host.hostname over the
+# network-activity stream, last 30 min. The response walker cannot map its
+# opaque output, so `block_unmappable_aggs` (default) must REJECT the request
+# before it reaches the indexer — never silently pass it with HTTP 200.
+SCRIPTED_METRIC_BODY: dict[str, Any] = {
+    "size": 0,
+    "query": {"bool": {"filter": [_WINDOW]}},
+    "aggs": {
+        "scripted": {
+            "scripted_metric": {
+                "init_script": "state.hosts = []",
+                "map_script": (
+                    "state.hosts.add(doc['wazuh.agent.host.hostname'].value)"
+                ),
+                "combine_script": "return state.hosts",
+            }
+        }
+    },
+}
+
+
+def _server_config_for(
+    live: live_test.LiveIndexerConfig, cfg: Any
+) -> Any:
+    """A server Config over the live credentials + tenant mask list + live salt,
+    with the default fail-closed `block_unmappable_aggs`."""
+    from klaxon_mcp.config import AnonymizationConfig, Config
+
+    return Config(
+        indexer_url=live.url,
+        indexer_user=live.user,
+        indexer_password=live.password,
+        manager_url="",
+        manager_user="",
+        manager_password="",
+        engine_url="",
+        verify_ssl=live.verify_ssl,
+        timeout=60.0,
+        schema_field_limit=200,
+        schema_probe_batch=100,
+        search_max_size=100,
+        logtest_default_trace_level="ASSET_ONLY",
+        logtest_default_space="custom",
+        anonymization=AnonymizationConfig(
+            enabled=True,
+            salt=live_salt(cfg),
+            mask_fields=cfg.all_masked_fields,
+            mask_aggregation_keys=True,
+            log_path="/tmp/klaxon-live-agg-masking.log",
+        ),
+    )
+
+
+async def test_live_scripted_metric_query_is_rejected(
+    live_config: tuple[live_test.LiveIndexerConfig, Any],
+) -> None:
+    """The Teil 12.3 PRIMARY acceptance: the scripted_metric finding query is
+    REJECTED by the request-side fail-closed gate (not silently passed with
+    HTTP 200). Exercises the real `server.search` gate against the raw stream
+    pattern."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from klaxon_mcp import server as server_mod
+
+    live, cfg = live_config
+    previous_indexer = server_mod._indexer
+    previous_config = server_mod._config
+    previous_anon = server_mod._anonymizer
+    try:
+        server_mod._config = _server_config_for(live, cfg)
+        server_mod._anonymizer = None
+        server_mod._indexer = None
+        with pytest.raises(ToolError, match="scripted_metric"):
+            await server_mod.search(
+                index="wazuh-events-v5-*", body=json.dumps(SCRIPTED_METRIC_BODY)
+            )
+        # The gate fires BEFORE any indexer request — nothing was sent.
+        assert server_mod._indexer is None
+    finally:
+        server_mod._indexer = previous_indexer
+        server_mod._config = previous_config
+        server_mod._anonymizer = previous_anon

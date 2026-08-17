@@ -47,6 +47,13 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
+# The Option B single source of truth (tenants/<tenant>/fields.yaml) — needed
+# at runtime by `klaxon_posture_check` / verify-config to load the tenant
+# config (`find_repo_root()` locates the `tenants/` directory under /app).
+# Without it the posture/GDPR verification chain aborts with "missing masking
+# source of truth: /app/tenants/<tenant>/fields.yaml".
+COPY tenants/ ./tenants/
+
 
 COPY --from=builder /wheels /wheels
 RUN python3 -m pip install --no-cache-dir --no-index /wheels/*.whl \

@@ -160,6 +160,26 @@ def agg_size_capped_notice(capped: list[tuple[str, int]], effective: int) -> str
     )
 
 
+def unmappable_agg_dropped_notice(pairs: list[tuple[str, str]]) -> str:
+    """State that unmappable aggregations were stripped from the request.
+
+    The "drop" mode of `block_unmappable_aggs`: an aggregation whose output the
+    anonymizer cannot guarantee to mask (`scripted_metric`, any unknown type)
+    is removed from the request before it is executed, so the response cannot
+    carry its raw values. Like the size-cap notices, this one describes the
+    REQUEST rather than the response — staying silent would let the caller read
+    the stripped response as the whole answer.
+    """
+    names = "; ".join(f"{agg_type} ({name})" for name, agg_type in pairs)
+    return (
+        f"[UNMAPPABLE AGG DROPPED] Aggregation(s) whose output cannot be "
+        f"anonymised were removed from the request before it was sent: {names}. "
+        f"Their results are absent from this response. Rewrite the query without "
+        f"these aggregations, or raise the data-protection exception explicitly "
+        f"(anonymization.block_unmappable_aggs)."
+    )
+
+
 def _total(hits: Any) -> tuple[int | None, str | None]:
     """Extract (value, relation) from hits.total across both response shapes."""
     if not isinstance(hits, dict):
