@@ -74,6 +74,7 @@ from .tenants import (
     FieldSpec,
     TenantConfig,
     build_config_fragment,
+    effective_free_text_fields,
     fields_yaml_sha256,
     find_repo_root,
     find_tenant_dir,
@@ -263,7 +264,10 @@ def build_pipeline(cfg: TenantConfig, salt: str) -> dict[str, Any]:
             "generator_version": generator_version(),
             "generated_by": "klaxon masking generate",
             "fields": list(cfg.all_masked_fields),
-            "free_text_fields": list(cfg.free_text_fields),
+            # Effective = the built-in `message` + extra free_text_fields; the
+            # provenance must match what the FREE_TEXT table emits, or the
+            # drift fingerprint would diverge.
+            "free_text_fields": list(effective_free_text_fields(cfg)),
         },
     }
 
@@ -338,6 +342,109 @@ def build_ism_policy(cfg: TenantConfig, retention_days: int = DEFAULT_RETENTION_
     }
 
 
+def _keyword_mapping(raw: dict[str, Any]) -> dict[str, Any]:
+    """A `keyword` mapping for a masked field, preserving `ignore_above` from
+    the raw mapping when present (else plain keyword)."""
+    mapping: dict[str, Any] = {"type": "keyword"}
+    ignore_above = raw.get("ignore_above")
+    if isinstance(ignore_above, int):
+        mapping["ignore_above"] = ignore_above
+    return mapping
+
+
+def _force_masked_field_keyword(
+    mappings: dict[str, Any], parts: list[str]
+) -> None:
+    """Override a masked field at a dotted path to `keyword`.
+
+    The raw mapping may store the field NESTED (`source: {properties: {ip:
+    ...}}`) and/or as a FLAT dotted key (`properties["source.ip"]`); both forms
+    are overridden. No-op when neither form is present in the mapping.
+    """
+    props = mappings.get("properties")
+    if not isinstance(props, dict):
+        return
+    dotted = ".".join(parts)
+    if dotted in props and isinstance(props[dotted], dict):
+        props[dotted] = _keyword_mapping(props[dotted])
+    current: dict[str, Any] = mappings
+    for index, part in enumerate(parts):
+        props = current.get("properties")
+        if not isinstance(props, dict):
+            return
+        if index == len(parts) - 1:
+            if isinstance(props.get(part), dict):
+                props[part] = _keyword_mapping(props[part])
+            return
+        child = props.get(part)
+        if not isinstance(child, dict):
+            # Cannot descend (the field is not nested here); the flat dotted
+            # form above already handled it when present.
+            return
+        current = child
+
+
+def masked_template_mappings(
+    cfg: TenantConfig, mappings: dict[str, Any]
+) -> dict[str, Any]:
+    """A deep copy of the raw Wazuh mappings with every masked field forced to
+    `keyword`.
+
+    The ingest pipeline replaces the values of every `fields.yaml` field with a
+    TOKEN (`[IP_...]` / `[USER_...]` / `[HOST_...]` / `[AGENT_...]`), so those
+    fields must be mapped as STRING (`keyword`) in the masked stream — the raw
+    mapping's specialized types (`ip`, `date`, `long`, `float`, `geo_point`,
+    ...) reject a token literal with `mapper_parsing_exception`. The field list
+    comes from `fields.yaml` (the parsed field table), never hardcoded. The
+    override applies at the nested path AND at any flat dotted-key form;
+    everything else is copied unchanged.
+    """
+    result = copy.deepcopy(mappings)
+    for spec in cfg.fields:
+        _force_masked_field_keyword(result, spec.field.split("."))
+    return result
+
+
+def _quarantine_metadata_mapping() -> dict[str, Any]:
+    """The explicit mapping for the `klaxon` metadata a fail-closed masking
+    failure writes into a quarantine document.
+
+    The pipeline's on_failure reroute preserves the original index
+    (`klaxon.quarantine.original_index`), records the failure reason
+    (`klaxon.quarantine.reason`) and flags the document
+    (`klaxon.masking_error`). The quarantine template copies the Wazuh mapping
+    verbatim — whose `dynamic: strict_allow_templates` rejects ANY unmapped
+    field. Without these explicit mappings the reroute itself fails with
+    `strict_dynamic_mapping_exception` ("dynamic introduction of [klaxon] ... is
+    not allowed"): the masking-failure document is neither quarantined nor
+    counted, and the reindex aborts on the first bulk that contains one.
+    """
+    return {
+        "properties": {
+            "masking_error": {"type": "boolean"},
+            "quarantine": {
+                "properties": {
+                    "original_index": {"type": "keyword"},
+                    "reason": {"type": "keyword"},
+                }
+            },
+        }
+    }
+
+
+def _merge_quarantine_metadata(mappings: dict[str, Any]) -> dict[str, Any]:
+    """A deep copy of the raw Wazuh mappings with the `klaxon` metadata object
+    added under `properties` so the fail-closed quarantine reroute can write
+    its failure evidence. Everything else is copied unchanged."""
+    result = copy.deepcopy(mappings)
+    props = result.setdefault("properties", {})
+    if not isinstance(props, dict):
+        props = {}
+        result["properties"] = props
+    props["klaxon"] = _quarantine_metadata_mapping()
+    return result
+
+
 def build_index_template(
     cfg: TenantConfig, mappings: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -360,6 +467,12 @@ def build_index_template(
     nothing. `index.lifecycle.name` is intentionally NOT set — it is an
     Elasticsearch ILM setting that OpenSearch rejects (HTTP 400 "expected
     [index.lifecycle.name] to be private but it was not").
+
+    The MAPPINGS are copied from the raw stream but EVERY masked field is
+    forced to `keyword` (see `masked_template_mappings`): the pipeline writes
+    TOKENS (`[IP_...]`, ...) into those fields, and the raw mapping's
+    specialized types (`ip`, ...) would reject a token with a
+    `mapper_parsing_exception`. Quarantine keeps the raw mapping.
     """
     template: dict[str, Any] = {
         "settings": {
@@ -369,7 +482,7 @@ def build_index_template(
         }
     }
     if mappings is not None:
-        template["mappings"] = mappings
+        template["mappings"] = masked_template_mappings(cfg, mappings)
     return {
         "index_patterns": [f"{cfg.masked_stream}*"],
         "priority": TEMPLATE_PRIORITY,
@@ -437,7 +550,12 @@ def build_quarantine_index_template(
     NEVER re-enter the masking pipeline (their values are already raw, and
     re-masking could drop the quarantine evidence or re-trigger the failure).
     `mappings` is copied from the Wazuh events stream like the masked stream
-    (omitted in the offline generator, merged by `--apply-masked-infra`).
+    (omitted in the offline generator, merged by `--apply-masked-infra`), with
+    the `klaxon` metadata object ADDED (see `_merge_quarantine_metadata`): the
+    pipeline's fail-closed on_failure reroute writes
+    `klaxon.masking_error` / `klaxon.quarantine.*` into quarantine documents,
+    and the copied `dynamic: strict_allow_templates` mapping would otherwise
+    reject them.
     """
     template: dict[str, Any] = {
         "settings": {
@@ -447,7 +565,7 @@ def build_quarantine_index_template(
         }
     }
     if mappings is not None:
-        template["mappings"] = mappings
+        template["mappings"] = _merge_quarantine_metadata(mappings)
     return {
         "index_patterns": [f"{cfg.quarantine_stream}*"],
         "priority": TEMPLATE_PRIORITY,
@@ -680,7 +798,7 @@ def pipeline_mask_doc(source: dict[str, Any], cfg: TenantConfig, salt: str) -> d
 
         return pattern.sub(repl, text)
 
-    for field in cfg.free_text_fields:
+    for field in effective_free_text_fields(cfg):
         value = masked.get(field)
         if not isinstance(value, str):
             continue
@@ -751,8 +869,12 @@ def pipeline_field_names(pipeline: dict[str, Any]) -> tuple[str, ...]:
 
 
 def effective_mask_fields_from_config(cfg: TenantConfig) -> tuple[str, ...]:
-    """What the Klaxon config MUST mask for this tenant (field + free text)."""
-    return tuple((*cfg.all_masked_fields, *cfg.free_text_fields))
+    """What the Klaxon config MUST mask for this tenant (field + free text).
+
+    Uses the effective free-text set (built-in `message` + extras) so it
+    matches the pipeline's provenance fingerprint (`pipeline_field_names`).
+    """
+    return tuple((*cfg.all_masked_fields, *effective_free_text_fields(cfg)))
 
 
 def fingerprint_matches(pipeline: dict[str, Any], cfg: TenantConfig) -> bool:

@@ -33,6 +33,24 @@ _FIELD_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
 
 _FAMILIES = frozenset({"IP", "USER", "HOST", "AGENT"})
 
+# The built-in default free-text field: the free-text pass ALWAYS runs over it
+# (pipeline AND response layer), independent of fields.yaml. It must NOT be
+# listed in `free_text_fields` (the validator rejects it) — the generator, the
+# Python twin and the config fragment inject it. `free_text_fields` holds only
+# EXTRA fields.
+DEFAULT_FREE_TEXT_FIELD = "message"
+
+
+def effective_free_text_fields(cfg: TenantConfig) -> tuple[str, ...]:
+    """The free-text fields the free-text pass runs over: the built-in
+    `message` plus any extra `free_text_fields` from fields.yaml. The single
+    source of truth so the generated pipeline (`FREE_TEXT`), its `_meta`, the
+    Python twin, the drift fingerprint and the Klaxon config fragment
+    (`mask_free_text_fields`) all agree — `message` is always present, so the
+    emitted `FREE_TEXT` list is never empty."""
+    extras = tuple(f for f in cfg.free_text_fields if f != DEFAULT_FREE_TEXT_FIELD)
+    return (DEFAULT_FREE_TEXT_FIELD, *extras)
+
 
 @dataclass(frozen=True)
 class FieldSpec:
@@ -228,6 +246,12 @@ def load_tenant_config(
             raise ValueError(f"invalid free_text_fields entry in {path}: {entry!r}")
         field = entry["field"]
         _validate_field_name(field, str(path))
+        if field == DEFAULT_FREE_TEXT_FIELD:
+            raise ValueError(
+                f"{field!r} is the built-in default free-text field and must "
+                "not be listed in free_text_fields (the free-text pass always "
+                "runs over it)"
+            )
         if field in seen:
             raise ValueError(f"{field!r} listed as both field and free_text_field")
         free_text_fields.append(field)
@@ -283,7 +307,9 @@ def build_config_fragment(cfg: TenantConfig) -> str:
         f"      priority: {_gdpr_priority(f.family)}"
         for f in cfg.fields
     )
-    free_text = "\n".join(f"    - {f}" for f in cfg.free_text_fields)
+    # `message` is the built-in default free-text field (always emitted);
+    # `cfg.free_text_fields` holds only the EXTRA fields from fields.yaml.
+    free_text = "\n".join(f"    - {f}" for f in effective_free_text_fields(cfg))
     sha = fields_yaml_sha256(cfg)
     return (
         f"# generated from {cfg.source_rel} (sha256: {sha})\n"

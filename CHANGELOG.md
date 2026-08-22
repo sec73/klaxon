@@ -10,6 +10,60 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Security — Teil 13 full audit: opaque request features blocked, error bodies
+withheld, rare_terms mapped, RBAC posture fix
+
+- **Fail-closed gate on the other opaque request features —
+  `anonymization.block_unmappable_features` (env
+  `KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_FEATURES`, default `block`).** A
+  `runtime_mappings` field can copy a masked field under a NEW name and be
+  aggregated on, `script_fields` is arbitrary code (like `scripted_metric`),
+  `suggest` returns raw field text, and `highlight` embeds raw source text —
+  the response walker cannot guarantee to mask any of them (live proof:
+  `_source.user.name` masked but `fields.who` leaked `root`; `suggest.text`
+  echoed `root`; a bare username leaked inside an `<em>`-wrapped highlight
+  snippet). `server.search` now detects these top-level request keys via
+  `find_unmappable_features` and either `block` (reject the request, naming
+  the feature), `drop` (strip the top-level section before it runs, with an
+  `[UNMAPPABLE FEATURE DROPPED]` notice) or `off` (serve them with only the
+  response-side deep value pass as a net — an explicit, documented
+  data-protection exception). Enforced request-side in code, like
+  `block_unmappable_aggs`.
+- **Response-side defense-in-depth for the opaque subtrees** (`suggest`,
+  per-hit `highlight` and `fields`): the walker now serves them through the
+  deep value pass — `highlight`/`fields` reuse the DOCUMENT's own tokens
+  (built from its raw `_source`, so a `script_fields` alias or snippet echo of
+  a structured value maps to the exact `_source` token), the top-level
+  `suggest` uses a response-wide registry. Existing tokens pass through
+  idempotent.
+- **Error bodies and shard failures are no longer served raw.** An indexer
+  error body (400/429/500) can echo the raw query (script source, field names,
+  values) and is opaque to the walker; with anonymization active the served
+  output carries the notices plus a `[BODY WITHHELD]` marker instead of the
+  body (the raw render still reaches the audit log when RAW logging is on). A
+  200 response with a failed shard gets a `[SHARD FAILURES]` notice and the
+  raw `_shards.failures` array (which echoes the query) is stripped from the
+  masked body. `diagnostics.render` gained `include_body=`.
+- **`rare_terms` mapped** (was blocked as unmappable): it is a field-mapped
+  family like `terms` — its bucket `key` AND `key_as_string` are now tokenised
+  (recognised in `_agg_body_spec`, added to the known-safe allowlist and the
+  `key_as_string` rebuild). Pipeline aggs (`bucket_script`, `bucket_selector`,
+  `bucket_sort`) and `ip_range`/`geohash`/`geotile` remain fail-closed BLOCKED
+  (their keys are personal IP ranges / coordinates, or their output is opaque).
+- **Posture `rbac` check fixed**: the OpenSearch Security roles API serves the
+  roles map as TOP-LEVEL keys (`{role_name: spec}`), not under a `roles` key —
+  the check now parses both shapes (live-verified: `rbac: OK —
+  klaxon_llm_report_customer-a grants: klaxon-masked-customer-a-v5*` only).
+  `pipeline_drift` now also reports the effective-config-vs-fields.yaml drift
+  when the Option B pipeline is NOT deployed.
+- **Tests**: +54 offline (find_unmappable_features, rare_terms key/key_as_string,
+  deep-pass on suggest/highlight/fields, shard-failure strip, feature-gate
+  block/drop/off end-to-end, error-body withholding, RBAC llm-report-never-raw,
+  posture real-roles-shape + not-deployed drift) and +2 live (script_fields /
+  suggest queries rejected against the raw streams). Full gate green: 1078
+  offline + 10 live tests, mypy strict clean, ruff at baseline, golden
+  byte-identical, `generate --check` OK.
+
 ### Added
 
 - **`klaxon masking teardown --tenant <tenant>` — cleanly remove the Option B
@@ -40,6 +94,45 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sweep, idempotency, dry-run no-op, confirmation gating, sync-state
   keep-vs-purge, verification-failure non-zero, no-secret output and the
   never-touches-`wazuh-*` guarantee.
+
+### Added
+
+- **Fail-closed gate on unmappable aggregations (`scripted_metric` & unknown
+  types) — the scripted_metric raw-value leak is now BLOCKED by default, plus a
+  deep value pass as defense-in-depth.** A `scripted_metric` (and any unknown
+  aggregation type) is served with an OPAQUE output the response walker cannot
+  map: its script can read ANY document field and the emitted values reach the
+  consumer RAW while the same values are tokenised everywhere else (live leak:
+  `wazuh.agent.host.hostname` → `Supergrobi.intern.moenig.it` ×80 in
+  `scripted_metric` output; `related.user` → `root`/`marco`/UUID in findings).
+  New `anonymization.block_unmappable_aggs` (env
+  `KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS`, default `block` — the strictest
+  behaviour) is enforced REQUEST-side in code, not by trusting the default:
+  `server.search` detects unmappable aggregation types via
+  `find_unmappable_aggs` (any type outside the walker's known-safe allowlist,
+  incl. nested sub-aggregations) and either (a) `block` — rejects the whole
+  request with a clear error naming the aggregation type ("don't serve what you
+  can't guarantee"), (b) `drop` — strips the offending top-level aggregations
+  from the request before it is executed, with an
+  `[UNMAPPABLE AGG DROPPED]` notice, or (c) `off` — serves them, an explicit
+  data-protection exception. The deep value pass (defense-in-depth, runs for
+  every OPAQUE aggregation that is served) recurses into ALL leaves of opaque
+  outputs (`scripted_metric.value`, `bucket_script` results) and masks string
+  values by VALUE pattern — the new HOSTNAME-family pass for dotted hostnames
+  (`Supergrobi.intern.moenig.it` → `[HOST_…]`), a new UUID/user-id pass, plus
+  the existing e-mail/IP passes — and by the response's known-value registry
+  (an opaque echo of a `_source` username/hostname reuses the exact `_source`
+  token; existing tokens pass through idempotently; non-personal free text like
+  `category` is untouched). Mapped aggregation types (`terms`, `multi_terms`,
+  `composite`, `top_hits`, `filters`, metrics) behave exactly as before — the
+  golden master is byte-identical. The strict default is active whenever
+  anonymization is active; a permissive mode (`drop`/`off`) requires explicit
+  opt-in and is a documented data-protection exception. The Docker image now
+  ships `tenants/` so the posture/GDPR verification chain's masking source of
+  truth (`/app/tenants/customer-a/fields.yaml`) resolves again. Tests: +43
+  offline (`TestFindUnmappableAggs`, `TestDeepValuePass`, search end-to-end
+  block/drop/off, config parsing, diagnostics notice) + a skippable live test
+  proving the exact finding query is rejected on a raw stream.
 
 ### Fixed
 
@@ -162,6 +255,77 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   functions. Committed artifacts and the golden master regenerated; the
   twin-masked-doc golden now masks the nested fields and matches the
   response-layer golden exactly.
+
+- **`message` is now the BUILT-IN default free-text field of the generated
+  pipeline.** Previously the `FREE_TEXT` table was populated solely from
+  `free_text_fields` in `fields.yaml`, so a tenant without that section emitted
+  an EMPTY `def FREE_TEXT = [ ];` and the free-text pass (`maskFreeText`) never
+  ran — raw usernames/IPs/e-mails in `message` would reach the masked stream
+  unmasked (the `klaxon masking test` free-text assertions failed). Now the
+  generator ALWAYS emits `message` (plus any extra `free_text_fields`), so the
+  list is never empty; the fields.yaml validator REJECTS `message` in
+  `free_text_fields` ("message is the built-in default free-text field and
+  must not be listed" — list only extra fields); and the script-structure
+  self-test asserts the rendered `FREE_TEXT` is non-empty and contains
+  `message`, aborting generation (no artifacts) if it would be empty. The
+  Python twin, the pipeline `_meta` provenance and the config fragment
+  (`mask_free_text_fields`) all route through the same
+  `effective_free_text_fields` helper, so the response layer keeps masking
+  `message` free text and the drift fingerprints stay in sync.
+  `tenants/customer-a/fields.yaml` no longer lists `message`; committed
+  artifacts + golden regenerated. New loader + self-test guard tests
+  (`tests/test_generate_masking.py`).
+
+- **`sync-masked` preflight no longer counts free-text fields as structured
+  masking fields.** The preflight compared the effective Klaxon config
+  (`mask_fields` + `mask_free_text_fields`) and the pipeline's full field list
+  (FIELDS + FREE_TEXT) against `fields.yaml`'s full list (structured +
+  `message`), so a correct deployment whose config `mask_fields` holds only the
+  structured fields (no `message`) was falsely rejected ("effective Klaxon
+  config masks [N fields] but fields.yaml requires [N+1]"). Now the STRUCTURED
+  fields are compared as equal sets — `fields.yaml` `fields:` == the deployed
+  pipeline's FIELDS table == the config's `mask_fields` — and FREE-TEXT fields
+  are checked separately: the pipeline's FREE_TEXT must contain the built-in
+  `message` plus any `free_text_fields`, and are NEVER required in
+  `mask_fields` (a free-text field is not a structured-masking field). The
+  pipeline-existence, provenance-fingerprint and quarantine-`on_failure`
+  checks are unchanged. New preflight unit tests cover: a correct deployment
+  passes (the reported bug), config missing a structured field fails, config
+  with an extra structured field fails, and a pipeline FREE_TEXT missing
+  `message` fails (`tests/test_sync_masked.py`).
+
+### Fixed
+
+- **Aggregation-key masking now reaches NESTED sub-aggregations — the keys of
+  every level are tokenised, not just the top level.** OpenSearch nests
+  sub-aggregations DIRECTLY inside each bucket — siblings of `key`/`doc_count`,
+  with no `aggregations` wrapper — but the response walker only descended when
+  a bucket contained an `aggregations` key (a shape real responses never have),
+  so a nested `terms related.user` under `terms related.hosts` came back RAW
+  (a verified leak: nested user/agent-host keys were unmasked on the raw
+  stream even though their fields are in `mask_fields`). The walker is now
+  driven by the REQUEST-built agg hierarchy: `AggSpec` records its nested
+  sub-aggregations (`children`, name → spec), and `_mask_bucket` treats any
+  direct child whose name is a known sub-aggregation of THAT aggregation as a
+  nested agg node — masking its buckets with the field of that level and
+  recursing, depth-agnostically. Same-named sub-aggregations under different
+  parents resolve per level (the flat name map is only a top-level fallback).
+  Every agg shape works at every depth: terms/significant_terms/significant_
+  text (key + `key_as_string`), multi_terms (aligned with its field list),
+  composite (`key` AND `after_key`, so pagination stays consistent), keyed
+  aggs (filters/range/date_histogram/histogram: keys never tokenised, only
+  walked), and top_hits (embedded `_source` through the document-masking
+  path). Idempotency holds at depth — already-tokenized sub-agg keys
+  (masked stream) pass through unchanged. Counts
+  (`doc_count`/`sum_other_doc_count`/`doc_count_error_upper_bound`) and the
+  `mask_aggregation_keys: false` byte-identical path are untouched. New unit
+  tests (`tests/test_anonymization.py` — direct-sibling nested masked/masked,
+  masked-top/unmasked-below, depth-3, per-level collision resolution, nested
+  composite after_key, nested multi_terms, nested top_hits, nested idempotency,
+  children hierarchy) + raw-stream regression tests
+  (`tests/test_aggregation_masking.py`, fail before / pass after the fix) + a
+  skippable live test (`tests/test_live_agg_masking.py`) that checks the leak
+  case and the unmasked-below case against the real raw stream.
 ## 0.2.0 – 2026-08-13
 
 ### Fixed

@@ -36,6 +36,7 @@ from klaxon_mcp.masked_stream import (
     pipeline_mask_doc,
     token,
 )
+from klaxon_mcp.tenants import effective_free_text_fields
 
 SALT = "test-salt"
 
@@ -43,8 +44,6 @@ FIELDS_YAML = """\
 tenant: test-a
 salt_env: KLAXON_ANONYMIZATION_SALT
 mask_free_text_users: true
-free_text_fields:
-  - field: message
 fields:
   - field: destination.ip
     family: IP
@@ -321,6 +320,10 @@ class FakeIndexer:
         self.reindex_ok = True
         self.reindex_failures: list[Any] | None = None
         self.reindex_created = 0
+        # When True, the completed async reindex task reports its failures under
+        # the top-level `response` key (the real shape OpenSearch returns for a
+        # completed task) instead of under `task.status`.
+        self.reindex_failures_in_response = False
         # Number of /_reindex posts that raise a transport-level error before
         # the request succeeds (retry path). 0 = never fail at transport level.
         self.reindex_transport_errors = 0
@@ -344,20 +347,25 @@ class FakeIndexer:
         if path.startswith("/_tasks/"):
             if self.task_pending:
                 return self._resp(200, {"completed": False}, path)
-            return self._resp(
-                200,
-                {
-                    "completed": True,
-                    "task": {
-                        "status": {
-                            "total": self.reindex_created,
-                            "created": self.reindex_created,
-                            "failures": self.reindex_failures or [],
-                        }
-                    },
-                },
-                path,
-            )
+            status = {
+                "total": self.reindex_created,
+                "created": self.reindex_created,
+            }
+            if not self.reindex_failures_in_response:
+                status["failures"] = self.reindex_failures or []
+            body: dict[str, Any] = {"completed": True, "task": {"status": status}}
+            if self.reindex_failures_in_response:
+                # A completed async task reports the FINAL response (with
+                # failures) under the top-level `response` key, NOT under
+                # task.status — the exact shape that exposed the bug.
+                body["response"] = {
+                    "took": 1,
+                    "timed_out": False,
+                    "total": self.reindex_created,
+                    "created": self.reindex_created,
+                    "failures": self.reindex_failures or [],
+                }
+            return self._resp(200, body, path)
         if path.startswith("/_ingest/pipeline/"):
             if self.deployed_pipeline is None:
                 return self._resp(404, {}, path)
@@ -444,7 +452,8 @@ def _config(cfg: Any) -> Config:
         logtest_default_space="custom",
         anonymization=AnonymizationConfig(
             mask_fields=cfg.all_masked_fields,
-            mask_free_text_fields=cfg.free_text_fields,
+            # Mirrors the generated config fragment: message (built-in) + extras.
+            mask_free_text_fields=effective_free_text_fields(cfg),
         ),
     )
 
@@ -463,6 +472,30 @@ def _checkpoint_puts(fake: FakeIndexer) -> list[dict[str, Any]]:
             assert isinstance(body, dict)
             puts.append(body)
     return puts
+
+
+def test_reindex_task_result_merges_response_failures() -> None:
+    """`_reindex_task_result` must surface failures from `task.response` — the
+    real location in a completed async task — not only `task.status`."""
+    completed = {
+        "completed": True,
+        "task": {"status": {"total": 5, "created": 3, "batches": 1}},
+        "response": {
+            "took": 5,
+            "timed_out": False,
+            "failures": [{"index": "q", "cause": {"type": "boom"}}],
+        },
+    }
+    result = sync_masked._reindex_task_result(completed)
+    assert result is not None
+    assert result["created"] == 3
+    assert result["failures"] == [{"index": "q", "cause": {"type": "boom"}}]
+    # Status-only task (or a synchronous response, which has no `response` key):
+    # still works, no crash, failures simply absent.
+    status_only = {"completed": True, "task": {"status": {"created": 3}}}
+    assert sync_masked._reindex_task_result(status_only) == {"created": 3}
+    # Unreadable result -> None (caller treats as fail-closed).
+    assert sync_masked._reindex_task_result({"completed": True}) is None
 
 
 @pytest.fixture(autouse=True)
@@ -643,6 +676,31 @@ class TestSyncReindexTaskPoll:
         assert _checkpoint_puts(fake) == []
         assert "failure(s)" in capsys.readouterr().err
 
+    def test_task_failures_in_response_checkpoint_not_advanced(
+        self, cfg: Any, capsys: Any
+    ) -> None:
+        """A completed async reindex reports failures under `task.response`
+        (the final body), NOT under `task.status`. Reading only `task.status`
+        misses them and would advance the checkpoint on an aborted reindex —
+        the exact bug a real backfill hit (strict_dynamic_mapping_exception on
+        the quarantine routing). The checkpoint must NOT advance."""
+        fake = FakeIndexer()
+        fake.deployed_pipeline = build_pipeline_template(cfg)
+        fake.reindex_created = 991
+        fake.reindex_failures = [
+            {
+                "index": ".ds-klaxon-quarantine-test-a-v5-raw-000001",
+                "cause": {
+                    "type": "strict_dynamic_mapping_exception",
+                    "reason": "dynamic introduction of [klaxon] ... not allowed",
+                },
+            }
+        ]
+        fake.reindex_failures_in_response = True
+        assert _run_sync(cfg, fake) == 1
+        assert _checkpoint_puts(fake) == []
+        assert "failure(s)" in capsys.readouterr().err
+
     def test_task_poll_timeout_checkpoint_not_advanced(
         self, cfg: Any, capsys: Any
     ) -> None:
@@ -696,6 +754,65 @@ class TestSyncPreflight:
         )
         assert result == 1
         assert _reindex_call(fake) is None
+
+    def test_preflight_passes_for_correct_deployment(self, cfg: Any) -> None:
+        # The reported bug: the config's mask_fields holds ONLY the structured
+        # fields (no `message`), the pipeline FIELDS matches them, and FREE_TEXT
+        # = ["message"]. Free-text fields are NOT structured-masking fields, so
+        # this correct deployment must PASS the preflight.
+        from dataclasses import replace
+
+        deployed = build_pipeline_template(cfg)
+        config = replace(
+            _config(cfg),
+            anonymization=replace(
+                _config(cfg).anonymization,
+                mask_free_text_fields=(),  # reported case: no `message` in config
+            ),
+        )
+        assert sync_masked.preflight_report(cfg, deployed, config) == []
+
+    def test_preflight_fails_when_config_missing_structured_field(self, cfg: Any) -> None:
+        # Real structured drift: the config mask_fields lacks a structured field
+        # that the pipeline FIELDS (and fields.yaml) require -> FAILS.
+        from dataclasses import replace
+
+        deployed = build_pipeline_template(cfg)
+        config = replace(
+            _config(cfg),
+            anonymization=replace(
+                _config(cfg).anonymization,
+                mask_fields=tuple(
+                    f for f in cfg.all_masked_fields if f != "user.name"
+                ),
+            ),
+        )
+        problems = sync_masked.preflight_report(cfg, deployed, config)
+        assert any("mask_fields" in p and "user.name" in p for p in problems)
+
+    def test_preflight_fails_when_pipeline_free_text_missing_message(self, cfg: Any) -> None:
+        # A pipeline whose FREE_TEXT lacks the built-in `message` is a free-text
+        # default regression -> FAILS, caught separately from the structured set.
+        deployed = build_pipeline_template(cfg)
+        deployed["_meta"]["free_text_fields"] = []
+        problems = sync_masked.preflight_report(cfg, deployed, _config(cfg))
+        assert any("FREE_TEXT" in p and "message" in p for p in problems)
+
+    def test_preflight_fails_when_config_has_extra_structured_field(self, cfg: Any) -> None:
+        # The config mask_fields has a structured field the pipeline FIELDS does
+        # not -> FAILS (the config and fields.yaml are out of sync).
+        from dataclasses import replace
+
+        deployed = build_pipeline_template(cfg)
+        config = replace(
+            _config(cfg),
+            anonymization=replace(
+                _config(cfg).anonymization,
+                mask_fields=tuple((*cfg.all_masked_fields, "source.ip")),
+            ),
+        )
+        problems = sync_masked.preflight_report(cfg, deployed, config)
+        assert any("mask_fields" in p and "source.ip" in p for p in problems)
 
 
 class TestReportMaskingErrors:

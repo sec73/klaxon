@@ -38,8 +38,11 @@ tenant: customer-a
 salt_env: KLAXON_ANONYMIZATION_SALT
 mask_free_text_users: true
 
-free_text_fields:
-  - field: message
+# `message` is the BUILT-IN default free-text field and must NOT be listed
+# here (the loader rejects it) — the free-text pass always runs over it. List
+# only EXTRA free-text fields:
+# free_text_fields:
+#   - field: event.original
 
 fields:
   - field: destination.ip

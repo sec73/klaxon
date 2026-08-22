@@ -78,8 +78,6 @@ MINIMAL_FIELDS = """\
 tenant: test-a
 salt_env: KLAXON_ANONYMIZATION_SALT
 mask_free_text_users: true
-free_text_fields:
-  - field: message
 fields:
   - field: destination.ip
     family: IP
@@ -144,8 +142,10 @@ def test_loader_rejects_duplicate_field(tmp_path: Any) -> None:
 def test_loader_rejects_field_also_in_free_text(tmp_path: Any) -> None:
     tenant_dir = tmp_path / "tenants" / "test-a"
     tenant_dir.mkdir(parents=True)
+    # `destination.ip` is a structured field AND listed as a free_text_field ->
+    # the loader must reject the overlap.
     (tenant_dir / "fields.yaml").write_text(
-        MINIMAL_FIELDS + "  - field: message\n    family: USER\n",
+        MINIMAL_FIELDS + "\nfree_text_fields:\n  - field: destination.ip\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="both field and free_text_field"):
@@ -169,11 +169,25 @@ def test_loader_rejects_malformed_free_text_field_name(tmp_path: Any) -> None:
     tenant_dir = tmp_path / "tenants" / "test-a"
     tenant_dir.mkdir(parents=True)
     bad = MINIMAL_FIELDS.replace(
-        "free_text_fields:\n  - field: message",
-        "free_text_fields:\n  - field: 'message# x'",
+        "mask_free_text_users: true",
+        "mask_free_text_users: true\nfree_text_fields:\n  - field: 'message# x'",
     )
     (tenant_dir / "fields.yaml").write_text(bad, encoding="utf-8")
     with pytest.raises(ValueError, match="invalid field name"):
+        load_tenant_config("test-a", root=tmp_path)
+
+
+def test_loader_rejects_message_in_free_text_fields(tmp_path: Any) -> None:
+    # `message` is the built-in default free-text field; listing it is a
+    # configuration error (the generator always emits it).
+    tenant_dir = tmp_path / "tenants" / "test-a"
+    tenant_dir.mkdir(parents=True)
+    bad = MINIMAL_FIELDS.replace(
+        "mask_free_text_users: true",
+        "mask_free_text_users: true\nfree_text_fields:\n  - field: message",
+    )
+    (tenant_dir / "fields.yaml").write_text(bad, encoding="utf-8")
+    with pytest.raises(ValueError, match="built-in default free-text"):
         load_tenant_config("test-a", root=tmp_path)
 
 
@@ -372,6 +386,52 @@ def test_verify_script_structure_catches_missing_function(cfg: Any) -> None:
     assert any("missing function" in p and "hmacSha256Hex" in p for p in problems)
 
 
+def test_verify_script_structure_catches_empty_free_text(cfg: Any) -> None:
+    """An empty FREE_TEXT list would silently skip the whole free-text pass
+    (raw usernames/IPs/e-mails unmasked); the structure check must reject it."""
+    source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
+    tampered = source.replace(
+        'def FREE_TEXT = [\n    "message"\n];',
+        "def FREE_TEXT = [\n];",
+    )
+    assert "message" not in tampered.split("def FREE_TEXT")[1].split("];")[0]
+    problems = verify_script_structure(tampered)
+    assert any("FREE_TEXT is empty" in p for p in problems)
+
+
+def test_verify_script_structure_requires_message_in_free_text(cfg: Any) -> None:
+    """The built-in `message` field must stay in FREE_TEXT (the free-text pass
+    always runs over it, even when fields.yaml lists only extra fields)."""
+    source = build_pipeline(cfg, SALT)["processors"][0]["script"]["source"]
+    tampered = source.replace(
+        'def FREE_TEXT = [\n    "message"\n];',
+        'def FREE_TEXT = [\n    "extra"\n];',
+    )
+    problems = verify_script_structure(tampered)
+    assert any("built-in `message`" in p for p in problems)
+
+
+def test_generator_selftest_fails_on_empty_free_text(
+    cfg: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generator change that empties FREE_TEXT must abort generation: the
+    self-test reports it, so `generate` emits NO artifacts."""
+    real_build = masking.build_pipeline
+
+    def broken(tenant_cfg: Any, salt: str) -> dict[str, Any]:
+        pipeline = real_build(tenant_cfg, salt)
+        script = pipeline["processors"][0]["script"]
+        script["source"] = script["source"].replace(
+            'def FREE_TEXT = [\n    "message"\n];',
+            "def FREE_TEXT = [\n];",
+        )
+        return pipeline
+
+    monkeypatch.setattr(masking, "build_pipeline", broken)
+    problems = run_generator_selftest(cfg, SALT)
+    assert any("FREE_TEXT is empty" in p for p in problems)
+
+
 def test_generator_selftest_includes_structure_check(
     cfg: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -546,6 +606,104 @@ def test_index_template_omits_mappings_when_none(cfg: Any) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Masked template mappings: every masked field is forced to `keyword`
+# --------------------------------------------------------------------------- #
+
+
+def _walk(props: Any, path: str) -> dict[str, Any]:
+    """The field mapping at a dotted path in a template's `properties` dict
+    (`{"source": {"properties": {"ip": {...}}}}` — the top-level properties
+    dict, not the `mappings` root)."""
+    node = props
+    for index, part in enumerate(path.split(".")):
+        node = node[part] if index == 0 else node["properties"][part]
+    return node
+
+
+def test_masked_template_forces_keyword_for_masked_fields() -> None:
+    """The pipeline writes TOKENS (`[IP_...]`, ...) into every masked field, so
+    the masked template must map them to `keyword` — never the raw mapping's
+    specialized type (`ip`, ...). `ignore_above` from the raw mapping is kept;
+    non-masked fields are copied unchanged."""
+    raw = {
+        "properties": {
+            "@timestamp": {"type": "date"},
+            "source": {"properties": {"ip": {"type": "ip"}}},
+            "destination": {"properties": {"ip": {"type": "ip"}}},
+            "related": {
+                "properties": {
+                    "ip": {"type": "ip", "ignore_above": 256},
+                    "hosts": {"type": "keyword"},
+                }
+            },
+            "user": {"properties": {"name": {"type": "keyword"}}},
+            "message": {"type": "text"},
+        }
+    }
+    cfg = load_tenant_config("customer-a")  # has source.ip / destination.ip / related.ip
+    template = build_index_template(cfg, raw)
+    props = template["template"]["mappings"]["properties"]
+    # IP-family masked fields: keyword, never `ip`.
+    assert _walk(props, "source.ip") == {"type": "keyword"}
+    assert _walk(props, "destination.ip") == {"type": "keyword"}
+    assert _walk(props, "related.ip") == {"type": "keyword", "ignore_above": 256}
+    assert _walk(props, "related.ip")["type"] != "ip"
+    # Every masked field present in the mapping is keyword.
+    for spec in cfg.fields:
+        node: Any = props
+        for part in spec.field.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, dict) and "type" in node:
+            assert node["type"] == "keyword", spec.field
+    # Non-masked fields keep the raw mapping unchanged.
+    assert props["@timestamp"] == {"type": "date"}
+    assert props["message"] == {"type": "text"}
+    assert props["user"]["properties"]["name"] == {"type": "keyword"}
+    # The INPUT is not mutated (the override deep-copies).
+    assert raw["properties"]["source"]["properties"]["ip"] == {"type": "ip"}
+
+
+def test_masked_template_forces_keyword_for_flat_dotted_keys() -> None:
+    """Some mappings flatten fields to dotted keys (`properties["source.ip"]`);
+    the override must apply there too."""
+    raw = {
+        "properties": {
+            "@timestamp": {"type": "date"},
+            "source.ip": {"type": "ip"},
+            "destination.ip": {"type": "ip"},
+            "user.name": {"type": "keyword"},
+        }
+    }
+    cfg = load_tenant_config("customer-a")
+    template = build_index_template(cfg, raw)
+    props = template["template"]["mappings"]["properties"]
+    assert props["source.ip"] == {"type": "keyword"}
+    assert props["destination.ip"] == {"type": "keyword"}
+    assert props["@timestamp"] == {"type": "date"}  # untouched
+
+
+def test_masked_template_accepts_token_values() -> None:
+    """Token-indexability: `[IP_...]` is a valid value for the masked template
+    because every masked field is `keyword` (stores arbitrary strings). The raw
+    `ip` type would reject it with `mapper_parsing_exception`."""
+    raw = {
+        "properties": {
+            "source": {"properties": {"ip": {"type": "ip"}}},
+            "destination": {"properties": {"ip": {"type": "ip"}}},
+        }
+    }
+    cfg = load_tenant_config("customer-a")
+    template = build_index_template(cfg, raw)
+    props = template["template"]["mappings"]["properties"]
+    for path in ("source.ip", "destination.ip"):
+        mapping = _walk(props, path)
+        assert mapping["type"] == "keyword", path
+        assert mapping["type"] != "ip", path
+
+
+# --------------------------------------------------------------------------- #
 # Quarantine artifacts (fail-closed masking-error routing)
 # --------------------------------------------------------------------------- #
 
@@ -578,10 +736,43 @@ def test_quarantine_index_template_targets_only_quarantine(cfg: Any) -> None:
     assert template["index_patterns"] == ["klaxon-quarantine-test-a-v5*"]
     assert template["priority"] == TEMPLATE_PRIORITY
     assert template["data_stream"] == {}
-    assert template["template"]["mappings"] == {"properties": {}}
+    # The fail-closed on_failure metadata is explicitly mapped even on an empty
+    # properties input (see test_quarantine_template_adds_klaxon_metadata).
+    props = template["template"]["mappings"]["properties"]
+    assert props["klaxon"]["properties"]["masking_error"] == {"type": "boolean"}
     settings = template["template"]["settings"]
     # NO index.default_pipeline — quarantine docs must never re-enter masking.
     assert "index.default_pipeline" not in settings
+
+
+def test_quarantine_template_adds_klaxon_metadata(cfg: Any) -> None:
+    """Quarantine stores RAW (unmasked) docs, so the copied Wazuh mappings keep
+    their specialized types (`ip` stays `ip`); but the pipeline's fail-closed
+    on_failure reroute writes `klaxon.masking_error` /
+    `klaxon.quarantine.*` into quarantine docs, and the copied
+    `dynamic: strict_allow_templates` mapping would reject them. The template
+    must add the `klaxon` object explicitly, and not mutate the input."""
+    raw = {
+        "dynamic": "strict_allow_templates",
+        "properties": {
+            "@timestamp": {"type": "date"},
+            "source": {"properties": {"ip": {"type": "ip"}}},
+        },
+    }
+    template = build_quarantine_index_template(cfg, raw)
+    props = template["template"]["mappings"]["properties"]
+    # Raw fields unchanged (quarantine keeps the forensic originals).
+    assert props["source"]["properties"]["ip"] == {"type": "ip"}
+    assert props["@timestamp"] == {"type": "date"}
+    # Explicit metadata mapping for the fail-closed reroute.
+    klaxon = props["klaxon"]["properties"]
+    assert klaxon["masking_error"] == {"type": "boolean"}
+    assert klaxon["quarantine"]["properties"]["reason"] == {"type": "keyword"}
+    assert klaxon["quarantine"]["properties"]["original_index"] == {
+        "type": "keyword"
+    }
+    # The input is NOT mutated (the merge deep-copies).
+    assert "klaxon" not in raw["properties"]
 
 
 def test_quarantine_index_template_omits_mappings_when_none(cfg: Any) -> None:
@@ -599,6 +790,12 @@ def test_roles_fragment_least_privilege(cfg: Any) -> None:
     assert cfg.masked_stream_pattern in llm_block
     assert cfg.quarantine_stream_pattern not in llm_block
     assert "klaxon-quarantine" not in llm_block
+    # Teil 13: the LLM-facing role must NEVER grant direct read on the raw
+    # streams (wazuh-events-v5-*/wazuh-findings-v5-*) — a consumer with this
+    # role could bypass Klaxon's masking entirely.
+    assert cfg.raw_stream not in llm_block
+    assert "wazuh-events" not in llm_block
+    assert "wazuh-findings" not in llm_block
     # Ops/security role: read on quarantine + raw events, no LLM mapping.
     ops = "klaxon_ops_test-a:"
     assert ops in roles

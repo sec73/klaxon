@@ -121,11 +121,36 @@ class AggSpec:
     (date_histogram, histogram, range, filters, metrics, scripted aggs) is
     `agg_type=None`, and its keys are never tokenised — a key is masked only when
     its recorded source field is in `mask_fields`.
+
+    `opaque` marks aggregation types the response walker cannot map at all
+    (`scripted_metric`, bucket_script, any unknown type): their output is an
+    opaque container whose values can be ANY field the script read, so the
+    walker cannot guarantee masking — the request-side fail-closed block rejects
+    them by default, and when one is served the deep value pass masks its string
+    leaves by value. Safe non-field aggs (filters, date_histogram, metrics) are
+    NOT opaque: their output is structurally known to be non-personal.
+
+    `children` records the nested sub-aggregations declared in the request's
+    `aggs` tree (name -> spec, in declaration order). OpenSearch nests these
+    DIRECTLY inside each bucket — siblings of `key`/`doc_count`, with no
+    `aggregations` wrapper — so the response walker needs this per-parent
+    hierarchy to find them, and to resolve same-named sub-aggregations under
+    different parents to the field of *that* level (a flat name map would pick
+    the wrong field on a collision).
     """
 
     agg_type: str | None
     fields: tuple[str, ...] = ()
     sources: tuple[tuple[str, str], ...] = ()
+    children: tuple[tuple[str, AggSpec], ...] = ()
+    opaque: bool = False
+
+    def child(self, name: str) -> AggSpec | None:
+        """The spec of a nested sub-aggregation of this aggregation, by name."""
+        for child_name, child in self.children:
+            if child_name == name:
+                return child
+        return None
 
 
 def parse_agg_fields(body: Any) -> dict[str, AggSpec]:
@@ -153,10 +178,30 @@ def _walk_aggs(aggs: dict[str, Any], specs: dict[str, AggSpec]) -> None:
 
 
 def _agg_spec(agg: Any) -> AggSpec:
-    """The AggSpec for one request-body aggregation object."""
+    """The AggSpec for one request-body aggregation object.
+
+    Records the aggregation's own type/field mapping AND the nested
+    sub-aggregations declared under its `aggs` key (`children`), so the
+    response walker can descend through buckets at every depth. The `opaque`
+    flag (unmappable output — scripted_metric, unknown types) is carried
+    through so the walker serves those through the deep value pass.
+    """
+    body = _agg_body_spec(agg)
+    return AggSpec(
+        body.agg_type,
+        body.fields,
+        body.sources,
+        children=_child_specs(agg),
+        opaque=body.opaque,
+    )
+
+
+def _agg_body_spec(agg: Any) -> AggSpec:
+    """Aggregation type/field mapping only (no `children`) for one request agg."""
     if not isinstance(agg, dict):
-        return AggSpec(None)
-    for kind in ("terms", "significant_terms", "significant_text"):
+        # An opaque shape the walker cannot map: treated as an opaque output.
+        return AggSpec(None, opaque=True)
+    for kind in ("terms", "significant_terms", "significant_text", "rare_terms"):
         inner = agg.get(kind)
         if isinstance(inner, dict) and isinstance(inner.get("field"), str):
             return AggSpec(kind, (inner["field"],))
@@ -169,7 +214,7 @@ def _agg_spec(agg: Any) -> AggSpec:
         )
         if fields:
             return AggSpec("multi_terms", fields)
-        return AggSpec(None)
+        return AggSpec(None, opaque=True)
     inner = agg.get("composite")
     if isinstance(inner, dict) and isinstance(inner.get("sources"), list):
         sources: list[tuple[str, str]] = []
@@ -182,12 +227,212 @@ def _agg_spec(agg: Any) -> AggSpec:
                     sources.append((name, spec.fields[0]))
         if sources:
             return AggSpec("composite", sources=tuple(sources))
-        return AggSpec(None)
+        return AggSpec(None, opaque=True)
     if "top_hits" in agg:
         # A marker, not a field mapping: the response embeds documents whose
         # `_source` must run through the normal document-masking path.
         return AggSpec("top_hits")
-    return AggSpec(None)
+    # A non-field aggregation (filters, date_histogram, range, metrics, ...) is
+    # served untouched — its output is structurally known to be non-personal —
+    # UNLESS it is a type outside the known-safe set (`scripted_metric`,
+    # `bucket_script`, any unknown type), which is opaque: its output can be ANY
+    # field value, so the deep value pass must mask it. `_KNOWN_SAFE_AGG_TYPES`
+    # is defined below the walker section but is resolved at call time.
+    type_keys = [k for k in agg if k not in _AGG_META_KEYS]
+    if type_keys and all(k in _KNOWN_SAFE_AGG_TYPES for k in type_keys):
+        return AggSpec(None)
+    return AggSpec(None, opaque=True)
+
+
+def _child_specs(agg: Any) -> tuple[tuple[str, AggSpec], ...]:
+    """(name, spec) pairs for the nested sub-aggregations of one request agg.
+
+    OpenSearch nests these DIRECTLY inside each response bucket (siblings of
+    `key`/`doc_count`), so the walker needs the per-parent hierarchy — a flat
+    name map would resolve same-named sub-aggregations under different parents
+    to the wrong field.
+    """
+    if not isinstance(agg, dict):
+        return ()
+    nested = agg.get("aggs")
+    if not isinstance(nested, dict):
+        return ()
+    return tuple((name, _agg_spec(sub)) for name, sub in nested.items())
+
+
+# --------------------------------------------------------------------------- #
+# Fail-closed gate on unmappable aggregations
+#
+# A `scripted_metric` (and ANY unknown/unhandled aggregation type) is served
+# with an OPAQUE output: the script can read ANY field of the documents, and
+# the emitted values reach the consumer RAW while the same values are
+# tokenised everywhere else. The response walker intentionally does not guess
+# at such output (spec §5.4 "do not guess"), so the only safe behaviour is to
+# not serve it at all. `_KNOWN_SAFE_AGG_TYPES` is the walker's allowlist: the
+# mapped key families plus the structural/metric aggregations whose output is
+# never personal (dates, ranges, numeric metrics, filter labels). Everything
+# else — `scripted_metric`, `bucket_script`, `top_metrics`, rare_terms, and any
+# unknown future type — is unmappable and blocked by default.
+# --------------------------------------------------------------------------- #
+
+_KNOWN_SAFE_AGG_TYPES = frozenset(
+    {
+        # Mapped key families: keys tokenised by the response walker.
+        "terms",
+        "significant_terms",
+        "significant_text",
+        "rare_terms",
+        "multi_terms",
+        "composite",
+        "top_hits",
+        # Structural: keys are dates/ranges/labels, never field values.
+        "date_histogram",
+        "histogram",
+        "range",
+        "date_range",
+        "filters",
+        "filter",
+        "missing",
+        "sampler",
+        "diversified_sampler",
+        "children",
+        # Metrics: numeric aggregate values, never personal.
+        "avg",
+        "sum",
+        "min",
+        "max",
+        "value_count",
+        "cardinality",
+        "stats",
+        "extended_stats",
+        "percentiles",
+        "percentile_ranks",
+        "matrix_stats",
+        "geo_bounds",
+        "geo_centroid",
+    }
+)
+
+# Aggregation-object keys that are not an aggregation type.
+_AGG_META_KEYS = frozenset({"aggs", "meta"})
+
+
+def find_unmappable_aggs(body: Any) -> list[tuple[str, str]]:
+    """`(top-level agg name, agg type)` for aggregation types the walker cannot map.
+
+    Walks the request `aggs` tree (top-level and nested sub-aggregations) and
+    collects every aggregation type NOT in `_KNOWN_SAFE_AGG_TYPES` —
+    `scripted_metric` plus any unknown/unhandled type. The reported name is
+    always the TOP-LEVEL aggregation that contains the opaque type, so a drop
+    can remove the whole offending subtree. Used by the request-side fail-closed
+    block in `server.search`: an opaque aggregation's script can read ANY field
+    and its output reaches the consumer raw.
+    """
+    found: list[tuple[str, str]] = []
+    if not isinstance(body, dict):
+        return found
+    aggs = body.get("aggs")
+    if not isinstance(aggs, dict):
+        return found
+    for name, agg in aggs.items():
+        _collect_unmappable(name, agg, found)
+    return found
+
+
+def _collect_unmappable(
+    top_name: str, agg: Any, found: list[tuple[str, str]]
+) -> None:
+    """Collect unmappable agg types under `agg`, reporting `top_name` for each."""
+    if not isinstance(agg, dict):
+        return
+    for key in agg:
+        if key in _AGG_META_KEYS:
+            continue
+        if key not in _KNOWN_SAFE_AGG_TYPES:
+            pair = (top_name, key)
+            if pair not in found:
+                found.append(pair)
+    nested = agg.get("aggs")
+    if isinstance(nested, dict):
+        for sub in nested.values():
+            _collect_unmappable(top_name, sub, found)
+
+
+def drop_unmappable_aggs(body: Any, agg_names: set[str]) -> Any:
+    """Return a copy of the request with the named top-level aggregations removed.
+
+    Used by the config-selectable "drop" mode: the offending aggregation (and
+    everything nested under it) is stripped from the request before it is
+    executed, so the indexer never computes it and the response cannot carry
+    its raw output.
+    """
+    if not isinstance(body, dict):
+        return body
+    aggs = body.get("aggs")
+    if not isinstance(aggs, dict):
+        return body
+    out = dict(body)
+    out["aggs"] = {
+        name: agg for name, agg in aggs.items() if name not in agg_names
+    }
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Fail-closed gate on the other opaque request features
+#
+# Same threat class as the unmappable aggregations, outside the `aggs` tree:
+#   * `runtime_mappings` — a runtime field is computed by a script and can copy
+#     a masked field (`user.name`) under a NEW name that is not in `mask_fields`;
+#     aggregating on it returns the raw values (the walker only tokenises keys
+#     whose source field is in `mask_fields`).
+#   * `script_fields` — arbitrary code, like `scripted_metric`; the emitted
+#     values land under arbitrary `fields.<name>` keys the walker cannot map.
+#   * `suggest` — term/phrase/completion suggesters return raw field text
+#     (a completion suggester emits the indexed value verbatim).
+#   * `highlight` — snippets embed raw source text (incl. bare usernames that
+#     no value pattern or username context pattern can catch once the indexer
+#     wraps them in highlight tags).
+# The walker cannot guarantee to mask any of these, so `block_unmappable_features`
+# rejects them by default (fail-closed), "drop" strips the top-level key before
+# the request runs, and "off" serves them with the response-side deep value pass
+# as the safety net (explicit, documented data-protection exception).
+# --------------------------------------------------------------------------- #
+
+# Top-level request keys whose response output is opaque to the walker.
+_OPAQUE_REQUEST_FEATURES = frozenset(
+    {"runtime_mappings", "script_fields", "suggest", "highlight"}
+)
+
+
+def find_unmappable_features(body: Any) -> list[tuple[str, str]]:
+    """`(top-level key, feature)` for request features the walker cannot mask.
+
+    Used by the request-side fail-closed block in `server.search`: a
+    `runtime_mappings`/`script_fields`/`suggest`/`highlight` section can emit
+    raw personal values the response walker cannot guarantee to mask. The
+    reported name is the top-level key itself, so a drop can remove it.
+    """
+    found: list[tuple[str, str]] = []
+    if not isinstance(body, dict):
+        return found
+    for key in body:
+        if key in _OPAQUE_REQUEST_FEATURES:
+            found.append((key, key))
+    return found
+
+
+def drop_unmappable_features(body: Any, feature_names: set[str]) -> Any:
+    """Return a copy of the request with the named top-level features removed.
+
+    Used by the config-selectable "drop" mode: the offending top-level section
+    (`runtime_mappings`, `script_fields`, `suggest`, `highlight`) is stripped
+    from the request before it is executed, so the response cannot carry its
+    raw output.
+    """
+    if not isinstance(body, dict):
+        return body
+    return {key: value for key, value in body.items() if key not in feature_names}
 
 
 # --------------------------------------------------------------------------- #
@@ -275,6 +520,13 @@ _USER = "USER"
 # ingest-time masking: leave it alone, never re-mask (idempotent). Kept in sync
 # with masked_stream.TOKEN_RE.
 _TOKEN_RE = re.compile(r"^\[(?:IP|USER|HOST|AGENT)_[0-9a-f]{16}\]$")
+
+# UUID / user-id style identifiers (the deep value pass masks them as USER —
+# `user.id` / `related.user` values, which the token scheme tokenises by field
+# name everywhere else, reach opaque aggregation outputs raw).
+_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
 
 
 class Anonymizer:
@@ -415,11 +667,19 @@ class Anonymizer:
         return self.mask_text(value)
 
     def mask_json(
-        self, obj: Any, path: str = "", identities: Mapping[str, str] | None = None
+        self,
+        obj: Any,
+        path: str = "",
+        identities: Mapping[str, str] | None = None,
+        value_registry: Mapping[str, str] | None = None,
     ) -> Any:
         """Deep-walk a parsed response and mask personal data in place-free."""
         return self._mask_json(
-            obj, path, skip_aggregations=False, identities=identities
+            obj,
+            path,
+            skip_aggregations=False,
+            identities=identities,
+            value_registry=value_registry,
         )
 
     def _mask_json(
@@ -428,6 +688,7 @@ class Anonymizer:
         path: str = "",
         skip_aggregations: bool = False,
         identities: Mapping[str, str] | None = None,
+        value_registry: Mapping[str, str] | None = None,
     ) -> Any:
         """The structural pass; optionally leaves the `aggregations` subtree alone.
 
@@ -437,9 +698,27 @@ class Anonymizer:
         pass over tokenised keys and drift aggregation tokens apart from their
         `_source` twins. `identities` (raw value -> token for the response's
         known usernames) feeds the free-text username pass.
+
+        Opaque response subtrees that embed source text under arbitrary key
+        names — `suggest` (top-level), and per-hit `highlight` / `fields` — are
+        served through the deep value pass (Teil 13): a `script_fields` alias
+        or a highlight snippet can carry a raw username/hostname under a key
+        the structured walker cannot map. `highlight`/`fields` reuse the
+        DOCUMENT's own tokens (built from its raw `_source`, so an echo of a
+        structured value maps to the exact `_source` token); the top-level
+        `suggest` subtree uses the response-wide `value_registry`.
         """
         if isinstance(obj, dict):
             out: dict[str, Any] = {}
+            # Per-document value registry for opaque response subtrees that
+            # embed source text (`highlight` / `fields`): reuse this document's
+            # own tokens so an echoed username/hostname maps to the exact
+            # `_source` token (and never borrows identities from another hit).
+            doc_registry = (
+                self._collect_value_registry(obj["_source"])
+                if "_source" in obj and ("highlight" in obj or "fields" in obj)
+                else None
+            )
             for key, value in obj.items():
                 if skip_aggregations and not path and key == "aggregations":
                     out[key] = value
@@ -452,11 +731,20 @@ class Anonymizer:
                     # word in ordinary prose in another.
                     local = self._collect_identities(value, child_path)
                     out[key] = self._mask_json(
-                        value, child_path, skip_aggregations, local
+                        value, child_path, skip_aggregations, local, value_registry
                     )
+                elif (key == "highlight" or key == "fields") and doc_registry is not None:
+                    # Opaque source-text subtree: deep value pass with the
+                    # document's own tokens (defense-in-depth, Teil 13).
+                    out[key] = self._deep_value_pass(value, doc_registry)
+                elif key == "suggest" and not path:
+                    # Top-level suggest (term/phrase/completion): raw field text
+                    # under arbitrary keys — deep value pass with the
+                    # response-wide registry.
+                    out[key] = self._deep_value_pass(value, value_registry or {})
                 else:
                     out[key] = self._mask_json(
-                        value, child_path, skip_aggregations, identities
+                        value, child_path, skip_aggregations, identities, value_registry
                     )
             return out
         if isinstance(obj, list):
@@ -504,11 +792,36 @@ class Anonymizer:
             return response
         # Free-text identities are built per document (inside the walk, at each
         # `_source`), so a username in one hit never masks prose in another.
+        # Opaque aggregation outputs (scripted_metric, bucket_script, unknown
+        # types) are masked INSIDE `mask_aggregations` via the deep value pass.
+        # A response-wide value registry is collected ONLY when the response
+        # carries a top-level `suggest` subtree (the deep pass for it reuses
+        # `_source` tokens); the common path pays no walk for it.
+        value_registry = (
+            self._collect_value_registry(parsed)
+            if isinstance(parsed, dict) and "suggest" in parsed
+            else None
+        )
         if self.config.mask_aggregation_keys:
             masked = self.mask_aggregations(parsed, agg_map)
-            masked = self._mask_json(masked, "", skip_aggregations=True)
+            masked = self._mask_json(
+                masked, "", skip_aggregations=True, value_registry=value_registry
+            )
         else:
-            masked = self.mask_json(parsed)
+            masked = self.mask_json(parsed, value_registry=value_registry)
+        # Shard-failure bodies (`_shards.failures`) echo the raw query — the
+        # script source, field names, sometimes values — and are opaque to the
+        # walker. Fail-closed: strip the raw `failures` array from what leaves
+        # for the LLM (the `failed` count stays; `search_notices` states it).
+        # A 200 response carrying a failed shard is still partial data, but its
+        # diagnostic payload is not masked output.
+        if isinstance(masked, dict):
+            shards = masked.get("_shards")
+            if isinstance(shards, dict) and shards.get("failures"):
+                stripped_shards = dict(shards)
+                stripped_shards.pop("failures", None)
+                masked = dict(masked)
+                masked["_shards"] = stripped_shards
         return Response(
             response.status_code,
             json.dumps(masked, indent=2, ensure_ascii=False),
@@ -530,19 +843,36 @@ class Anonymizer:
         Only fires when `mask_aggregation_keys` is on. Returns a copy of the
         parsed response with every bucket key whose source field is in
         `mask_fields` replaced by the deterministic token the `_source` pass
-        produces. Counts and metadata — `doc_count`,
+        produces — at EVERY nesting depth. OpenSearch nests sub-aggregations
+        DIRECTLY inside buckets (siblings of `key`/`doc_count`, no
+        `aggregations` wrapper); the walker descends through them via the
+        request-built agg hierarchy, so a nested `terms` on `related.user`
+        under a top-level `terms` on `related.hosts` gets its keys tokenised
+        exactly like the top-level ones. Counts and metadata — `doc_count`,
         `doc_count_error_upper_bound`, `sum_other_doc_count` — and the keys of
         non-field aggregations (date_histogram, histogram, range, filters,
         metrics) are left byte-identical. Embedded `top_hits` documents run
         through the normal `_source` masking path.
+
+        OPAQUE aggregations (`scripted_metric`, bucket_script, any unknown
+        type, flagged `opaque` on the spec) are NOT walked structurally — the
+        walker cannot map their output — instead the DEEP VALUE PASS masks every
+        string leaf by value pattern and by the response's known-value registry
+        (built from the RAW `obj` before `_source` values are tokenised, so an
+        opaque output that echoes a username/hostname reuses the exact `_source`
+        token). Existing tokens pass through unchanged (idempotent).
         """
         if not self.active or not self.config.mask_aggregation_keys:
             return obj
         if not isinstance(obj, dict) or "aggregations" not in obj:
             return obj
+        value_registry = self._collect_value_registry(obj)
         out = dict(obj)
         out["aggregations"] = self._mask_agg_map(
-            out["aggregations"], agg_map or {}, identities=identities
+            out["aggregations"],
+            agg_map or {},
+            identities=identities,
+            value_registry=value_registry,
         )
         return out
 
@@ -551,13 +881,18 @@ class Anonymizer:
         aggs: Any,
         agg_map: Mapping[str, AggSpec],
         identities: Mapping[str, str] | None = None,
+        value_registry: Mapping[str, str] | None = None,
     ) -> Any:
         """Walk a response `aggregations` map (name -> aggregation object)."""
         if not isinstance(aggs, dict):
             return aggs
         return {
             name: self._mask_agg_obj(
-                agg_obj, agg_map.get(name), agg_map, identities=identities
+                agg_obj,
+                agg_map.get(name),
+                agg_map,
+                identities=identities,
+                value_registry=value_registry,
             )
             for name, agg_obj in aggs.items()
         }
@@ -568,15 +903,29 @@ class Anonymizer:
         spec: AggSpec | None,
         agg_map: Mapping[str, AggSpec],
         identities: Mapping[str, str] | None = None,
+        value_registry: Mapping[str, str] | None = None,
     ) -> Any:
-        """Mask one aggregation object: buckets, after_key, nested aggs, top_hits."""
+        """Mask one aggregation object: buckets, after_key, nested aggs, top_hits.
+
+        Reached both for top-level aggregations (with `spec` from the flat
+        `agg_map`) and for nested sub-aggregations (with `spec` resolved from the
+        parent's `children`, so the field is correct for THIS level). An OPAQUE
+        aggregation (spec.opaque — scripted_metric, bucket_script, any unknown
+        type) is served through the deep value pass instead of the structural
+        walk, since the walker cannot map its output.
+        """
         if not isinstance(agg_obj, dict):
             return agg_obj
+        if spec is not None and spec.opaque:
+            # Opaque/unmappable output: mask every string leaf by value pattern
+            # and by the response's known-value registry (defense-in-depth).
+            return self._deep_value_pass(agg_obj, value_registry or {})
         out: dict[str, Any] = {}
         for key, value in agg_obj.items():
             if key == "buckets":
                 out[key] = self._mask_buckets(
-                    value, spec, agg_map, identities=identities
+                    value, spec, agg_map, identities=identities,
+                    value_registry=value_registry,
                 )
             elif (
                 key == "after_key"
@@ -593,7 +942,10 @@ class Anonymizer:
                 # what tells us this is one.
                 out[key] = self.mask_json(value, "top_hits", identities=identities)
             elif key == "aggregations":
-                out[key] = self._mask_agg_map(value, agg_map, identities=identities)
+                out[key] = self._mask_agg_map(
+                    value, agg_map, identities=identities,
+                    value_registry=value_registry,
+                )
             elif key == "top_hits":
                 # A response that does carry an explicit top_hits marker.
                 out[key] = self.mask_json(value, "top_hits", identities=identities)
@@ -609,17 +961,27 @@ class Anonymizer:
         spec: AggSpec | None,
         agg_map: Mapping[str, AggSpec],
         identities: Mapping[str, str] | None = None,
+        value_registry: Mapping[str, str] | None = None,
     ) -> Any:
         if isinstance(buckets, list):
             return [
-                self._mask_bucket(bucket, spec, agg_map, identities=identities)
+                self._mask_bucket(
+                    bucket, spec, agg_map, identities=identities,
+                    value_registry=value_registry,
+                )
                 for bucket in buckets
             ]
         if isinstance(buckets, dict):
-            # Named `filters` buckets: filter names are labels, not field values,
-            # and are never tokenised — only their sub-aggregations are walked.
+            # Named `filters` buckets: the dict key is a filter label, never a
+            # field value, so it is not tokenised. The spec still flows through
+            # (a keyed agg's agg_type is None, so `_mask_key` never fires) so
+            # sub-aggregations nested inside each named bucket are walked with
+            # the correct child field.
             return {
-                name: self._mask_bucket(bucket, None, agg_map, identities=identities)
+                name: self._mask_bucket(
+                    bucket, spec, agg_map, identities=identities,
+                    value_registry=value_registry,
+                )
                 for name, bucket in buckets.items()
             }
         return buckets
@@ -630,20 +992,46 @@ class Anonymizer:
         spec: AggSpec | None,
         agg_map: Mapping[str, AggSpec],
         identities: Mapping[str, str] | None = None,
+        value_registry: Mapping[str, str] | None = None,
     ) -> Any:
         if not isinstance(bucket, dict):
             return bucket
         out: dict[str, Any] = {}
+        # The masked `key` is computed once up front so `key_as_string` can be
+        # REBUILT from it (never segment-wise): the masked key list is the
+        # source of truth, so the joined `key_as_string` can carry no raw
+        # remnant and never mixes token families for one raw value.
+        masked_key = self._mask_key(bucket["key"], spec) if "key" in bucket else None
         for key, value in bucket.items():
             if key == "key":
-                out[key] = self._mask_key(value, spec)
+                out[key] = masked_key
             elif key == "key_as_string":
-                out[key] = self._mask_key_as_string(value, spec)
+                out[key] = self._mask_key_as_string(
+                    value, spec, masked_key=masked_key
+                )
             elif key == "aggregations":
-                out[key] = self._mask_agg_map(value, agg_map, identities=identities)
+                # The "aggregations"-wrapper shape (some proxies nest sub-aggs
+                # under it); real OpenSearch nests them directly, handled below.
+                out[key] = self._mask_agg_map(
+                    value, agg_map, identities=identities,
+                    value_registry=value_registry,
+                )
             else:
-                # doc_count and any bucket metadata are never touched.
-                out[key] = value
+                # Nested sub-aggregations sit DIRECTLY in the bucket, siblings of
+                # `key`/`doc_count`, with no "aggregations" wrapper. A direct
+                # child whose name is a known sub-aggregation of THIS aggregation
+                # (from the request tree) is a nested agg node: mask its buckets
+                # and recurse deeper — at every depth, with the field for this
+                # level (name collisions across parents resolve per level).
+                child_spec = spec.child(key) if spec is not None else None
+                if child_spec is not None:
+                    out[key] = self._mask_agg_obj(
+                        value, child_spec, agg_map, identities=identities,
+                        value_registry=value_registry,
+                    )
+                else:
+                    # doc_count and any bucket metadata are never touched.
+                    out[key] = value
         return out
 
     def _mask_key(self, value: Any, spec: AggSpec | None) -> Any:
@@ -662,15 +1050,37 @@ class Anonymizer:
         field = spec.fields[0] if spec.fields else ""
         return self._mask_key_value(field, value)
 
-    def _mask_key_as_string(self, value: Any, spec: AggSpec | None) -> Any:
-        """Keep `key_as_string` consistent with a tokenised `key` when present."""
-        if (
-            spec is None
-            or spec.agg_type not in {"terms", "significant_terms", "significant_text"}
-            or not spec.fields
-        ):
+    def _mask_key_as_string(
+        self, value: Any, spec: AggSpec | None, masked_key: Any = None
+    ) -> Any:
+        """Rebuild `key_as_string` from the already-masked `key`.
+
+        The masked key list is the source of truth — never mask `key_as_string`
+        segment-wise (fragile when a raw value contains "|", and the token
+        family would only be guessable). For `multi_terms` the masked keys are
+        joined with "|"; for the terms family `key_as_string` equals the masked
+        key token. A `key_as_string` therefore can never carry a raw remnant
+        (the leak) and always shares the key's token family — no more `[IP_]`
+        vs `[HOST_]` for the same raw value. Unmasked fields' values stay
+        verbatim (an original formatted value, e.g. a date, is preserved).
+        """
+        if spec is None or spec.agg_type is None:
             return value
-        return self._mask_key_value(spec.fields[0], value)
+        if spec.agg_type == "multi_terms":
+            if masked_key is None or not isinstance(masked_key, list):
+                return value
+            return "|".join(str(item) for item in masked_key)
+        if (
+            spec.agg_type
+            in {"terms", "significant_terms", "significant_text", "rare_terms"}
+            and spec.fields
+        ):
+            if self._field_for_path(spec.fields[0]) is None:
+                # Unmasked field: key AND key_as_string stay untouched.
+                return value
+            if masked_key is not None:
+                return masked_key
+        return value
 
     def _mask_composite_key(self, value: Any, spec: AggSpec) -> Any:
         """Tokenise the named entries of a composite `key` / `after_key`."""
@@ -707,6 +1117,99 @@ class Anonymizer:
             # it, never re-tokenise (idempotent).
             return value
         return self._register(kind, value)
+
+    # ------------------------------------------------------------------ #
+    # Deep value pass (defense-in-depth for opaque aggregation outputs)
+    # ------------------------------------------------------------------ #
+
+    def _collect_value_registry(
+        self,
+        obj: Any,
+        path: str = "",
+        registry: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """raw value -> token for every configured-field string leaf in a subtree.
+
+        Collected from the RAW response BEFORE the structured pass tokenises the
+        `_source` values, so an opaque aggregation output that echoes a
+        structured value (a `scripted_metric` emitting `related.user` members, a
+        hostname from `wazuh.agent.host.hostname`) reuses the EXACT `_source`
+        token for it — same value, same family, same token. List indices do not
+        belong to the field path (mirrors `_mask_json`), so `_source` paths
+        resolve like they do there. Uses `_token` (not `_register`) so the
+        compliance report counts a value once, when the structured pass actually
+        masks it.
+        """
+        if registry is None:
+            registry = {}
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                child = f"{path}.{key}" if path else key
+                self._collect_value_registry(value, child, registry)
+        elif isinstance(obj, list):
+            for item in obj:
+                self._collect_value_registry(item, path, registry)
+        elif isinstance(obj, str) and obj:
+            matched = self._field_for_path(path)
+            if matched is not None and not _TOKEN_RE.fullmatch(obj):
+                kind, _field = matched
+                registry.setdefault(obj, self._token(kind, obj))
+        return registry
+
+    def _deep_value_pass(self, obj: Any, registry: Mapping[str, str]) -> Any:
+        """Mask personal data in opaque aggregation output leaves by VALUE.
+
+        Recurses into every leaf of a subtree — `scripted_metric` `value`s,
+        `bucket_script` results, any container the structured walker left raw —
+        and masks string values by pattern (e-mail, IP, FQDN hostname, UUID) and
+        by the response's known-value registry. Existing tokens pass through
+        unchanged (idempotent). Non-personal values (category labels, counts,
+        dates) never match a pattern and stay verbatim.
+        """
+        if isinstance(obj, dict):
+            return {
+                key: self._deep_value_pass(value, registry)
+                for key, value in obj.items()
+            }
+        if isinstance(obj, list):
+            return [self._deep_value_pass(value, registry) for value in obj]
+        if isinstance(obj, str):
+            return self._deep_mask_string(obj, registry)
+        return obj
+
+    def _deep_mask_string(
+        self, value: str, registry: Mapping[str, str]
+    ) -> str:
+        """Mask one string leaf of an opaque aggregation output."""
+        if not value or _TOKEN_RE.fullmatch(value):
+            # Already a Klaxon token: idempotent passthrough (no double masking).
+            return value
+        # 1. Exact whole-value match in the response's value registry: the same
+        #    entity the `_source` pass tokenises. Catches opaque echoes of
+        #    hostnames/usernames/IPs/UUIDs without guessing at a pattern — and
+        #    handles bare usernames (root, marco) that no value regex could
+        #    recognise in isolation.
+        token = registry.get(value)
+        if token is not None:
+            return token
+        stripped = value.strip()
+        # 2. Whole-value patterns (the HOSTNAME-family pass for dotted hostnames
+        #    like "Supergrobi.intern.moenig.it", plus the existing e-mail/IP
+        #    passes and the new UUID/user-id pass).
+        if _EMAIL_RE.fullmatch(stripped):
+            return self._register(_EMAIL, stripped)
+        if _IPV4_RE.fullmatch(stripped) or _IPV6_RE.fullmatch(stripped):
+            return self._register(_IP, stripped)
+        if _FQDN_RE.fullmatch(stripped) and "://" not in stripped:
+            return self._register(HOST, stripped)
+        if _UUID_RE.fullmatch(stripped):
+            return self._register(USER, stripped)
+        # 3. Embedded identities inside opaque prose (word-boundary, common
+        #    words guarded) — the free-text username pass, extended to agg
+        #    outputs. Gated on mask_free_text_users like the free-text pass.
+        if self.config.mask_free_text_users:
+            return self._replace_known_identities(value, registry)
+        return value
 
     # ------------------------------------------------------------------ #
     # Free-text username masking (Gap 1)

@@ -160,6 +160,47 @@ def agg_size_capped_notice(capped: list[tuple[str, int]], effective: int) -> str
     )
 
 
+def unmappable_agg_dropped_notice(pairs: list[tuple[str, str]]) -> str:
+    """State that unmappable aggregations were stripped from the request.
+
+    The "drop" mode of `block_unmappable_aggs`: an aggregation whose output the
+    anonymizer cannot guarantee to mask (`scripted_metric`, any unknown type)
+    is removed from the request before it is executed, so the response cannot
+    carry its raw values. Like the size-cap notices, this one describes the
+    REQUEST rather than the response — staying silent would let the caller read
+    the stripped response as the whole answer.
+    """
+    names = "; ".join(f"{agg_type} ({name})" for name, agg_type in pairs)
+    return (
+        f"[UNMAPPABLE AGG DROPPED] Aggregation(s) whose output cannot be "
+        f"anonymised were removed from the request before it was sent: {names}. "
+        f"Their results are absent from this response. Rewrite the query without "
+        f"these aggregations, or raise the data-protection exception explicitly "
+        f"(anonymization.block_unmappable_aggs)."
+    )
+
+
+def unmappable_feature_dropped_notice(pairs: list[tuple[str, str]]) -> str:
+    """State that opaque request features were stripped from the request.
+
+    The "drop" mode of `block_unmappable_features`: a request section whose
+    output the anonymizer cannot guarantee to mask (`runtime_mappings`,
+    `script_fields`, `suggest`, `highlight`) is removed from the request before
+    it is executed, so the response cannot carry its raw values. Like the
+    size-cap notices, this one describes the REQUEST rather than the response —
+    staying silent would let the caller read the stripped response as the whole
+    answer.
+    """
+    names = "; ".join(name for name, _ in pairs)
+    return (
+        f"[UNMAPPABLE FEATURE DROPPED] Request feature(s) whose output cannot "
+        f"be anonymised were removed from the request before it was sent: "
+        f"{names}. Their results are absent from this response. Rewrite the "
+        f"query without these features, or raise the data-protection exception "
+        f"explicitly (anonymization.block_unmappable_features)."
+    )
+
+
 def _total(hits: Any) -> tuple[int | None, str | None]:
     """Extract (value, relation) from hits.total across both response shapes."""
     if not isinstance(hits, dict):
@@ -311,7 +352,8 @@ def search_notices(index: str, body: Any, response: Response) -> list[str]:
         detail = f" ({kind})" if kind else ""
         notices.append(
             f"[HTTP {response.status_code}]{detail} The indexer rejected the search "
-            f"against {index!r}. The unmodified error body is below."
+            f"against {index!r}. The error body can echo the query and is withheld "
+            f"from masked output."
         )
         if kind == "index_not_found_exception":
             notices.append(
@@ -325,6 +367,20 @@ def search_notices(index: str, body: Any, response: Response) -> list[str]:
     if not isinstance(parsed, dict):
         notices.append("[NON-JSON RESPONSE] The indexer returned a body that is not JSON.")
         return notices
+
+    # A 200 response can carry a failed shard: `_shards.failures` echoes the raw
+    # query (script source, field names, possibly values) and is opaque to the
+    # walker. The anonymization layer strips it from masked output; the notice
+    # states the count either way so a partial answer is never read as complete.
+    shards = parsed.get("_shards")
+    if isinstance(shards, dict) and isinstance(shards.get("failures"), list):
+        failed = [f for f in shards["failures"] if f]
+        if failed:
+            notices.append(
+                f"[SHARD FAILURES] {len(failed)} shard(s) failed; this response "
+                "is partial. Failure details echo the query and are withheld "
+                "from masked output."
+            )
 
     hits = parsed.get("hits")
     value, relation = _total(hits)
@@ -518,12 +574,18 @@ def render(
     *,
     summary: str | None = None,
     footer: str | None = None,
+    include_body: bool = True,
 ) -> str:
     """Assemble the final tool output: notices first, raw payload verbatim after.
 
     `summary` is a rendering placed above the raw payload, never instead of it —
     a table is easier to read than protobuf-shaped JSON, but it is an addition,
     and the caller still gets the untouched body underneath.
+
+    `include_body=False` withholds the payload (an error body can echo the raw
+    query and is opaque to the anonymization walker; the fail-closed reading
+    serves the notices and a marker, not the body). The caller's audit log still
+    carries the raw render separately.
     """
     parts: list[str] = []
     if notices:
@@ -534,7 +596,14 @@ def render(
         parts.append(summary)
         parts.append("")
     parts.append(f"{RAW_HEADER} (HTTP {response.status_code})")
-    parts.append(response.pretty())
+    if include_body:
+        parts.append(response.pretty())
+    else:
+        parts.append(
+            "[BODY WITHHELD] The response body was withheld by the anonymization "
+            "layer: an indexer error/shard-failure body can echo the raw query "
+            "values. The masked exchange is recorded in llm_prompts.log."
+        )
     if footer:
         parts.append("")
         parts.append(footer)

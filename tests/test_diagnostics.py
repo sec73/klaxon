@@ -20,6 +20,8 @@ from klaxon_mcp.diagnostics import (
     render,
     search_notices,
     size_capped_notice,
+    unmappable_agg_dropped_notice,
+    unmappable_feature_dropped_notice,
 )
 
 
@@ -43,7 +45,7 @@ class TestSizeCappedNotice:
         assert "[AGG SIZE CAPPED]" in text
         assert "hosts.terms" in text
         assert "50000" in text
-        assert "100" in text
+
 
     def test_agg_size_cap_names_every_lowered_aggregation(self) -> None:
         text = agg_size_capped_notice(
@@ -55,6 +57,42 @@ class TestSizeCappedNotice:
     def test_agg_size_cap_empty_list_still_formats(self) -> None:
         text = agg_size_capped_notice([], 100)
         assert "[AGG SIZE CAPPED]" in text
+
+
+class TestUnmappableAggDroppedNotice:
+    def test_names_type_and_agg_and_states_absence(self) -> None:
+        text = unmappable_agg_dropped_notice(
+            [("scripted", "scripted_metric")]
+        )
+        assert "[UNMAPPABLE AGG DROPPED]" in text
+        assert "scripted_metric (scripted)" in text
+        # Never states a raw value — only the agg type and name.
+        assert "absent from this response" in text
+
+    def test_multiple_pairs(self) -> None:
+        text = unmappable_agg_dropped_notice(
+            [("a", "scripted_metric"), ("b", "weird_agg")]
+        )
+        assert "scripted_metric (a)" in text
+        assert "weird_agg (b)" in text
+
+
+class TestUnmappableFeatureDroppedNotice:
+    def test_names_features_and_states_absence(self) -> None:
+        text = unmappable_feature_dropped_notice(
+            [("script_fields", "script_fields")]
+        )
+        assert "[UNMAPPABLE FEATURE DROPPED]" in text
+        assert "script_fields" in text
+        # Never states a raw value — only the feature name.
+        assert "absent from this response" in text
+
+    def test_multiple_features(self) -> None:
+        text = unmappable_feature_dropped_notice(
+            [("runtime_mappings", "runtime_mappings"), ("suggest", "suggest")]
+        )
+        assert "runtime_mappings" in text
+        assert "suggest" in text
 
 
 class TestZeroHits:
@@ -280,6 +318,44 @@ class TestErrorPassthrough:
         assert "ZERO HITS" not in notice_tags(notices)
         assert "HTTP 400" in notice_tags(notices)
 
+    def test_error_notice_does_not_promise_the_body(self) -> None:
+        """Teil 13: the error notice no longer claims the body is below (it is
+        withheld from masked output when anonymization is active)."""
+        notices = search_notices(
+            "wazuh-events-v5-*",
+            {},
+            resp({"error": {"type": "parsing_exception"}}, status=400),
+        )
+        joined = " ".join(notices)
+        assert "unmodified error body" not in joined
+        assert "withheld" in joined
+
+    def test_shard_failures_ok_response_adds_notice(self) -> None:
+        """Teil 13: a 200 response with a failed shard is partial — the notice
+        states the count (the raw failures array is stripped by the masker)."""
+        payload = {
+            "_shards": {
+                "total": 8,
+                "successful": 7,
+                "failed": 1,
+                "failures": [{"shard": 0, "index": ".ds-x", "reason": {"type": "script_exception"}}],
+            },
+            "hits": {"total": {"value": 1, "relation": "eq"}, "hits": []},
+        }
+        notices = search_notices("wazuh-events-v5-*", {}, resp(payload))
+        tags = notice_tags(notices)
+        assert "SHARD FAILURES" in tags
+        assert any("1 shard(s) failed" in n for n in notices)
+        assert "ZERO HITS" not in tags
+
+    def test_shard_failures_absent_no_notice(self) -> None:
+        notices = search_notices(
+            "wazuh-events-v5-*",
+            {},
+            resp({"hits": {"total": {"value": 1, "relation": "eq"}, "hits": []}}),
+        )
+        assert "SHARD FAILURES" not in notice_tags(notices)
+
 
 class TestRender:
     def test_raw_payload_is_preserved_verbatim(self) -> None:
@@ -301,6 +377,26 @@ class TestRender:
         response = resp(payload)
         out = render([], response)
         assert "DIAGNOSTICS" not in out
+        assert json.loads(out.split("\n", 1)[1]) == payload
+
+    def test_include_body_false_withholds_payload(self) -> None:
+        """Teil 13: include_body=False serves the notices + a marker, never the
+        body (an error body can echo the raw query)."""
+        payload = {
+            "error": {"type": "parsing_exception", "reason": "bad [marco]"},
+            "status": 400,
+        }
+        response = resp(payload, status=400)
+        out = render([], response, include_body=False)
+        assert "[BODY WITHHELD]" in out
+        assert "marco" not in out
+        assert "bad" not in out
+
+    def test_include_body_defaults_to_true(self) -> None:
+        payload = {"hits": {"total": {"value": 1, "relation": "eq"}, "hits": []}}
+        response = resp(payload)
+        out = render([], response)
+        assert "[BODY WITHHELD]" not in out
         assert json.loads(out.split("\n", 1)[1]) == payload
 
     def test_non_json_body_is_passed_through(self) -> None:

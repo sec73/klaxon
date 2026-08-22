@@ -25,7 +25,7 @@ from klaxon_mcp import posture, server
 from klaxon_mcp.clients import Response, TransportError
 from klaxon_mcp.config import AnonymizationConfig, Config
 from klaxon_mcp.masked_stream import fields_yaml_sha256
-from klaxon_mcp.tenants import load_tenant_config
+from klaxon_mcp.tenants import effective_free_text_fields, load_tenant_config
 
 TEST_SALT = "0123456789abcdef0123456789abcdef"
 # Exactly 64 hex chars = 256 bits (the recommended length).
@@ -83,6 +83,7 @@ class FakeIndexer:
         count: int = 0,
         reachable: bool = True,
         pii_in_roles: bool = False,
+        raw_roles_shape: bool = False,
     ) -> None:
         self.masked_streams = masked_streams
         self.quarantine_streams = quarantine_streams
@@ -91,6 +92,9 @@ class FakeIndexer:
         self.count = count
         self.reachable = reachable
         self.pii_in_roles = pii_in_roles
+        # When True, the roles API returns the roles as TOP-LEVEL keys (the
+        # real OpenSearch Security shape), not wrapped under a "roles" key.
+        self.raw_roles_shape = raw_roles_shape
 
     async def get(self, path: str, *, params: dict[str, Any] | None = None) -> Response:
         if not self.reachable:
@@ -124,6 +128,10 @@ class FakeIndexer:
                 }
             else:
                 bodies = {r: {} for r in self.roles}
+            if self.raw_roles_shape:
+                return Response(
+                    200, json.dumps(bodies), f"https://indexer.example{path}"
+                )
             return Response(
                 200, json.dumps({"roles": bodies}), f"https://indexer.example{path}"
             )
@@ -153,7 +161,7 @@ def matching_pipeline(cfg: Any) -> dict[str, Any]:
     meta = {
         "sha256": fields_yaml_sha256(cfg),
         "fields": list(cfg.all_masked_fields),
-        "free_text_fields": list(cfg.free_text_fields),
+        "free_text_fields": list(effective_free_text_fields(cfg)),
     }
     return {
         "description": "\nklaxon-provenance: " + json.dumps(meta),
@@ -201,7 +209,7 @@ class TestPostureChecks:
         # pipeline-drift check passes (response layer == pipeline field list).
         a = anon(
             mask_fields=tenant.all_masked_fields,
-            mask_free_text_fields=tenant.free_text_fields,
+            mask_free_text_fields=effective_free_text_fields(tenant),
             salt=SECRET_SALT,
         )
         fake = FakeIndexer(roles=set(ALL_ROLES), pipeline=matching_pipeline(tenant))
@@ -285,6 +293,36 @@ class TestPostureChecks:
         assert find(lines, "pipeline_drift").startswith("pipeline_drift: WARN")
         assert "not deployed" in find(lines, "pipeline_drift")
 
+    async def test_config_vs_fields_yaml_drift_reported_even_when_not_deployed(
+        self,
+    ) -> None:
+        """Teil 13: the single-source-of-truth drift (effective Klaxon
+        mask_fields vs the tenant's fields.yaml) is reported by the posture
+        check REGARDLESS of whether the Option B pipeline is deployed — an env
+        override drifting from fields.yaml is never silently masked by the
+        "not deployed" path."""
+        tenant = load_tenant_config("customer-a")
+        # Effective config masks only user.name; fields.yaml requires the full
+        # 19-field list -> drift. Pipeline not deployed.
+        a = anon(mask_fields=("user.name",))
+        fake = FakeIndexer(pipeline=None)
+        lines = await run_posture(fake, a=a, cfg=tenant)
+        line = find(lines, "pipeline_drift")
+        assert line.startswith("pipeline_drift: WARN")
+        assert "not deployed" in line
+        assert "mask_fields" in line
+        assert "fields.yaml" in line
+
+    async def test_config_matches_fields_yaml_when_not_deployed_no_drift(self) -> None:
+        tenant = load_tenant_config("customer-a")
+        a = anon(mask_fields=tenant.all_masked_fields)
+        fake = FakeIndexer(pipeline=None)
+        lines = await run_posture(fake, a=a, cfg=tenant)
+        line = find(lines, "pipeline_drift")
+        assert line.startswith("pipeline_drift: WARN")
+        assert "not deployed" in line
+        assert "mask_fields" not in line
+
     async def test_pipeline_drift_warns_on_fingerprint_mismatch(self) -> None:
         fake = FakeIndexer(pipeline={"description": "wrong provenance", "processors": []})
         lines = await run_posture(fake)
@@ -331,6 +369,18 @@ class TestPostureChecks:
         line = find(lines, "rbac")
         assert line.startswith("rbac: WARN")
         assert "klaxon_ops_customer-a missing" in line
+
+    async def test_rbac_parses_real_top_level_roles_shape(self) -> None:
+        """Teil 13: the real OpenSearch Security roles API returns the roles map
+        as TOP-LEVEL keys ({role_name: spec}), not wrapped under a "roles" key.
+        The posture check must parse it (was reporting "unknown")."""
+        lines = await run_posture(
+            FakeIndexer(roles=set(ALL_ROLES), raw_roles_shape=True)
+        )
+        line = find(lines, "rbac")
+        assert line.startswith("rbac: OK")
+        for role in ALL_ROLES:
+            assert f"{role} present" in line
 
     async def test_retention_reports_days(self) -> None:
         lines = await run_posture(FakeIndexer())

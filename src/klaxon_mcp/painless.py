@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .tenants import TenantConfig
+from .tenants import TenantConfig, effective_free_text_fields
 
 # Painless regex source strings. These are ALSO compiled by the Python reference
 # implementation (`pipeline_mask_doc`) so the pipeline logic is unit-testable
@@ -306,7 +306,11 @@ def _painless_script(cfg: TenantConfig) -> str:
     field_rows = ",\n    ".join(
         json.dumps(f.to_painless_row()) for f in cfg.fields
     )
-    free_text_rows = ", ".join(json.dumps(f) for f in cfg.free_text_fields)
+    # `message` is the built-in default free-text field and is ALWAYS present
+    # (never an empty FREE_TEXT list); `free_text_fields` adds extra fields.
+    free_text_rows = ", ".join(
+        json.dumps(f) for f in effective_free_text_fields(cfg)
+    )
 
     pattern_fns = "\n".join(
         f'Pattern {name}() {{ return /{_painless_regex(name)}/; }}'

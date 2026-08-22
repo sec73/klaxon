@@ -46,6 +46,11 @@ flowchart LR
     GEN -.deploy.-> PIP[klaxon-mask-&lt;tenant&gt;]
 ```
 
+> **LLM/report usage.** The masked stream `klaxon-masked-<tenant>-v5*` is the
+> **only** source for LLM/report queries — see
+> [docs/llm-safety.md](llm-safety.md) for the masked-stream-first routing rules
+> and a ready-to-copy system-prompt section. The raw streams are forensics-only.
+
 ## Single source of truth: `fields.yaml`
 
 `tenants/<tenant>/fields.yaml` is where the masking field list lives **exactly
