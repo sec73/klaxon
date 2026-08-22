@@ -103,7 +103,7 @@ withheld, rare_terms mapped, RBAC posture fix
   aggregation type) is served with an OPAQUE output the response walker cannot
   map: its script can read ANY document field and the emitted values reach the
   consumer RAW while the same values are tokenised everywhere else (live leak:
-  `wazuh.agent.host.hostname` → `Supergrobi.intern.moenig.it` ×80 in
+  `wazuh.agent.host.hostname` → `Supergrobi.intern.lab.local` ×80 in
   `scripted_metric` output; `related.user` → `root`/`marco`/UUID in findings).
   New `anonymization.block_unmappable_aggs` (env
   `KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS`, default `block` — the strictest
@@ -119,7 +119,7 @@ withheld, rare_terms mapped, RBAC posture fix
   every OPAQUE aggregation that is served) recurses into ALL leaves of opaque
   outputs (`scripted_metric.value`, `bucket_script` results) and masks string
   values by VALUE pattern — the new HOSTNAME-family pass for dotted hostnames
-  (`Supergrobi.intern.moenig.it` → `[HOST_…]`), a new UUID/user-id pass, plus
+  (`Supergrobi.intern.lab.local` → `[HOST_…]`), a new UUID/user-id pass, plus
   the existing e-mail/IP passes — and by the response's known-value registry
   (an opaque echo of a `_source` username/hostname reuses the exact `_source`
   token; existing tokens pass through idempotently; non-personal free text like
