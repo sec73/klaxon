@@ -10,6 +10,60 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Security — Teil 13 full audit: opaque request features blocked, error bodies
+withheld, rare_terms mapped, RBAC posture fix
+
+- **Fail-closed gate on the other opaque request features —
+  `anonymization.block_unmappable_features` (env
+  `KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_FEATURES`, default `block`).** A
+  `runtime_mappings` field can copy a masked field under a NEW name and be
+  aggregated on, `script_fields` is arbitrary code (like `scripted_metric`),
+  `suggest` returns raw field text, and `highlight` embeds raw source text —
+  the response walker cannot guarantee to mask any of them (live proof:
+  `_source.user.name` masked but `fields.who` leaked `root`; `suggest.text`
+  echoed `root`; a bare username leaked inside an `<em>`-wrapped highlight
+  snippet). `server.search` now detects these top-level request keys via
+  `find_unmappable_features` and either `block` (reject the request, naming
+  the feature), `drop` (strip the top-level section before it runs, with an
+  `[UNMAPPABLE FEATURE DROPPED]` notice) or `off` (serve them with only the
+  response-side deep value pass as a net — an explicit, documented
+  data-protection exception). Enforced request-side in code, like
+  `block_unmappable_aggs`.
+- **Response-side defense-in-depth for the opaque subtrees** (`suggest`,
+  per-hit `highlight` and `fields`): the walker now serves them through the
+  deep value pass — `highlight`/`fields` reuse the DOCUMENT's own tokens
+  (built from its raw `_source`, so a `script_fields` alias or snippet echo of
+  a structured value maps to the exact `_source` token), the top-level
+  `suggest` uses a response-wide registry. Existing tokens pass through
+  idempotent.
+- **Error bodies and shard failures are no longer served raw.** An indexer
+  error body (400/429/500) can echo the raw query (script source, field names,
+  values) and is opaque to the walker; with anonymization active the served
+  output carries the notices plus a `[BODY WITHHELD]` marker instead of the
+  body (the raw render still reaches the audit log when RAW logging is on). A
+  200 response with a failed shard gets a `[SHARD FAILURES]` notice and the
+  raw `_shards.failures` array (which echoes the query) is stripped from the
+  masked body. `diagnostics.render` gained `include_body=`.
+- **`rare_terms` mapped** (was blocked as unmappable): it is a field-mapped
+  family like `terms` — its bucket `key` AND `key_as_string` are now tokenised
+  (recognised in `_agg_body_spec`, added to the known-safe allowlist and the
+  `key_as_string` rebuild). Pipeline aggs (`bucket_script`, `bucket_selector`,
+  `bucket_sort`) and `ip_range`/`geohash`/`geotile` remain fail-closed BLOCKED
+  (their keys are personal IP ranges / coordinates, or their output is opaque).
+- **Posture `rbac` check fixed**: the OpenSearch Security roles API serves the
+  roles map as TOP-LEVEL keys (`{role_name: spec}`), not under a `roles` key —
+  the check now parses both shapes (live-verified: `rbac: OK —
+  klaxon_llm_report_customer-a grants: klaxon-masked-customer-a-v5*` only).
+  `pipeline_drift` now also reports the effective-config-vs-fields.yaml drift
+  when the Option B pipeline is NOT deployed.
+- **Tests**: +54 offline (find_unmappable_features, rare_terms key/key_as_string,
+  deep-pass on suggest/highlight/fields, shard-failure strip, feature-gate
+  block/drop/off end-to-end, error-body withholding, RBAC llm-report-never-raw,
+  posture real-roles-shape + not-deployed drift) and +2 live (script_fields /
+  suggest queries rejected against the raw streams). Full gate green: 1078
+  offline + 10 live tests, mypy strict clean, ruff at baseline, golden
+  byte-identical, `generate --check` OK.
+
 ### Added
 
 - **`klaxon masking teardown --tenant <tenant>` — cleanly remove the Option B

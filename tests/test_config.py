@@ -53,6 +53,7 @@ KLAXON_VARS = (
     "KLAXON_ANONYMIZATION_MASKED_STREAMS",
     "KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS",
     "KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS",
+    "KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_FEATURES",
     "KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS",
     "KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS",
     "KLAXON_ANONYMIZATION_WHITELIST_ENABLED",
@@ -455,6 +456,66 @@ class TestBlockUnmappableAggs:
         monkeypatch.setenv("KLAXON_CONFIG", str(path))
         monkeypatch.setenv("KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS", "off")
         assert AnonymizationConfig.from_env().block_unmappable_aggs == "off"
+
+
+class TestBlockUnmappableFeatures:
+    """Teil 13: the fail-closed gate on opaque request features
+    (runtime_mappings / script_fields / suggest / highlight) defaults to the
+    strictest behaviour (block); permissive modes are explicit opt-in only — a
+    typo refuses to start rather than silently serving raw."""
+
+    def test_defaults_to_block(self) -> None:
+        assert AnonymizationConfig.from_env().block_unmappable_features == "block"
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("block", "block"),
+            ("true", "block"),
+            ("1", "block"),
+            ("yes", "block"),
+            ("drop", "drop"),
+            ("off", "off"),
+            ("false", "off"),
+            ("0", "off"),
+            ("no", "off"),
+            ("allow", "off"),
+        ],
+    )
+    def test_env_parsing(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+    ) -> None:
+        monkeypatch.setenv(
+            "KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_FEATURES", raw
+        )
+        assert AnonymizationConfig.from_env().block_unmappable_features == expected
+
+    @pytest.mark.parametrize("bad", ["blok", "maybe", "truefalse", "block-drop"])
+    def test_invalid_value_raises(
+        self, monkeypatch: pytest.MonkeyPatch, bad: str
+    ) -> None:
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_FEATURES", bad)
+        with pytest.raises(ConfigError):
+            AnonymizationConfig.from_env()
+
+    def test_yaml_block(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "anonymization:\n  block_unmappable_features: drop\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        assert AnonymizationConfig.from_env().block_unmappable_features == "drop"
+
+    def test_env_beats_yaml(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "anonymization:\n  block_unmappable_features: drop\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("KLAXON_CONFIG", str(path))
+        monkeypatch.setenv("KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_FEATURES", "off")
+        assert AnonymizationConfig.from_env().block_unmappable_features == "off"
 
 
 class TestAnonymizationYaml:

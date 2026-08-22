@@ -34,20 +34,44 @@ so a lowered bucket count is never read as the real one.
 
 **Fail-closed gate on unmappable aggregations (default).** When anonymization
 is active, a request whose aggregation types the response walker cannot map —
-`scripted_metric`, `bucket_script`, any unknown/unhandled type — is REJECTED
-before it reaches the indexer, with a clear error naming the aggregation type
-("don't serve what you can't guarantee"): a `scripted_metric` script can read
-ANY document field and its opaque output reaches the consumer RAW while the
-same values are tokenised everywhere else. This is an active security control
-enforced in code (`anonymization.block_unmappable_aggs`, default `block`), not
-a config default someone must trust. `drop` strips the offending aggregations
-from the request (an `[UNMAPPABLE AGG DROPPED]` notice says so); `off` serves
-them with only the deep value pass as a safety net — both are explicit,
-documented data-protection exceptions.
+`scripted_metric`, `bucket_script`/`bucket_selector`/`bucket_sort` (pipeline
+aggs), `ip_range`, `geohash`/`geotile`, any unknown/unhandled type — is
+REJECTED before it reaches the indexer, with a clear error naming the
+aggregation type ("don't serve what you can't guarantee"): a `scripted_metric`
+script can read ANY document field and its opaque output reaches the consumer
+RAW while the same values are tokenised everywhere else. (`ip_range` keys are
+IP ranges and geo keys are coordinates — personal — so they stay blocked; only
+date/histogram/range labels are structurally safe.) This is an active security
+control enforced in code (`anonymization.block_unmappable_aggs`, default
+`block`), not a config default someone must trust. `drop` strips the offending
+aggregations from the request (an `[UNMAPPABLE AGG DROPPED]` notice says so);
+`off` serves them with only the deep value pass as a safety net — both are
+explicit, documented data-protection exceptions.
+
+**Fail-closed gate on opaque request features (default).** The same threat
+class outside the `aggs` tree: `runtime_mappings` (a runtime field can copy a
+masked field under a NEW name and be aggregated on), `script_fields` (arbitrary
+code, like `scripted_metric`), `suggest` (term/phrase/completion return raw
+field text) and `highlight` (snippets embed raw source text incl. bare
+usernames) are REJECTED before the request reaches the indexer, naming the
+feature (`anonymization.block_unmappable_features`, default `block`). `drop`
+strips the top-level section (an `[UNMAPPABLE FEATURE DROPPED]` notice says
+so); `off` serves it with only the response-side deep value pass (the
+`highlight`/`fields` subtrees reuse the document's own tokens, so a script
+field alias echoes the exact `_source` token) — explicit, documented
+data-protection exceptions.
+
+**Error bodies and shard failures are withheld from masked output.** When
+anonymization is active, an indexer error body (non-2xx) is served as the
+notices plus a `[BODY WITHHELD]` marker — an error body can echo the raw query
+(script source, field names, values) and is opaque to the walker (the raw
+render still reaches the audit log when RAW logging is on). A 200 response with
+a failed shard gets a `[SHARD FAILURES]` notice and the raw
+`_shards.failures` array is stripped from the masked body.
 
 Diagnostics emitted: zero hits, total-hits cap, partial aggregation coverage,
 empty aggregations, legacy 4.x index patterns, size cap, aggregation size cap,
-unmappable-agg drop.
+unmappable-agg drop, unmappable-feature drop, shard failures, body withheld.
 
 **Automatic safety banner.** Every response is prefixed — **before** any other
 diagnostics line — with `[UNMASKED MODE]` and/or `[RAW STREAM QUERY]` whenever
@@ -296,6 +320,7 @@ the settings and what the gate does.
 | masked fields | `KLAXON_ANONYMIZATION_MASK_FIELDS` | `mask_fields` | see below |
 | aggregation key masking | `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS` | `mask_aggregation_keys` | `true` (fail-closed) |
 | block unmappable aggs | `KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS` | `block_unmappable_aggs` | `block` (reject; `drop`/`off` opt-in) |
+| block opaque request features | `KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_FEATURES` | `block_unmappable_features` | `block` (reject; `drop`/`off` opt-in) |
 | free-text username masking | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS` | `mask_free_text_users` | `true` |
 | extra free-text fields | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS` | `mask_free_text_fields` | empty (hint pattern) |
 | block on residual PII | `KLAXON_ANONYMIZATION_WHITELIST_ENABLED` | `whitelist_enabled` | `true` |
@@ -324,8 +349,9 @@ masking pass a `terms` agg on `related.hosts` returns raw hostnames even when
 `_source` is clean. With `mask_aggregation_keys` on (**on by default**,
 fail-closed; `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS=false` restores raw
 keys), the `search` response walker tokenises the `key` of `terms` / `significant_terms` /
-`significant_text` / `multi_terms` / `composite` buckets whose source field is
-in `mask_fields`, using the same deterministic tokens as `_source`. The walker
+`significant_text` / `rare_terms` / `multi_terms` / `composite` buckets whose
+source field is in `mask_fields`, using the same deterministic tokens as
+`_source` (`rare_terms` added in the Teil-13 audit). The walker
 descends through the request-built aggregation hierarchy, so NESTED
 sub-aggregations — which OpenSearch serves directly inside each bucket, as
 siblings of `key`/`doc_count` — have their keys tokenised at every depth with
@@ -348,7 +374,12 @@ e-mails and IPs — plus a known-value registry built from the response's own
 `_source`, so an opaque echo of a username/hostname reuses the exact `_source`
 token. Existing tokens pass through unchanged (idempotent); non-personal free
 text (e.g. `category` labels) is untouched. This is defense-in-depth, not a
-replacement for the fail-closed block.
+replacement for the fail-closed block. The same deep pass serves the OTHER
+opaque subtrees when they are served (`block_unmappable_features=off`): the
+`fields`/`highlight` blocks of each hit reuse the DOCUMENT's own `_source`
+tokens (so a `script_fields` alias like `fields.who` echoes the exact
+`[USER_…]` token of `user.name`), and a top-level `suggest` uses a
+response-wide registry.
 
 **Free-text usernames.** A `message` line can name a user without the structured
 `user.name` being present (`uid=marcomoenig,ou=users,dc=sec73,dc=io`,

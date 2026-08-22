@@ -790,6 +790,12 @@ def test_roles_fragment_least_privilege(cfg: Any) -> None:
     assert cfg.masked_stream_pattern in llm_block
     assert cfg.quarantine_stream_pattern not in llm_block
     assert "klaxon-quarantine" not in llm_block
+    # Teil 13: the LLM-facing role must NEVER grant direct read on the raw
+    # streams (wazuh-events-v5-*/wazuh-findings-v5-*) — a consumer with this
+    # role could bypass Klaxon's masking entirely.
+    assert cfg.raw_stream not in llm_block
+    assert "wazuh-events" not in llm_block
+    assert "wazuh-findings" not in llm_block
     # Ops/security role: read on quarantine + raw events, no LLM mapping.
     ops = "klaxon_ops_test-a:"
     assert ops in roles

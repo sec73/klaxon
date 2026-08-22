@@ -88,7 +88,8 @@ See [security-model.md](security-model.md) for how the tokens work and
 | `KLAXON_ANONYMIZATION_USE_HASH` | `true` | `false` ⇒ generic labels (`[USERNAME]`, `[IP_ADDRESS]`, …) instead of keyed tokens |
 | `KLAXON_ANONYMIZATION_MASK_FIELDS` | built-in list | Fields masked wholesale (`source.ip`, `user.name`, `user.effective.name`, `host.hostname`, `wazuh.agent.*`, …). Comma-separated |
 | `KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS` | `true` | Mask aggregation bucket keys (terms/composite/…) with the same tokens as `_source`. ON by default (fail-closed); `false` restores raw keys |
-| `KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS` | `block` | Fail-closed gate on aggregation types the walker cannot map (`scripted_metric`, unknown types): `block` rejects the request (default, strictest), `drop` strips the offending aggregations, `off` serves them with only the deep value pass (a data-protection exception). Accepts boolean spellings (`true`→`block`, `false`→`off`) |
+| `KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS` | `block` | Fail-closed gate on aggregation types the walker cannot map (`scripted_metric`, pipeline aggs like `bucket_script`/`bucket_selector`/`bucket_sort`, `ip_range`, `geohash`/`geotile`, unknown types): `block` rejects the request (default, strictest), `drop` strips the offending aggregations, `off` serves them with only the deep value pass (a data-protection exception). Accepts boolean spellings (`true`→`block`, `false`→`off`) |
+| `KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_FEATURES` | `block` | Fail-closed gate on the other opaque request features — `runtime_mappings` (a runtime field can copy a masked field under a NEW name and be aggregated on), `script_fields` (arbitrary code), `suggest` (raw field text), `highlight` (raw source snippets): `block` rejects the request (default, strictest), `drop` strips the top-level section, `off` serves it with only the response-side deep value pass (a data-protection exception). Accepts boolean spellings (`true`→`block`, `false`→`off`) |
 | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS` | `true` | Mask usernames inside free-text fields using known identities + context patterns |
 | `KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS` | empty | Extra free-text fields that get the free-text username pass (beyond the built-in hint pattern) |
 | `KLAXON_ANONYMIZATION_MASKED_STREAMS` | empty | Data streams already masked at ingest (Option B); their values pass through unchanged (idempotent). The pattern is `klaxon-masked-<tenant>-v5*` (the stream is named `...-v5`, no trailing dash — `...-v5-*` matches nothing). A pattern that could match the quarantine stream (`klaxon-quarantine-<tenant>-v5-*`, RAW masking failures) is refused — Klaxon fails to start |
@@ -139,6 +140,7 @@ anonymization:
     - "wazuh.agent.id"
   mask_aggregation_keys: true  # KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS
   block_unmappable_aggs: block # KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS (block|drop|off)
+  block_unmappable_features: block # KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_FEATURES (block|drop|off)
   mask_free_text_users: true   # KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS
   mask_free_text_fields:       # KLAXON_ANONYMIZATION_MASK_FREE_TEXT_FIELDS
     - "message"

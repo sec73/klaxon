@@ -384,3 +384,81 @@ async def test_live_scripted_metric_query_is_rejected(
         server_mod._indexer = previous_indexer
         server_mod._config = previous_config
         server_mod._anonymizer = previous_anon
+
+
+# --------------------------------------------------------------------------- #
+# Teil 13 — live probe: opaque request features are REJECTED (fail-closed)
+# --------------------------------------------------------------------------- #
+
+# The exact Teil-13 finding: script_fields is arbitrary code (like
+# scripted_metric) and a raw username leaks under an unmapped `fields.<name>`
+# key while `_source.user.name` is tokenised. `block_unmappable_features`
+# (default) must REJECT the request before it reaches the indexer.
+SCRIPT_FIELDS_LIVE_BODY: dict[str, Any] = {
+    "size": 1,
+    "query": {"bool": {"filter": [_WINDOW]}},
+    "script_fields": {
+        "who": {"script": {"source": "params._source.user.name;"}}
+    },
+}
+
+
+async def test_live_script_fields_query_is_rejected(
+    live_config: tuple[live_test.LiveIndexerConfig, Any],
+) -> None:
+    """Teil 13 PRIMARY acceptance: the script_fields finding query is REJECTED
+    by the request-side fail-closed `block_unmappable_features` gate (a raw
+    username would otherwise leak under the `fields.who` alias)."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from klaxon_mcp import server as server_mod
+
+    live, cfg = live_config
+    previous_indexer = server_mod._indexer
+    previous_config = server_mod._config
+    previous_anon = server_mod._anonymizer
+    try:
+        server_mod._config = _server_config_for(live, cfg)
+        server_mod._anonymizer = None
+        server_mod._indexer = None
+        with pytest.raises(ToolError, match="script_fields"):
+            await server_mod.search(
+                index="wazuh-events-v5-*", body=json.dumps(SCRIPT_FIELDS_LIVE_BODY)
+            )
+        # The gate fires BEFORE any indexer request — nothing was sent.
+        assert server_mod._indexer is None
+    finally:
+        server_mod._indexer = previous_indexer
+        server_mod._config = previous_config
+        server_mod._anonymizer = previous_anon
+
+
+async def test_live_suggest_query_is_rejected(
+    live_config: tuple[live_test.LiveIndexerConfig, Any],
+) -> None:
+    """Teil 13: a term/phrase/completion suggester returns raw field text; the
+    fail-closed `block_unmappable_features` gate rejects it."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from klaxon_mcp import server as server_mod
+
+    live, cfg = live_config
+    previous_indexer = server_mod._indexer
+    previous_config = server_mod._config
+    previous_anon = server_mod._anonymizer
+    try:
+        server_mod._config = _server_config_for(live, cfg)
+        server_mod._anonymizer = None
+        server_mod._indexer = None
+        body: dict[str, Any] = {
+            "size": 0,
+            "query": {"bool": {"filter": [_WINDOW]}},
+            "suggest": {"u": {"text": "root", "term": {"field": "user.name"}}},
+        }
+        with pytest.raises(ToolError, match="suggest"):
+            await server_mod.search(index="wazuh-events-v5-*", body=json.dumps(body))
+        assert server_mod._indexer is None
+    finally:
+        server_mod._indexer = previous_indexer
+        server_mod._config = previous_config
+        server_mod._anonymizer = previous_anon

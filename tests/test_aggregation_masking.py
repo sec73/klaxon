@@ -42,6 +42,7 @@ def config_with(
     enabled: bool,
     mask_agg_keys: bool,
     block_unmappable: str = "block",
+    block_unmappable_features: str = "block",
     mask_free_text_users: bool = True,
 ) -> Config:
     return Config(
@@ -63,6 +64,7 @@ def config_with(
             enabled=enabled,
             mask_aggregation_keys=mask_agg_keys,
             block_unmappable_aggs=block_unmappable,
+            block_unmappable_features=block_unmappable_features,
             mask_free_text_users=mask_free_text_users,
             mask_fields=(
                 "source.ip",
@@ -97,13 +99,20 @@ PAYLOAD: dict[str, Any] = {
 
 
 class RecordingIndexer:
-    def __init__(self, payload: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        payload: dict[str, Any] | None = None,
+        status: int = 200,
+    ) -> None:
         self.payload = payload if payload is not None else PAYLOAD
+        self.status = status
         self.last_body: Any = None
 
     async def post(self, path: str, body: Any = None) -> Response:
         self.last_body = body
-        return Response(200, json.dumps(self.payload), f"https://indexer.example{path}")
+        return Response(
+            self.status, json.dumps(self.payload), f"https://indexer.example{path}"
+        )
 
 
 @pytest.fixture
@@ -118,17 +127,20 @@ def run_search() -> Iterator[Any]:
         mask_agg_keys: bool,
         payload: dict[str, Any] | None = None,
         block_unmappable: str = "block",
+        block_unmappable_features: str = "block",
         mask_free_text_users: bool = True,
+        status: int = 200,
     ) -> None:
         server._config = config_with(
             enabled=enabled,
             mask_agg_keys=mask_agg_keys,
             block_unmappable=block_unmappable,
+            block_unmappable_features=block_unmappable_features,
             mask_free_text_users=mask_free_text_users,
         )
         # Rebuild the cached anonymizer from the config above.
         server._anonymizer = None  # type: ignore[assignment]
-        server._indexer = RecordingIndexer(payload)  # type: ignore[assignment]
+        server._indexer = RecordingIndexer(payload, status)  # type: ignore[assignment]
 
     install(True, True)
     try:
@@ -533,3 +545,190 @@ class TestSearchDeepValuePass:
         assert ph("IP", "192.168.1.10") in out
         # Unmasked free text (category) is untouched.
         assert "system-activity" in out
+
+
+# --------------------------------------------------------------------------- #
+# Teil 13 — fail-closed gate on opaque request features + error-body withholding
+# --------------------------------------------------------------------------- #
+
+RUNTIME_MAPPINGS_BODY: dict[str, Any] = {
+    "size": 0,
+    "runtime_mappings": {
+        "rt_user": {"type": "keyword", "script": {"source": "emit(doc['user.name'].value)"}}
+    },
+    "aggs": {"by_rt_user": {"terms": {"field": "rt_user"}}},
+}
+
+SCRIPT_FIELDS_BODY: dict[str, Any] = {
+    "size": 1,
+    "script_fields": {"who": {"script": {"source": "params._source.user.name;"}}},
+}
+
+SUGGEST_BODY: dict[str, Any] = {
+    "size": 0,
+    "suggest": {"u": {"text": "root", "term": {"field": "user.name"}}},
+}
+
+HIGHLIGHT_BODY: dict[str, Any] = {
+    "size": 1,
+    "highlight": {"fields": {"message": {"fragment_size": 80}}},
+}
+
+
+class TestSearchFailClosedUnmappableFeatures:
+    """Teil 13: `block_unmappable_features` is an ACTIVE security control — a
+    request carrying runtime_mappings / script_fields / suggest / highlight is
+    rejected BEFORE it reaches the indexer (fail-closed), "drop" strips the
+    section, "off" serves it with only the response-side deep value pass."""
+
+    async def test_script_fields_rejected_by_default(
+        self, run_search: Any
+    ) -> None:
+        run_search(True, True)
+        indexer = server._indexer
+        assert indexer is not None and isinstance(indexer, RecordingIndexer)
+        with pytest.raises(ToolError, match="script_fields"):
+            await run(SCRIPT_FIELDS_BODY)
+        assert indexer.last_body is None  # request-side gate: never executed
+
+    async def test_runtime_mappings_rejected_by_default(
+        self, run_search: Any
+    ) -> None:
+        run_search(True, True)
+        with pytest.raises(ToolError, match="runtime_mappings"):
+            await run(RUNTIME_MAPPINGS_BODY)
+
+    async def test_suggest_rejected_by_default(self, run_search: Any) -> None:
+        run_search(True, True)
+        with pytest.raises(ToolError, match="suggest"):
+            await run(SUGGEST_BODY)
+
+    async def test_highlight_rejected_by_default(self, run_search: Any) -> None:
+        run_search(True, True)
+        with pytest.raises(ToolError, match="highlight"):
+            await run(HIGHLIGHT_BODY)
+
+    async def test_safe_request_still_served(self, run_search: Any) -> None:
+        run_search(True, True)
+        out = await run(
+            {"size": 0, "aggs": {"hosts": {"terms": {"field": "related.hosts"}}}}
+        )
+        assert ph("HOST", "nc02web") in out
+
+    async def test_block_does_not_fire_when_anonymization_inactive(
+        self, run_search: Any
+    ) -> None:
+        """A local/disabled anonymizer has no masking guarantee to enforce."""
+        run_search(False, True)
+        indexer = server._indexer
+        assert indexer is not None and isinstance(indexer, RecordingIndexer)
+        out = await run(SCRIPT_FIELDS_BODY)
+        # Served through to the indexer (no 4xx from the Klaxon gate); the
+        # stub returns its fixed payload unmasked.
+        assert "script_fields" in json.dumps(indexer.last_body)
+        assert "nc02web" in out
+
+    async def test_drop_mode_strips_the_feature(self, run_search: Any) -> None:
+        """"drop": the offending top-level section is removed from the request
+        before it is executed; a notice says so; safe keys remain."""
+        run_search(True, True, block_unmappable_features="drop")
+        indexer = server._indexer
+        assert indexer is not None and isinstance(indexer, RecordingIndexer)
+        body = {
+            "size": 0,
+            "script_fields": {"who": {"script": {"source": "1"}}},
+            "aggs": {"hosts": {"terms": {"field": "related.hosts"}}},
+        }
+        out = await run(body)
+        assert "[UNMAPPABLE FEATURE DROPPED]" in out
+        assert indexer.last_body is not None
+        assert "script_fields" not in json.dumps(indexer.last_body)
+        assert "hosts" in indexer.last_body.get("aggs", {})
+
+    async def test_off_mode_serves_with_deep_value_pass(self, run_search: Any) -> None:
+        """Explicit "off": the feature is served, and the response-side deep
+        value pass masks the raw echoes (fields alias under a new name)."""
+        payload = {
+            "hits": {
+                "total": {"value": 1, "relation": "eq"},
+                "hits": [
+                    {
+                        "_source": {"user": {"name": "marco"}},
+                        "fields": {"who": ["marco"]},
+                    }
+                ],
+            }
+        }
+        run_search(True, True, payload, block_unmappable_features="off")
+        out = await run(SCRIPT_FIELDS_BODY)
+        assert "marco" not in out
+        assert ph("USER", "marco") in out
+
+
+class TestSearchErrorBodyWithheld:
+    """Teil 13: an indexer error body can echo the raw query and is opaque to
+    the walker — with anonymization active it is withheld from the served
+    output (fail-closed), while the notice still names status/type."""
+
+    async def test_error_body_withheld_when_active(self, run_search: Any) -> None:
+        payload = {
+            "error": {
+                "type": "parsing_exception",
+                "reason": "failed to parse field [marco] for type [keyword]",
+            },
+            "status": 400,
+        }
+        run_search(True, True, payload, status=400)
+        out = await run({"size": 0})
+        assert "HTTP 400" in out
+        assert "[BODY WITHHELD]" in out
+        assert "marco" not in out
+        assert "parsing_exception" in out  # type is an enumeration, safe
+
+    async def test_error_body_passed_through_when_inactive(
+        self, run_search: Any
+    ) -> None:
+        payload = {
+            "error": {"type": "parsing_exception", "reason": "bad [marco]"},
+            "status": 400,
+        }
+        run_search(False, True, payload, status=400)
+        out = await run({"size": 0})
+        assert "marco" in out  # operator chose unmasked mode: body passes through
+
+    async def test_ok_response_body_not_withheld(self, run_search: Any) -> None:
+        run_search(True, True)
+        out = await run(
+            {"size": 0, "aggs": {"hosts": {"terms": {"field": "related.hosts"}}}}
+        )
+        assert "[BODY WITHHELD]" not in out
+        assert ph("HOST", "nc02web") in out
+
+    async def test_shard_failures_notice_and_stripped_body(
+        self, run_search: Any
+    ) -> None:
+        """A 200 response with a failed shard: the notice names the count and
+        the raw `failures` array (which echoes the query) is stripped."""
+        payload = {
+            "_shards": {
+                "total": 8,
+                "successful": 7,
+                "failed": 1,
+                "failures": [
+                    {
+                        "shard": 0,
+                        "index": ".ds-x-000001",
+                        "reason": {
+                            "type": "script_exception",
+                            "script": "params._source.user.name;",
+                        },
+                    }
+                ],
+            },
+            "hits": {"total": {"value": 1, "relation": "eq"}, "hits": []},
+        }
+        run_search(True, True, payload)
+        out = await run({"size": 0})
+        assert "[SHARD FAILURES]" in out
+        assert "params._source" not in out
+        assert "failures" not in out

@@ -177,6 +177,22 @@ async def _get_deployed_pipeline(
     return "ok", parsed.get(cfg.pipeline_name)
 
 
+def _config_fields_drift(cfg: TenantConfig, config: Config) -> list[str]:
+    """Effective Klaxon `mask_fields` (env/YAML) vs fields.yaml — single source
+    of truth. Reported by the posture check REGARDLESS of whether the Option B
+    pipeline is deployed, so an env override drifting from the tenant's
+    fields.yaml is never silently masked by the "not deployed" path."""
+    problems: list[str] = []
+    structured_expected = set(cfg.all_masked_fields)
+    klaxon_structured = set(config.anonymization.mask_fields)
+    if klaxon_structured != structured_expected:
+        problems.append(
+            f"effective Klaxon config mask_fields {sorted(klaxon_structured)} "
+            f"do not match fields.yaml {sorted(structured_expected)}"
+        )
+    return problems
+
+
 async def _pipeline_drift_line(
     client: IndexerClient, cfg: TenantConfig, config: Config
 ) -> str:
@@ -186,6 +202,7 @@ async def _pipeline_drift_line(
             f"pipeline_drift: WARN — generated artifacts drifted from fields.yaml: "
             f"{'; '.join(generated)} (source: check_artifacts)"
         )
+    config_drift = _config_fields_drift(cfg, config)
     state, payload = await _get_deployed_pipeline(client, cfg)
     if state == "unknown":
         return (
@@ -193,11 +210,14 @@ async def _pipeline_drift_line(
             f"(source: GET /_ingest/pipeline/{cfg.pipeline_name})"
         )
     if state == "not_deployed":
-        return (
+        base = (
             f"pipeline_drift: WARN — pipeline {cfg.pipeline_name} is not deployed "
             f"(Option B not deployed); fingerprint check not applicable "
             f"(source: GET /_ingest/pipeline/{cfg.pipeline_name})"
         )
+        if config_drift:
+            return base + "; " + "; ".join(config_drift)
+        return base
     deployed: dict[str, Any] = payload if isinstance(payload, dict) else {}
     problems = preflight_report(cfg, deployed, config)
     if problems:
@@ -312,7 +332,15 @@ async def _rbac_line(client: IndexerClient, cfg: TenantConfig) -> str:
             f"(source: GET {endpoint})"
         )
     parsed = resp.json()
-    actual = parsed.get("roles") if isinstance(parsed, dict) else None
+    actual = None
+    if isinstance(parsed, dict):
+        # OpenSearch Security serves the roles map DIRECTLY as the response
+        # object ({role_name: spec, ...}); some proxies/gateways wrap it under a
+        # "roles" key. Accept both — a dict whose values are role specs.
+        if isinstance(parsed.get("roles"), dict):
+            actual = parsed["roles"]
+        elif parsed and all(isinstance(v, dict) for v in parsed.values()):
+            actual = parsed
     if not isinstance(actual, dict):
         return f"rbac: unknown — roles API response has no roles map (source: GET {endpoint})"
 

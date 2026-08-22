@@ -34,7 +34,9 @@ from klaxon_mcp.anonymization import (
     USER,
     Anonymizer,
     drop_unmappable_aggs,
+    drop_unmappable_features,
     find_unmappable_aggs,
+    find_unmappable_features,
     parse_agg_fields,
 )
 from klaxon_mcp.clients import Response
@@ -2176,6 +2178,105 @@ class TestFindUnmappableAggs:
         assert drop_unmappable_aggs(body, {"nope"})["aggs"] == body["aggs"]
 
 
+class TestFindUnmappableFeatures:
+    """Teil 13: request features whose response output the walker cannot map.
+
+    `runtime_mappings` (a runtime field can copy a masked field under a NEW name
+    and be aggregated on), `script_fields` (arbitrary code, like
+    scripted_metric), `suggest` (returns raw field text) and `highlight`
+    (snippets embed raw source text) are opaque to the response walker.
+    `find_unmappable_features` detects them so `server.search` can reject
+    (default) or drop the request.
+    """
+
+    def test_all_four_features_detected(self) -> None:
+        body = {
+            "runtime_mappings": {"rt": {}},
+            "script_fields": {"who": {}},
+            "suggest": {"u": {}},
+            "highlight": {"fields": {}},
+            "size": 0,
+        }
+        assert find_unmappable_features(body) == [
+            ("runtime_mappings", "runtime_mappings"),
+            ("script_fields", "script_fields"),
+            ("suggest", "suggest"),
+            ("highlight", "highlight"),
+        ]
+
+    def test_single_feature_detected(self) -> None:
+        assert find_unmappable_features({"script_fields": {"who": {}}}) == [
+            ("script_fields", "script_fields")
+        ]
+
+    def test_clean_body_is_empty(self) -> None:
+        assert find_unmappable_features(None) == []
+        assert find_unmappable_features({"size": 0}) == []
+        assert find_unmappable_features({"query": {"match_all": {}}}) == []
+        assert find_unmappable_features(
+            {"aggs": {"hosts": {"terms": {"field": "related.hosts"}}}}
+        ) == []
+
+    def test_drop_removes_the_features(self) -> None:
+        body = {
+            "script_fields": {"who": {}},
+            "highlight": {"fields": {}},
+            "size": 0,
+            "aggs": {"hosts": {"terms": {"field": "related.hosts"}}},
+        }
+        dropped = drop_unmappable_features(body, {"script_fields", "highlight"})
+        assert dropped == {
+            "size": 0,
+            "aggs": {"hosts": {"terms": {"field": "related.hosts"}}},
+        }
+        # The original is not mutated.
+        assert "script_fields" in body
+        assert "highlight" in body
+
+
+class TestRareTermsAggregationMasking:
+    """Teil 13: rare_terms is a field-mapped family like terms — its key AND
+    key_as_string must be tokenised (was blocked as unmappable; mapping it is
+    the checklist requirement)."""
+
+    def test_rare_terms_key_and_key_as_string_masked(self) -> None:
+        a = anon(mask_aggregation_keys=True, mask_fields=MASK_FIELDS_18)
+        request = {
+            "size": 0,
+            "aggs": {"rares": {"rare_terms": {"field": "related.hosts"}}},
+        }
+        response_body = {
+            "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+            "aggregations": {
+                "rares": {
+                    "buckets": [
+                        {
+                            "key": "nc02web",
+                            "key_as_string": "nc02web",
+                            "doc_count": 3,
+                        }
+                    ]
+                }
+            },
+        }
+        masked = a.mask_response(
+            Response(200, json.dumps(response_body), "https://x"),
+            agg_map=parse_agg_fields(request),
+        ).json()
+        bucket = masked["aggregations"]["rares"]["buckets"][0]
+        assert bucket["key"] == ph("HOST", "nc02web")
+        assert bucket["key_as_string"] == ph("HOST", "nc02web")
+        assert "nc02web" not in json.dumps(masked)
+
+    def test_rare_terms_parsed_as_mapped_family(self) -> None:
+        specs = parse_agg_fields(
+            {"aggs": {"rares": {"rare_terms": {"field": "user.name"}}}}
+        )
+        assert specs["rares"].agg_type == "rare_terms"
+        assert specs["rares"].fields == ("user.name",)
+        assert specs["rares"].opaque is False
+
+
 class TestDeepValuePass:
     """Defense-in-depth: opaque aggregation outputs are masked by VALUE.
 
@@ -2359,3 +2460,163 @@ class TestDeepValuePass:
         }
         masked, _ = self.mask(response, request)
         assert masked["aggregations"]["top_users"]["buckets"][0]["key"] == "alice"
+
+
+class TestOpaqueResponseSubtrees:
+    """Teil 13: `suggest` (top-level), `highlight` and `fields` (per hit) embed
+    source text under arbitrary key names the structured walker cannot map.
+    They are served through the deep value pass — the request gate blocks them
+    by default; this is the defense-in-depth net for the explicit "off" mode."""
+
+    def deep_anon(self, **overrides: Any) -> Anonymizer:
+        return anon(
+            mask_aggregation_keys=True,
+            mask_fields=MASK_FIELDS_18,
+            **overrides,
+        )
+
+    def _doc(self) -> dict[str, Any]:
+        return {
+            "_source": {
+                "user": {"name": "marco"},
+                "host": {"hostname": "nc02web.intern.example"},
+                "related": {"user": ["root"]},
+            }
+        }
+
+    def test_fields_script_field_alias_masked_via_doc_registry(self) -> None:
+        """A script_fields alias (`who`) echoes `user.name`; the deep value pass
+        reuses the DOCUMENT's exact `_source` token (the exact Teil-13 finding:
+        raw value under an unmapped key name)."""
+        body = {
+            "hits": {
+                "total": {"value": 1, "relation": "eq"},
+                "hits": [
+                    {
+                        **self._doc(),
+                        "fields": {
+                            "who": ["marco"],
+                            "host.hostname": ["nc02web.intern.example"],
+                        },
+                    }
+                ],
+            }
+        }
+        a = self.deep_anon()
+        masked = a.mask_response(Response(200, json.dumps(body), "https://x")).json()
+        fields = masked["hits"]["hits"][0]["fields"]
+        assert fields["who"] == [ph("USER", "marco")]
+        assert fields["host.hostname"] == [ph("HOST", "nc02web.intern.example")]
+        assert "marco" not in json.dumps(masked)
+        assert "nc02web.intern.example" not in json.dumps(masked)
+
+    def test_highlight_bare_username_in_snippet_masked(self) -> None:
+        """Highlight tags break the username context patterns; the per-document
+        registry catches the bare username by word boundary."""
+        body = {
+            "hits": {
+                "total": {"value": 1, "relation": "eq"},
+                "hits": [
+                    {
+                        **self._doc(),
+                        "highlight": {
+                            "user.name": ["<em>marco</em>"],
+                            "message": ["login as <em>marco</em> then more"],
+                        },
+                    }
+                ],
+            }
+        }
+        a = self.deep_anon()
+        masked = a.mask_response(Response(200, json.dumps(body), "https://x")).json()
+        highlight = masked["hits"]["hits"][0]["highlight"]
+        joined = json.dumps(highlight)
+        assert "marco" not in joined
+        assert ph("USER", "marco") in joined
+        # The structured field value keeps its own exact token.
+        assert masked["hits"]["hits"][0]["_source"]["user"]["name"] == ph("USER", "marco")
+
+    def test_suggest_uses_response_wide_registry(self) -> None:
+        """A term/completion suggester returns raw field text; the response-wide
+        registry (from the raw `_source` docs) reuses the exact tokens."""
+        body = {
+            "hits": {"total": {"value": 1, "relation": "eq"}, "hits": [self._doc()]},
+            "suggest": {
+                "u": [
+                    {
+                        "text": "marco",
+                        "offset": 0,
+                        "length": 5,
+                        "options": [{"text": "root", "score": 1.0}],
+                    }
+                ]
+            },
+        }
+        a = self.deep_anon()
+        masked = a.mask_response(Response(200, json.dumps(body), "https://x")).json()
+        sug = masked["suggest"]["u"][0]
+        assert sug["text"] == ph("USER", "marco")
+        assert sug["options"][0]["text"] == ph("USER", "root")
+        assert "marco" not in json.dumps(masked["suggest"])
+
+    def test_existing_tokens_in_subtrees_pass_through_idempotent(self) -> None:
+        body = {
+            "hits": {
+                "total": {"value": 1, "relation": "eq"},
+                "hits": [
+                    {
+                        **self._doc(),
+                        "fields": {"who": ["[USER_aaaaaaaaaaaaaaaa]"]},
+                        "highlight": {"message": ["user [USER_aaaaaaaaaaaaaaaa]"]},
+                    }
+                ],
+            }
+        }
+        a = self.deep_anon()
+        masked = a.mask_response(Response(200, json.dumps(body), "https://x")).json()
+        hit = masked["hits"]["hits"][0]
+        assert hit["fields"]["who"] == ["[USER_aaaaaaaaaaaaaaaa]"]
+        assert "[USER_aaaaaaaaaaaaaaaa]" in hit["highlight"]["message"][0]
+
+
+class TestShardFailuresStripped:
+    """Teil 13: a 200 response can carry a failed shard whose body echoes the
+    raw query (script source, field names, values). Fail-closed: the raw
+    `failures` array is stripped from masked output; the count stays."""
+
+    FAILURES_BODY: dict[str, Any] = {
+        "_shards": {
+            "total": 8,
+            "successful": 7,
+            "failed": 1,
+            "failures": [
+                {
+                    "shard": 0,
+                    "index": ".ds-wazuh-events-v5-access-management-000001",
+                    "reason": {
+                        "type": "script_exception",
+                        "reason": "runtime error",
+                        "script": "params._source.user.name;",
+                    },
+                }
+            ],
+        },
+        "hits": {"total": {"value": 1, "relation": "eq"}, "hits": []},
+    }
+
+    def test_failure_array_stripped_when_active(self) -> None:
+        a = anon(mask_aggregation_keys=True, mask_fields=MASK_FIELDS_18)
+        masked = a.mask_response(
+            Response(200, json.dumps(self.FAILURES_BODY), "https://x")
+        ).json()
+        assert "failures" not in masked["_shards"]
+        assert masked["_shards"]["failed"] == 1
+        assert "params._source" not in json.dumps(masked)
+
+    def test_failures_kept_when_inactive(self) -> None:
+        a = anon(enabled=False)
+        masked = a.mask_response(
+            Response(200, json.dumps(self.FAILURES_BODY), "https://x")
+        )
+        assert masked is not None
+        assert "failures" in masked.json()["_shards"]

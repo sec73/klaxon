@@ -34,7 +34,9 @@ from .anonymization import (
     AggSpec,
     Anonymizer,
     drop_unmappable_aggs,
+    drop_unmappable_features,
     find_unmappable_aggs,
+    find_unmappable_features,
     parse_agg_fields,
 )
 from .clients import (
@@ -284,12 +286,17 @@ def _render(
     if not anon.active:
         return raw
     masked_response = anon.mask_response(response, agg_map=agg_map)
-    if masked_response is not response:
-        masked = diagnostics.render(
-            notices, masked_response, summary=summary, footer=footer
-        )
-    else:
-        masked = raw
+    # Fail-closed on error responses: the indexer's error body can echo the raw
+    # query (script source, field names, values) and is opaque to the walker —
+    # it is not served to the LLM. The raw (audit) render above still carries it
+    # for the operator when RAW logging is enabled.
+    masked = diagnostics.render(
+        notices,
+        masked_response,
+        summary=summary,
+        footer=footer,
+        include_body=response.ok,
+    )
     return anon.finish(tool, raw, anon.mask_text(masked))
 
 
@@ -389,6 +396,40 @@ async def search(index: str, body: str) -> str:
                     "query without these aggregations, or set "
                     "anonymization.block_unmappable_aggs to 'drop'/'off' "
                     "explicitly (a documented data-protection exception)."
+                )
+
+    # Fail-closed gate on the other opaque request features — the same threat
+    # class as the unmappable aggregations, outside the `aggs` tree: a
+    # `runtime_mappings` field can copy a masked field under a NEW name and be
+    # aggregated on, `script_fields` is arbitrary code (like scripted_metric),
+    # `suggest` returns raw field text, and `highlight` embeds raw source text
+    # the walker cannot guarantee to mask. Default is the strictest behaviour —
+    # reject the request, naming the feature. "drop" strips the top-level
+    # section before it is executed; "off" serves it with only the deep value
+    # pass as a safety net (an explicit, documented data-protection exception).
+    if anon.active and anon.config.block_unmappable_features != UNMAPPABLE_AGGS_OFF:
+        features = find_unmappable_features(parsed_body)
+        if features:
+            if anon.config.block_unmappable_features == UNMAPPABLE_AGGS_DROP:
+                parsed_body = drop_unmappable_features(
+                    parsed_body, {name for name, _ in features}
+                )
+                unmappable_notices.append(
+                    diagnostics.unmappable_feature_dropped_notice(features)
+                )
+            else:
+                names = sorted({name for name, _ in features})
+                raise ToolError(
+                    "search blocked: the request contains feature(s) whose "
+                    f"output cannot be anonymised: {', '.join(names)}. A "
+                    "runtime_mappings field can copy a masked field under a new "
+                    "name and be aggregated on, script_fields runs arbitrary "
+                    "code, suggesters return raw field text, and highlight "
+                    "embeds raw source text — Klaxon does not serve what it "
+                    "cannot guarantee to mask. Rewrite the query without these "
+                    "features, or set anonymization.block_unmappable_features "
+                    "to 'drop'/'off' explicitly (a documented data-protection "
+                    "exception)."
                 )
 
     # Automatic safety banner (unmasked mode / raw-stream query): first line of

@@ -214,12 +214,14 @@ _UNMAPPABLE_AGGS_ALIASES: dict[str, str] = {
 }
 
 
-def _unmappable_agg_mode(raw: str | None, yaml_value: Any) -> str:
-    """Normalise `block_unmappable_aggs` to one of block/drop/off (strict).
+def _unmappable_mode(raw: str | None, yaml_value: Any, config_name: str) -> str:
+    """Normalise an unmappable-feature mode to one of block/drop/off (strict).
 
     Like the security-critical booleans, an invalid value refuses to start
-    rather than silently serving unmappable aggregations raw. The default is
-    the strictest behaviour (`block`); any permissive mode is explicit opt-in.
+    rather than silently serving unmappable output raw. The default is the
+    strictest behaviour (`block`); any permissive mode is explicit opt-in.
+    `config_name` names the setting in the error so an operator can tell which
+    gate refused to start.
     """
     value = raw if raw is not None else yaml_value
     if value is None:
@@ -231,10 +233,10 @@ def _unmappable_agg_mode(raw: str | None, yaml_value: Any) -> str:
         if mode is not None:
             return mode
     raise ConfigError(
-        "anonymization.block_unmappable_aggs must be 'block' (reject requests "
-        "with unmappable aggregations — the default), 'drop' (strip the "
-        "offending aggregations from the request), or 'off' (serve them; a "
-        "data-protection exception). Got an unrecognised value."
+        f"{config_name} must be 'block' (reject requests that carry unmappable "
+        "output — the default), 'drop' (strip the offending feature from the "
+        "request), or 'off' (serve it; a data-protection exception). Got an "
+        "unrecognised value."
     )
 
 
@@ -283,6 +285,16 @@ class AnonymizationConfig:
     # documented data-protection exception). Enforced request-side in code, not
     # by trusting this default.
     block_unmappable_aggs: str = UNMAPPABLE_AGGS_BLOCK
+    # Fail-closed gate on the other request features whose output the response
+    # walker cannot guarantee to mask: `runtime_mappings` (a runtime field can
+    # copy a masked field under a new name and be aggregated on), `script_fields`
+    # (arbitrary code returning values under arbitrary field names), `suggest`
+    # (term/phrase/completion return raw field text), and `highlight` (snippets
+    # embed raw source text incl. bare usernames that no context pattern can
+    # catch). Same block/drop/off semantics as `block_unmappable_aggs`, default
+    # "block": do not serve what you cannot guarantee to mask. Enforced
+    # request-side in code.
+    block_unmappable_features: str = UNMAPPABLE_AGGS_BLOCK
     # Mask usernames that appear inside free-text fields (message, event.original,
     # ...) using known identities from the structured fields plus precise context
     # patterns (uid=..., "for user ...", "Accepted publickey for ..."). On by
@@ -436,9 +448,15 @@ class AnonymizationConfig:
                 "KLAXON_ANONYMIZATION_MASK_AGGREGATION_KEYS",
                 _yaml_get(anon_yaml, "mask_aggregation_keys", True),
             ),
-            block_unmappable_aggs=_unmappable_agg_mode(
+            block_unmappable_aggs=_unmappable_mode(
                 _env_str("KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_AGGS", None),
                 _yaml_get(anon_yaml, "block_unmappable_aggs", UNMAPPABLE_AGGS_BLOCK),
+                "anonymization.block_unmappable_aggs",
+            ),
+            block_unmappable_features=_unmappable_mode(
+                _env_str("KLAXON_ANONYMIZATION_BLOCK_UNMAPPABLE_FEATURES", None),
+                _yaml_get(anon_yaml, "block_unmappable_features", UNMAPPABLE_AGGS_BLOCK),
+                "anonymization.block_unmappable_features",
             ),
             mask_free_text_users=_env_bool_strict(
                 "KLAXON_ANONYMIZATION_MASK_FREE_TEXT_USERS",

@@ -201,7 +201,7 @@ def _agg_body_spec(agg: Any) -> AggSpec:
     if not isinstance(agg, dict):
         # An opaque shape the walker cannot map: treated as an opaque output.
         return AggSpec(None, opaque=True)
-    for kind in ("terms", "significant_terms", "significant_text"):
+    for kind in ("terms", "significant_terms", "significant_text", "rare_terms"):
         inner = agg.get(kind)
         if isinstance(inner, dict) and isinstance(inner.get("field"), str):
             return AggSpec(kind, (inner["field"],))
@@ -281,6 +281,7 @@ _KNOWN_SAFE_AGG_TYPES = frozenset(
         "terms",
         "significant_terms",
         "significant_text",
+        "rare_terms",
         "multi_terms",
         "composite",
         "top_hits",
@@ -375,6 +376,63 @@ def drop_unmappable_aggs(body: Any, agg_names: set[str]) -> Any:
         name: agg for name, agg in aggs.items() if name not in agg_names
     }
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Fail-closed gate on the other opaque request features
+#
+# Same threat class as the unmappable aggregations, outside the `aggs` tree:
+#   * `runtime_mappings` — a runtime field is computed by a script and can copy
+#     a masked field (`user.name`) under a NEW name that is not in `mask_fields`;
+#     aggregating on it returns the raw values (the walker only tokenises keys
+#     whose source field is in `mask_fields`).
+#   * `script_fields` — arbitrary code, like `scripted_metric`; the emitted
+#     values land under arbitrary `fields.<name>` keys the walker cannot map.
+#   * `suggest` — term/phrase/completion suggesters return raw field text
+#     (a completion suggester emits the indexed value verbatim).
+#   * `highlight` — snippets embed raw source text (incl. bare usernames that
+#     no value pattern or username context pattern can catch once the indexer
+#     wraps them in highlight tags).
+# The walker cannot guarantee to mask any of these, so `block_unmappable_features`
+# rejects them by default (fail-closed), "drop" strips the top-level key before
+# the request runs, and "off" serves them with the response-side deep value pass
+# as the safety net (explicit, documented data-protection exception).
+# --------------------------------------------------------------------------- #
+
+# Top-level request keys whose response output is opaque to the walker.
+_OPAQUE_REQUEST_FEATURES = frozenset(
+    {"runtime_mappings", "script_fields", "suggest", "highlight"}
+)
+
+
+def find_unmappable_features(body: Any) -> list[tuple[str, str]]:
+    """`(top-level key, feature)` for request features the walker cannot mask.
+
+    Used by the request-side fail-closed block in `server.search`: a
+    `runtime_mappings`/`script_fields`/`suggest`/`highlight` section can emit
+    raw personal values the response walker cannot guarantee to mask. The
+    reported name is the top-level key itself, so a drop can remove it.
+    """
+    found: list[tuple[str, str]] = []
+    if not isinstance(body, dict):
+        return found
+    for key in body:
+        if key in _OPAQUE_REQUEST_FEATURES:
+            found.append((key, key))
+    return found
+
+
+def drop_unmappable_features(body: Any, feature_names: set[str]) -> Any:
+    """Return a copy of the request with the named top-level features removed.
+
+    Used by the config-selectable "drop" mode: the offending top-level section
+    (`runtime_mappings`, `script_fields`, `suggest`, `highlight`) is stripped
+    from the request before it is executed, so the response cannot carry its
+    raw output.
+    """
+    if not isinstance(body, dict):
+        return body
+    return {key: value for key, value in body.items() if key not in feature_names}
 
 
 # --------------------------------------------------------------------------- #
@@ -609,11 +667,19 @@ class Anonymizer:
         return self.mask_text(value)
 
     def mask_json(
-        self, obj: Any, path: str = "", identities: Mapping[str, str] | None = None
+        self,
+        obj: Any,
+        path: str = "",
+        identities: Mapping[str, str] | None = None,
+        value_registry: Mapping[str, str] | None = None,
     ) -> Any:
         """Deep-walk a parsed response and mask personal data in place-free."""
         return self._mask_json(
-            obj, path, skip_aggregations=False, identities=identities
+            obj,
+            path,
+            skip_aggregations=False,
+            identities=identities,
+            value_registry=value_registry,
         )
 
     def _mask_json(
@@ -622,6 +688,7 @@ class Anonymizer:
         path: str = "",
         skip_aggregations: bool = False,
         identities: Mapping[str, str] | None = None,
+        value_registry: Mapping[str, str] | None = None,
     ) -> Any:
         """The structural pass; optionally leaves the `aggregations` subtree alone.
 
@@ -631,9 +698,27 @@ class Anonymizer:
         pass over tokenised keys and drift aggregation tokens apart from their
         `_source` twins. `identities` (raw value -> token for the response's
         known usernames) feeds the free-text username pass.
+
+        Opaque response subtrees that embed source text under arbitrary key
+        names — `suggest` (top-level), and per-hit `highlight` / `fields` — are
+        served through the deep value pass (Teil 13): a `script_fields` alias
+        or a highlight snippet can carry a raw username/hostname under a key
+        the structured walker cannot map. `highlight`/`fields` reuse the
+        DOCUMENT's own tokens (built from its raw `_source`, so an echo of a
+        structured value maps to the exact `_source` token); the top-level
+        `suggest` subtree uses the response-wide `value_registry`.
         """
         if isinstance(obj, dict):
             out: dict[str, Any] = {}
+            # Per-document value registry for opaque response subtrees that
+            # embed source text (`highlight` / `fields`): reuse this document's
+            # own tokens so an echoed username/hostname maps to the exact
+            # `_source` token (and never borrows identities from another hit).
+            doc_registry = (
+                self._collect_value_registry(obj["_source"])
+                if "_source" in obj and ("highlight" in obj or "fields" in obj)
+                else None
+            )
             for key, value in obj.items():
                 if skip_aggregations and not path and key == "aggregations":
                     out[key] = value
@@ -646,11 +731,20 @@ class Anonymizer:
                     # word in ordinary prose in another.
                     local = self._collect_identities(value, child_path)
                     out[key] = self._mask_json(
-                        value, child_path, skip_aggregations, local
+                        value, child_path, skip_aggregations, local, value_registry
                     )
+                elif (key == "highlight" or key == "fields") and doc_registry is not None:
+                    # Opaque source-text subtree: deep value pass with the
+                    # document's own tokens (defense-in-depth, Teil 13).
+                    out[key] = self._deep_value_pass(value, doc_registry)
+                elif key == "suggest" and not path:
+                    # Top-level suggest (term/phrase/completion): raw field text
+                    # under arbitrary keys — deep value pass with the
+                    # response-wide registry.
+                    out[key] = self._deep_value_pass(value, value_registry or {})
                 else:
                     out[key] = self._mask_json(
-                        value, child_path, skip_aggregations, identities
+                        value, child_path, skip_aggregations, identities, value_registry
                     )
             return out
         if isinstance(obj, list):
@@ -700,11 +794,34 @@ class Anonymizer:
         # `_source`), so a username in one hit never masks prose in another.
         # Opaque aggregation outputs (scripted_metric, bucket_script, unknown
         # types) are masked INSIDE `mask_aggregations` via the deep value pass.
+        # A response-wide value registry is collected ONLY when the response
+        # carries a top-level `suggest` subtree (the deep pass for it reuses
+        # `_source` tokens); the common path pays no walk for it.
+        value_registry = (
+            self._collect_value_registry(parsed)
+            if isinstance(parsed, dict) and "suggest" in parsed
+            else None
+        )
         if self.config.mask_aggregation_keys:
             masked = self.mask_aggregations(parsed, agg_map)
-            masked = self._mask_json(masked, "", skip_aggregations=True)
+            masked = self._mask_json(
+                masked, "", skip_aggregations=True, value_registry=value_registry
+            )
         else:
-            masked = self.mask_json(parsed)
+            masked = self.mask_json(parsed, value_registry=value_registry)
+        # Shard-failure bodies (`_shards.failures`) echo the raw query — the
+        # script source, field names, sometimes values — and are opaque to the
+        # walker. Fail-closed: strip the raw `failures` array from what leaves
+        # for the LLM (the `failed` count stays; `search_notices` states it).
+        # A 200 response carrying a failed shard is still partial data, but its
+        # diagnostic payload is not masked output.
+        if isinstance(masked, dict):
+            shards = masked.get("_shards")
+            if isinstance(shards, dict) and shards.get("failures"):
+                stripped_shards = dict(shards)
+                stripped_shards.pop("failures", None)
+                masked = dict(masked)
+                masked["_shards"] = stripped_shards
         return Response(
             response.status_code,
             json.dumps(masked, indent=2, ensure_ascii=False),
@@ -954,7 +1071,8 @@ class Anonymizer:
                 return value
             return "|".join(str(item) for item in masked_key)
         if (
-            spec.agg_type in {"terms", "significant_terms", "significant_text"}
+            spec.agg_type
+            in {"terms", "significant_terms", "significant_text", "rare_terms"}
             and spec.fields
         ):
             if self._field_for_path(spec.fields[0]) is None:

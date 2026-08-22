@@ -81,6 +81,22 @@ LLM/report queries.**
   masks every string leaf by value: dotted hostnames, UUIDs/user-ids, e-mails
   and IPs, plus the response's own known values (an opaque echo of a `_source`
   username/hostname reuses the exact `_source` token).
+- **The other opaque request features are blocked too (fail-closed).** A
+  `runtime_mappings` field can copy a masked field under a NEW name and be
+  aggregated on, `script_fields` is arbitrary code, `suggest` returns raw field
+  text, and `highlight` embeds raw source snippets — the walker cannot
+  guarantee to mask them. `block_unmappable_features` (**`block` by default,
+  enforced in code**) rejects those requests; `drop` strips the top-level
+  section. When one is explicitly served (`off` — a data-protection
+  exception), the response-side deep value pass masks the subtrees: a
+  `script_fields` alias reuses the exact `_source` token, a highlight snippet's
+  bare username is caught by the document's own known values.
+- **Error bodies and shard failures never leak the raw query.** An indexer
+  error body (400/429/500) can echo the raw query (script source, field names,
+  values); with anonymization active the served output carries the notices plus
+  a `[BODY WITHHELD]` marker, never the body. A 200 response with a failed
+  shard gets a `[SHARD FAILURES]` notice and the raw `_shards.failures` array
+  is stripped.
 - **Free-text usernames reuse the structured tokens.** With
   `mask_free_text_users` on (default), usernames inside free-text fields are
   masked with the same tokens as the structured fields — `uid=alice` inside a
