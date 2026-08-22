@@ -8,7 +8,7 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## released
 
-## Unreleased
+## 0.2.1 – 2026-08-22
 
 ### Security — Teil 13 full audit: opaque request features blocked, error bodies
 withheld, rare_terms mapped, RBAC posture fix
