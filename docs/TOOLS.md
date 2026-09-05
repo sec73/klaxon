@@ -170,6 +170,65 @@ truncation.
 
 ---
 
+## `parsing_cemetery`
+
+Which log sources the decoder chain under-serves, so an operator knows where a
+custom decoder or a detection rule pays off. **Wazuh 5.x only** — like the rest
+of Klaxon there is no archives/alerts model: every decoded event lands in
+`wazuh-events-v5-*` (there is no `logall_json` toggle, because indexing
+everything is the default) and detection output is the separate
+`wazuh-findings-v5-*` stream.
+
+| Parameter | Type | |
+|---|---|---|
+| `hours` | int | default `24` — window ending now |
+| `classification` | string | `decoder_gap`, `detection_gap`, or `both` (default) |
+| `min_count` | int | default `10` — minimum event count for a source to be reported |
+| `top_n` | int | default `20` — max groups per classification (cap `200`) |
+| `sample_size` | int | default `3` — raw samples per group (cap `10`) |
+
+Groups are `(agent, category)` (`wazuh.agent.name` × `wazuh.integration.category`),
+and each group lists the concrete `event.dataset` values inside the category, so
+very different sources that share one coarse category stay visible.
+
+**`decoder_gap`** counts the group's events that carry **no `event.dataset`** —
+a raw line reached the index but was only decoded by a generic decoder, never
+mapped to an integration dataset. (Wazuh 5 stores a real per-event decoder
+chain under `wazuh.integration.decoders`; that field is deliberately *not*
+aggregated on yet — see the TODO in `src/klaxon_mcp/constants.py` — because its
+value vocabulary is still churning through the beta cycle.)
+
+**`detection_gap`** lists sources that produced events in the window but **zero
+findings** in `wazuh-findings-v5-*` for the same window and group key —
+normalised, but nothing was detected from them. Sources that did produce
+findings are excluded (and counted in a notice).
+
+Per group the report shows the event count, the share (decoder_gap),
+hours-active/full-window, the peak hour and count, and whether the stream is
+`sustained` (events in at least half the window's buckets) rather than a
+one-off spike — then up to `sample_size` raw log lines, pseudonymized before
+return (agent-name group keys are tokenised the same way the `_source` pass
+tokenises them). The footer lists every request so the run can be repeated or
+extended through `search`.
+
+```
+AGENT       CATEGORY          GAP_EVENTS  TOTAL  SHARE  ACTIVE  PEAK  PEAK_AT(UTC)      SUSTAINED
+[HOST_a1b2] network-activity        700    800  87.5%    1/24   700  2026-09-04T10:00Z  no
+```
+
+```
+samples — [HOST_a1b2] / network-activity:
+  sshd[123]: login by [USER_9f2a] from [IP_5c01]
+```
+
+Empty-window, empty-index and empty-findings-stream are stated explicitly
+(`[EMPTY WINDOW]`, `[NO DOCUMENTS]`, `[FINDINGS STREAM EMPTY]`) and are never
+rendered as a table of zeros. The counts pass walks up to 200 agents; a
+deployment with more reports it rather than silently returning a top-N of an
+unknown total.
+
+---
+
 ## `findings_overview`
 
 The findings breakdown every report starts with, without needing query DSL.

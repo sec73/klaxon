@@ -8,6 +8,16 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## released
 
+### Added — `parsing_cemetery`: which log sources the decoder chain under-serves
+
+- **New tool `parsing_cemetery`** (server.py + pure module `src/klaxon_mcp/cemetery.py`, tests `tests/test_cemetery.py`). Finds and aggregates events that a generic decoder only half-decoded, or that detection never looked at, so operators can prioritise which log sources need a custom decoder or rule. Wazuh 5.x-only by construction: it queries `wazuh-events-v5-*` directly — there is no archives/`logall_json` concept in 5.x (indexing everything is the default) — and cross-checks `wazuh-findings-v5-*` for detection output.
+  - `classification` values are **`decoder_gap` / `detection_gap` / `both`** (no `rule_gap`: that is the old 4.x rule-level/rule-group model, which does not exist in 5.x). `decoder_gap` = events never mapped to an `event.dataset` (the schema-churn-proof proxy for generic-only decode); `detection_gap` = an (agent, category) with events in the window but zero findings for the same window/group key.
+  - Parameters `hours` (24), `min_count` (10), `top_n` (20, cap 200), `sample_size` (3, cap 10). Groups are `(wazuh.agent.name, wazuh.integration.category)` with an `event.dataset` facet per group; each group shows count/share, hours-active/window, peak hour, and sustained-vs-spike, plus `sample_size` raw samples passed through the anonymization layer (agent keys tokenised like `findings_overview`). Output is a readable two-section report via `_guarded_summary` with every request in the footer.
+  - Empty window / empty index / empty findings stream are all reported explicitly, never as a table of zeros; counts-pass agent list truncation is noticed, not silent.
+  - **Decoder-chain upgrade path documented, not wired**: live probe confirmed Wazuh 5 stores a real per-event chain at `wazuh.integration.decoders` (array of `decoder/<name>/<n>`); recorded as a TODO in `constants.py` so `decoder_gap` can later aggregate on it once the value vocabulary stabilises. No 4.x field/index/API names anywhere.
+  - Tests (+19): empty index/window, findings-stream-empty, decoder_gap aggregation + 5.x-signal query assertions, detection_gap aggregation (zero-findings = gap, detected sources excluded), `min_count` filtering, `top_n` truncation, argument validation, and pseudonymization of agent keys + raw samples.
+  - Docs: README tool table + paragraph (explicitly 5.x-only, no archives toggle), `docs/TOOLS.md` section, this CHANGELOG entry.
+
 ## 0.2.1 – 2026-08-22
 
 ### Security — Teil 13 full audit: opaque request features blocked, error bodies

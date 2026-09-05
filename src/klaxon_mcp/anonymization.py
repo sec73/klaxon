@@ -49,7 +49,7 @@ import re
 import secrets
 import threading
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -1323,6 +1323,28 @@ class Anonymizer:
             categories=result.categories,
             categories_other=result.categories_other,
         )
+
+    def mask_group_keys(
+        self, values: Iterable[str], family: str = HOST
+    ) -> dict[str, str]:
+        """Map distinct report group keys to deterministic tokens.
+
+        Report-style tools that aggregate on agent names reuse this so a
+        hostname that appears as a table key is tokenised exactly like the same
+        value under a configured field (findings_overview does the same for its
+        agent rows through `mask_overview`). Already-token values map to
+        themselves, so a value that came from a masked stream is left untouched
+        (idempotent).
+        """
+        out: dict[str, str] = {}
+        for value in values:
+            if not value:
+                continue
+            if _TOKEN_RE.fullmatch(value):
+                out[value] = value
+            else:
+                out[value] = self._register(family, value)
+        return out
 
     # ------------------------------------------------------------------ #
     # Text pass (safety net)

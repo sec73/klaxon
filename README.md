@@ -118,10 +118,21 @@ The handful of tools a normal user needs (full reference:
 | `logtest` | Push a raw line through the decoder chain | `logtest(event="<raw line>")` |
 | `gdpr_check` | Find sensitive fields the mask list should cover | `gdpr_check(index="wazuh-events-v5-*")` |
 | `klaxon_posture_check` | Read-only security posture: facts + gaps, no verdict | `klaxon_posture_check(tenant="customer-a")` |
+| `parsing_cemetery` | Which log sources the decoder chain under-serves | `parsing_cemetery(classification="both", hours=24)` |
 
 On an unfamiliar cluster, start with `field_coverage`. Every thin result gets a
 notice block before the data (empty aggregation, capped size, missing index —
 all return `HTTP 200` with nothing).
+
+When the decoder chain under-serves a source, `parsing_cemetery` says which one
+and how badly. **Wazuh 5.x only** — there is no archives/`logall_json` concept
+in 5.x: every decoded event lands in `wazuh-events-v5-*` (indexing everything
+is the default) and detection output is the separate `wazuh-findings-v5-*`
+stream. `decoder_gap` finds events that reached the index but were never mapped
+to an `event.dataset` (generic decode only); `detection_gap` finds sources that
+produced events but zero findings in the same window. Raw log samples are
+pseudonymized before they are returned. Full reference:
+[`docs/TOOLS.md`](docs/TOOLS.md#parsing_cemetery).
 
 ---
 

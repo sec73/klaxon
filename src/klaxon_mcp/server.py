@@ -29,7 +29,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import coverage, diagnostics, gdpr, overview, posture
+from . import cemetery, coverage, diagnostics, gdpr, overview, posture
 from .anonymization import (
     AggSpec,
     Anonymizer,
@@ -54,8 +54,14 @@ from .config import (
 )
 from .constants import (
     CATEGORIES,
+    CLASSIFICATION_BOTH,
+    CLASSIFICATION_DECODER_GAP,
+    CLASSIFICATION_DETECTION_GAP,
+    CLASSIFICATIONS,
     DETECTORS_BASE,
     DETECTORS_SEARCH,
+    EVENTS_DATASET_FIELD,
+    EVENTS_PATTERN,
     FINDINGS_LEVEL_FIELD,
     FINDINGS_PATTERN,
     LOGTEST_ENDPOINT,
@@ -72,6 +78,7 @@ from .fields import (
     count_documents,
     fetch_field_caps,
     fetch_field_mappings,
+    parse_total,
     probe_population,
     sample_source,
 )
@@ -1869,6 +1876,351 @@ async def klaxon_posture_check(
         get_indexer(), config, config.anonymization, cfg, hours=hours
     )
     return _guarded_text("klaxon_posture_check", "\n".join(lines))
+
+
+# --------------------------------------------------------------------------- #
+# 10. parsing_cemetery
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+async def parsing_cemetery(
+    hours: int = 24,
+    classification: str = "both",
+    min_count: int = 10,
+    top_n: int = 20,
+    sample_size: int = 3,
+) -> str:
+    """Find the log sources the decoder chain under-serves, and prioritise them.
+
+    Wazuh 5 has no archives/alerts split: every decoded event lives in
+    wazuh-events-v5-* and detection output is a separate wazuh-findings-v5-*
+    stream. This tool reports the two kinds of "parsing gap" on the events
+    stream, so an operator knows which sources need a custom decoder or a
+    detection rule:
+
+      decoder_gap   — events whose raw line reached the index but was never
+                      mapped to an integration dataset (no `event.dataset`),
+                      i.e. decoded only by a generic decoder.
+      detection_gap — an (agent, category) that produced events in the window
+                      but no findings in wazuh-findings-v5-* for the same
+                      window and group key.
+
+    Groups are (agent, category); within each coarse category the concrete
+    event.dataset values are listed so very different sources that share a
+    category stay visible. Each group reports its event count, a time profile
+    (hours active / full window, peak hour and count, and whether the stream is
+    sustained rather than a one-off spike) and up to `sample_size` raw log
+    samples — which are passed through the anonymization layer before being
+    returned. There is deliberately no `logall_json`-style prerequisite to
+    check: Wazuh 5 indexes every event by default.
+
+    Args:
+        hours: Size of the time window ending now, in hours. Default 24.
+        classification: One of decoder_gap, detection_gap, both. Default both.
+        min_count: Minimum event count for a source to be reported (decoder_gap
+            counts its gap events, detection_gap counts the group's events).
+            Default 10.
+        top_n: Maximum number of source groups reported per classification.
+            Default 20.
+        sample_size: How many raw log samples to show per group. Default 3.
+    """
+    hours = _positive("hours", hours)
+    top_n = _positive("top_n", top_n, cemetery.TOP_N_MAX)
+    sample_size = _positive("sample_size", sample_size, cemetery.SAMPLE_SIZE_MAX)
+    if isinstance(min_count, bool) or not isinstance(min_count, int) or min_count < 1:
+        raise ToolError(
+            f"min_count must be a positive integer (got {min_count!r}). Zero would "
+            "report every source; the tool exists to surface the sources above a "
+            "volume threshold."
+        )
+    kind = (classification or "").strip().lower()
+    if kind not in CLASSIFICATIONS:
+        raise ToolError(
+            f"classification must be one of {', '.join(CLASSIFICATIONS)} "
+            f"(got {classification!r})."
+        )
+    run_decoder = kind in (CLASSIFICATION_DECODER_GAP, CLASSIFICATION_BOTH)
+    run_detection = kind in (CLASSIFICATION_DETECTION_GAP, CLASSIFICATION_BOTH)
+
+    anon = get_anonymizer()
+    notices = diagnostics.safety_banner(anon.config, EVENTS_PATTERN)
+    client = get_indexer()
+    request_log: list[str] = []
+
+    async def _search(path: str, body: dict[str, Any]) -> Response:
+        try:
+            return await client.post(path, body=body)
+        except TransportError as exc:
+            raise ToolError(str(exc)) from exc
+
+    # 1. The whole events datastream: distinguishes an empty index from an empty
+    #    window, exactly as `field_coverage` does.
+    request_log.append(f"POST /{EVENTS_PATTERN}/_search x1 (datastream count)")
+    try:
+        grand_total, grand_response = await count_documents(client, EVENTS_PATTERN)
+    except TransportError as exc:
+        raise ToolError(str(exc)) from exc
+    if not grand_response.ok:
+        notices.append(
+            f"[HTTP {grand_response.status_code}] Counting the events datastream "
+            f"failed, so there is no denominator. The unmodified error body is below."
+        )
+        return _render("parsing_cemetery", notices, grand_response)
+    if grand_total is None:
+        notices.append(
+            "[NO DOCUMENT COUNT] The indexer answered the count query without a "
+            "readable hits.total. No report is produced rather than one derived "
+            "from a guessed denominator."
+        )
+        return _guarded_summary(
+            "parsing_cemetery",
+            notices,
+            cemetery.header(hours, None, None, None),
+            "(no events measured)",
+        )
+    if grand_total == 0:
+        notices.append(
+            f"[NO DOCUMENTS] {EVENTS_PATTERN} matches no document at all — not in "
+            "this window, not anywhere. There is nothing to analyse. Check the "
+            "pattern and that the engine is forwarding events before concluding "
+            "the decoders are at fault."
+        )
+        return _guarded_summary(
+            "parsing_cemetery",
+            notices,
+            cemetery.header(hours, 0, 0, None),
+            "(no events index-wide)",
+        )
+
+    decoder_groups: tuple[cemetery.Group, ...] = ()
+    decoder_candidates = 0
+    decoder_leaves_total = 0
+    window_total: int | None = None
+
+    # 2a. decoder_gap counts (also provides the window total when it runs first).
+    if run_decoder:
+        body = cemetery.decoder_counts_query(hours)
+        request_log.append(
+            f"POST /{EVENTS_PATTERN}/_search x1 (decoder-gap counts + hourly)"
+        )
+        response = await _search(f"/{EVENTS_PATTERN}/_search", body)
+        if not response.ok:
+            notices.append(
+                f"[HTTP {response.status_code}] The decoder-gap query against "
+                f"{EVENTS_PATTERN!r} was rejected. The unmodified error body is below."
+            )
+            return _render("parsing_cemetery", notices, response)
+        window_total = parse_total(response)
+        leaves = cemetery.parse_counts(response.json(), thin=True)
+        decoder_leaves_total = len(leaves)
+        selection = cemetery.select_groups(
+            leaves,
+            kind=CLASSIFICATION_DECODER_GAP,
+            hours=hours,
+            min_count=min_count,
+            top_n=top_n,
+        )
+        decoder_candidates = selection.kept_candidates
+        decoder_groups = selection.groups
+
+    detection_groups: tuple[cemetery.Group, ...] = ()
+    detection_candidates = 0
+    detection_leaves_total = 0
+    detection_positive = 0
+    findings_window_total: int | None = None
+    findings_stream_empty = False
+
+    # 2b. detection_gap counts, plus the findings side of the cross-stream test.
+    if run_detection:
+        body = cemetery.detection_counts_query(hours)
+        request_log.append(
+            f"POST /{EVENTS_PATTERN}/_search x1 (detection-gap counts + hourly)"
+        )
+        response = await _search(f"/{EVENTS_PATTERN}/_search", body)
+        if not response.ok:
+            notices.append(
+                f"[HTTP {response.status_code}] The detection-gap query against "
+                f"{EVENTS_PATTERN!r} was rejected. The unmodified error body is below."
+            )
+            return _render("parsing_cemetery", notices, response)
+        if window_total is None:
+            window_total = parse_total(response)
+        leaves = cemetery.parse_counts(response.json(), thin=False)
+        detection_leaves_total = len(leaves)
+
+        request_log.append(f"POST /{FINDINGS_PATTERN}/_search x1 (datastream count)")
+        try:
+            findings_grand, findings_response = await count_documents(
+                client, FINDINGS_PATTERN
+            )
+        except TransportError as exc:
+            raise ToolError(str(exc)) from exc
+        if not findings_response.ok:
+            notices.append(
+                f"[HTTP {findings_response.status_code}] Counting the findings "
+                f"datastream failed. The unmodified error body is below."
+            )
+            return _render("parsing_cemetery", notices, findings_response)
+        if findings_grand == 0:
+            findings_stream_empty = True
+            findings_window_total = 0
+            notices.append(
+                f"[FINDINGS STREAM EMPTY] {FINDINGS_PATTERN} holds no document at "
+                "all. Detection output never reaches the index, so every event "
+                "source would read as a detection gap — that is an indexing "
+                "problem, not a per-source one, and no detection-gap table is "
+                "produced. Fix the findings pipeline first."
+            )
+        else:
+            fbody = cemetery.findings_counts_query(hours)
+            request_log.append(
+                f"POST /{FINDINGS_PATTERN}/_search x1 (findings per group)"
+            )
+            fresponse = await _search(f"/{FINDINGS_PATTERN}/_search", fbody)
+            if not fresponse.ok:
+                notices.append(
+                    f"[HTTP {fresponse.status_code}] The per-group findings query "
+                    f"against {FINDINGS_PATTERN!r} was rejected. The unmodified "
+                    f"error body is below."
+                )
+                return _render("parsing_cemetery", notices, fresponse)
+            findings_map, findings_window_total = cemetery.parse_findings(
+                fresponse.json()
+            )
+            if findings_window_total == 0:
+                notices.append(
+                    f"[EMPTY FINDINGS WINDOW] No finding in {FINDINGS_PATTERN} "
+                    f"carries an {TIME_FIELD} within the last {hours}h, while the "
+                    "events stream does. Every event group below therefore reads "
+                    "as a detection gap — check whether findings are flowing at "
+                    "all before treating them as per-source gaps."
+                )
+            selection = cemetery.select_groups(
+                leaves,
+                kind=CLASSIFICATION_DETECTION_GAP,
+                hours=hours,
+                min_count=min_count,
+                top_n=top_n,
+                findings=findings_map,
+            )
+            detection_candidates = selection.kept_candidates
+            detection_positive = selection.findings_positive
+            detection_groups = selection.groups
+
+    # 3. Empty-window classification, once a window total is known.
+    if window_total == 0:
+        notices.append(
+            f"[EMPTY WINDOW] No event in {EVENTS_PATTERN} carries an {TIME_FIELD} "
+            f"within the last {hours}h, while {grand_total} document(s) exist in "
+            "the datastream. Nothing is reported below — the sections are omitted "
+            "rather than shown empty. Widen `hours` before concluding the "
+            "pipeline is quiet."
+        )
+        return _guarded_summary(
+            "parsing_cemetery",
+            notices,
+            cemetery.header(hours, 0, grand_total, findings_window_total),
+            f"(no events in the last {hours}h)",
+        )
+
+    # 4. Raw samples for the kept groups, one bounded request per classification.
+    async def _attach_samples(
+        groups: tuple[cemetery.Group, ...], thin: bool
+    ) -> tuple[cemetery.Group, ...]:
+        if not groups:
+            return groups
+        kept = [(g.agent, g.category) for g in groups]
+        scope = "decoder-gap" if thin else "detection-gap"
+        body = cemetery.samples_query(hours, kept, thin=thin, sample_size=sample_size)
+        request_log.append(
+            f"POST /{EVENTS_PATTERN}/_search x1 ({scope} raw samples)"
+        )
+        response = await _search(f"/{EVENTS_PATTERN}/_search", body)
+        if not response.ok:
+            notices.append(
+                f"[HTTP {response.status_code}] Fetching raw samples for the "
+                f"{scope} groups failed; they are omitted. The unmodified error "
+                f"body is below."
+            )
+            return groups
+        payload = response.json()
+        mapping = {
+            (agent, category): cemetery.parse_samples(payload, agent, category, thin=thin)
+            for agent, category in kept
+        }
+        return cemetery.with_samples(groups, mapping)
+
+    if run_decoder and decoder_groups:
+        decoder_groups = await _attach_samples(decoder_groups, thin=True)
+    if run_detection and detection_groups:
+        detection_groups = await _attach_samples(detection_groups, thin=False)
+
+    # 5. Pseudonymization: agent-name keys become HOST tokens, raw samples pass
+    #    through the free-text pass, before anything is rendered.
+    def _finalize(groups: tuple[cemetery.Group, ...]) -> tuple[cemetery.Group, ...]:
+        if not anon.active or not groups:
+            return groups
+        names = sorted({g.agent for g in groups if g.agent})
+        agent_names = anon.mask_group_keys(names)
+        return cemetery.mask_groups(groups, agent_names, anon.mask_text)
+
+    if run_decoder:
+        decoder_groups = _finalize(decoder_groups)
+        if decoder_candidates > len(decoder_groups):
+            notices.append(
+                f"[TOP N TRUNCATED] {decoder_candidates} sources reached "
+                f"min_count={min_count}; the table shows the top {len(decoder_groups)}. "
+                f"Raise `top_n` (currently {top_n}) to see the rest."
+            )
+        elif decoder_candidates == 0 and decoder_leaves_total:
+            notices.append(
+                f"[NO DECODER-GAP GROUPS] None of the {decoder_leaves_total} "
+                f"(agent, category) sources had at least min_count={min_count} "
+                f"events without {EVENTS_DATASET_FIELD}. Every source was "
+                "mapped to an integration dataset (or fell below the threshold)."
+            )
+    if run_detection and detection_groups is not None:
+        detection_groups = _finalize(detection_groups)
+        if detection_positive:
+            notices.append(
+                f"[DETECTED SOURCES EXCLUDED] {detection_positive} source(s) "
+                "produced findings in the window and are not detection gaps; "
+                "they are omitted from the table."
+            )
+        if detection_candidates > len(detection_groups):
+            notices.append(
+                f"[TOP N TRUNCATED] {detection_candidates} detection-gap sources "
+                f"exist; the table shows the top {len(detection_groups)}. Raise "
+                f"`top_n` (currently {top_n}) to see the rest."
+            )
+        elif detection_candidates == 0 and detection_leaves_total:
+            notices.append(
+                f"[NO DETECTION-GAP GROUPS] Every one of the "
+                f"{detection_leaves_total} sources with events in the window also "
+                f"produced a finding — nothing is under-detected."
+            )
+
+    # 6. Assemble the report.
+    parts: list[str] = []
+    if run_decoder:
+        parts.append(cemetery.render_decoder(decoder_groups))
+    if run_detection:
+        if findings_stream_empty:
+            parts.append(
+                "=== DETECTION GAPS ===\n"
+                "(findings stream empty index-wide — nothing to detect from)"
+            )
+        else:
+            parts.append(cemetery.render_detection(detection_groups))
+    footer = "requests:\n" + "\n".join(f"  {r}" for r in request_log) if request_log else None
+    return _guarded_summary(
+        "parsing_cemetery",
+        notices,
+        cemetery.header(hours, window_total, grand_total, findings_window_total),
+        "\n\n".join(parts),
+        footer,
+    )
 
 
 # --------------------------------------------------------------------------- #

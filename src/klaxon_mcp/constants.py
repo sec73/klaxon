@@ -104,6 +104,58 @@ SHADOWED_NAMESPACES: Final[dict[str, str]] = {
     "agent.": "wazuh.agent.",
 }
 
+# --------------------------------------------------------------------------- #
+# parsing_cemetery — which log sources are under-served by the decoder chain.
+#
+# Wazuh 5 keeps every decoded event in wazuh-events-v5-* — there is no separate
+# archives datastream and no `logall_json` toggle, because indexing everything
+# is the default — and detection output is a SEPARATE wazuh-findings-v5-* stream
+# (no alert-level filter of the same events). "Parsing gaps" are therefore
+# measured on the events stream, never on a 4.x archives-vs-alerts split.
+#
+# decoder_gap: an event whose raw line reached the index but was never mapped to
+#   an integration dataset — i.e. it carries no `event.dataset`. This is the
+#   schema-churn-proof proxy for "matched only a generic decoder": the engine
+#   assigns event.dataset only when a specific decoder mapped the source
+#   (verified live: the ~21k of ~89k events in 24h without event.dataset are
+#   exactly the events whose decoder chain is only generic ones).
+# detection_gap: an (agent, category) that produces events in the window but no
+#   findings in wazuh-findings-v5-* for the same window and group key — events
+#   were normalised but nothing was detected from them.
+#
+# TODO(decoder-gap upgrade path; probed live 2026-09-05 on 10.20.30.3:9200):
+#   Wazuh 5 DOES write a genuine per-event decoder-provenance field,
+#   `wazuh.integration.decoders` (keyword, ARRAY-valued — an event carries its
+#   whole decoder chain), present on essentially every event. Values look like
+#   "decoder/<name>/<n>" (e.g. "decoder/opnsense-filterlog/0",
+#   "decoder/apache-access/0", "decoder/keycloak-events/0"); generic/catch-all
+#   decoders observed include "decoder/core-wazuh-message/0" and
+#   "decoder/syslog/0" (plus a tenant "decoder/custom-root/0" whose genericity
+#   is unconfirmed). decoder_gap could be upgraded to aggregate on this field
+#   directly once its value vocabulary is stable — the missing-event.dataset
+#   proxy is deliberately used instead while decoder <name> strings are still
+#   churning through the beta cycle. Do not wire this field into a query yet.
+CLASSIFICATION_DECODER_GAP: Final[str] = "decoder_gap"
+CLASSIFICATION_DETECTION_GAP: Final[str] = "detection_gap"
+CLASSIFICATION_BOTH: Final[str] = "both"
+CLASSIFICATIONS: Final[tuple[str, ...]] = (
+    CLASSIFICATION_DECODER_GAP,
+    CLASSIFICATION_DETECTION_GAP,
+    CLASSIFICATION_BOTH,
+)
+
+# Grouping and signal fields for parsing_cemetery, all verified populated on
+# wazuh-events-v5-* (live, 2026-09-05). The agent/category fields are the same
+# global-WCS fields the findings stream uses (FINDINGS_AGENT_NAME_FIELD /
+# FINDINGS_CATEGORY_FIELD); they are aliased here so events-side callers read
+# intent without ever drifting from the findings constants.
+EVENTS_AGENT_NAME_FIELD: Final[str] = FINDINGS_AGENT_NAME_FIELD
+EVENTS_CATEGORY_FIELD: Final[str] = FINDINGS_CATEGORY_FIELD
+# event.dataset: assigned only when a specific decoder mapped the source.
+EVENTS_DATASET_FIELD: Final[str] = "event.dataset"
+# The per-event decoder chain (see the upgrade-path TODO above). Not queried.
+DECODER_CHAIN_FIELD: Final[str] = "wazuh.integration.decoders"
+
 # Indexer plugin endpoints.
 LOGTEST_ENDPOINT: Final[str] = "/_plugins/_content_manager/logtest"
 
