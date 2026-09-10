@@ -85,7 +85,7 @@ The system is split into three decoupled, secure layers to ensure that Personall
  ┌───────────────────────────────────────────────────────────────────────────────────────┐
  │ OLLAMA KI-ENGINE (Self-Hosted odr running fully offline on your workstation)          │
  │                                                                                       │
- │  Hardware Allocation:                                                                 │
+ │  Hardware Allocation (example):                                                       │
  │  ┌─────────────────────────────────────────────────────────────────────────────────┐  │
  │  │ NVIDIA RTX 4080 (16 GB VRAM)                                                    │  │
  │  │  ├── Vector Embeddings: `nomic-embed-text` (768 Dimensions)                     │  │
