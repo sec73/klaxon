@@ -224,7 +224,8 @@ Release history: [`CHANGELOG.md`](CHANGELOG.md).
 
 Apache-2.0 — see [LICENSE](LICENSE).
 
-Built by [sec73 GmbH](https://sec73.io).
-
 Wazuh is a registered trademark of Wazuh Inc. Klaxon is an independent project
 and is not affiliated with, endorsed by, or sponsored by Wazuh Inc.
+
+## Support
+For professional support, please contact [support@sec73.io](mailto:support@sec73.io).
